@@ -269,6 +269,54 @@ class SelectedModelTests(unittest.TestCase):
             evaluate_predictions([task])
             self.assertEqual(call.call_args.args[0].pk, self.backends[1].pk)
 
+    def test_selected_model_executes_batch_prediction(self):
+        from ml.models import MLBackend
+        from tasks.models import Prediction
+
+        self.project.model_version = self.backends[1].title
+        task = Task.objects.get(pk=1)
+        task.project = self.project
+        before = (task.annotations.count(), task.drafts.count(), task.data)
+        version = self.backends[1].model_version
+        self.assertFalse(self.backends[1].is_interactive)
+        result = {
+            "task": task.pk,
+            "project": self.project.pk,
+            "model_version": version,
+            "score": 0.9,
+            "result": [
+                {
+                    "from_name": "category",
+                    "to_name": "sms",
+                    "type": "choices",
+                    "value": {"choices": ["Customer category"]},
+                }
+            ],
+        }
+        self.addCleanup(
+            lambda: Prediction.objects.filter(task_id=1, model_version=version).delete()
+        )
+        api = TaskAPI()
+        api.task = task
+
+        def connected(backend):
+            backend.state = "CO"
+            return version
+
+        with patch.object(
+            MLBackend, "update_state", autospec=True, side_effect=connected
+        ), patch.object(
+            MLBackend, "_get_predictions_from_ml_backend", return_value=[result]
+        ) as predict:
+            api.maybe_evaluate_predictions(self.project, APIRequestFactory().get("/"))
+            predict.assert_called_once()
+        self.assertEqual(task.predictions.filter(model_version=version).count(), 1)
+        self.assertEqual(task.predictions_score, 0.9)
+        task.refresh_from_db()
+        self.assertEqual(
+            (task.annotations.count(), task.drafts.count(), task.data), before
+        )
+
     def test_old_model_predictions_do_not_block_selected_model(self):
         self.project.model_version = self.backends[1].title
         task = Task.objects.get(pk=1)
