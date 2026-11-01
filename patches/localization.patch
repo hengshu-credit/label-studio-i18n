@@ -2628,6 +2628,25 @@ index f561934..24cfcbc 100644
          url: "https://labelstud.io/guide/ml",
          params: {
            experiment: "project_settings_tip",
+diff --git a/web/apps/labelstudio/src/components/HeidiTips/utils.ts b/web/apps/labelstudio/src/components/HeidiTips/utils.ts
+index 4202fb4..68dce8d 100644
+--- a/web/apps/labelstudio/src/components/HeidiTips/utils.ts
++++ b/web/apps/labelstudio/src/components/HeidiTips/utils.ts
+@@ -1,4 +1,5 @@
+ import { defaultTipsCollection } from "./content";
++import { currentLanguage } from "@humansignal/app-common/i18n/ui";
+ import type { Tip, TipsCollection } from "./types";
+ 
+ const STORE_KEY = "heidi_ignored_tips";
+@@ -43,6 +44,8 @@ export function getTipMetadata(tip: Tip) {
+ }
+ 
+ export const loadLiveTipsCollection = () => {
++  // Remote campaigns are English-only; Chinese uses the localized source-owned tips.
++  if (currentLanguage() === "zh-CN") return defaultTipsCollection;
+   // stale while revalidate - we will return the data present in the cache or the default data and fetch updated data to be put into the cache for the next time this function is called without waiting for the promise.
+   const cachedData = localStorage.getItem(CACHE_KEY);
+   const fetchedAt = localStorage.getItem(CACHE_FETCHED_AT_KEY);
 diff --git a/web/apps/labelstudio/src/components/Menubar/Menubar.jsx b/web/apps/labelstudio/src/components/Menubar/Menubar.jsx
 index c134ad2..b69b7f4 100644
 --- a/web/apps/labelstudio/src/components/Menubar/Menubar.jsx
@@ -4652,7 +4671,7 @@ index 7daed28..bcc7c11 100644
 +DangerZone.title = __uiT("Danger Zone");
  DangerZone.path = "/danger-zone";
 diff --git a/web/apps/labelstudio/src/pages/Settings/GeneralSettings.jsx b/web/apps/labelstudio/src/pages/Settings/GeneralSettings.jsx
-index 3c423d4..4c7a84d 100644
+index 3c423d4..008bca3 100644
 --- a/web/apps/labelstudio/src/pages/Settings/GeneralSettings.jsx
 +++ b/web/apps/labelstudio/src/pages/Settings/GeneralSettings.jsx
 @@ -1,3 +1,4 @@
@@ -4776,6 +4795,14 @@ index 3c423d4..4c7a84d 100644
              </Form.Actions>
            </Form>
          </div>
+@@ -131,6 +123,6 @@ export const GeneralSettings = () => {
+   );
+ };
+ 
+-GeneralSettings.menuItem = "General";
++GeneralSettings.menuItem = __uiT("General");
+ GeneralSettings.path = "/";
+ GeneralSettings.exact = true;
 diff --git a/web/apps/labelstudio/src/pages/Settings/LabelingSettings.jsx b/web/apps/labelstudio/src/pages/Settings/LabelingSettings.jsx
 index 11ac063..5e0026e 100644
 --- a/web/apps/labelstudio/src/pages/Settings/LabelingSettings.jsx
@@ -7791,7 +7818,7 @@ index 0000000..91358e1
 +});
 diff --git a/web/libs/app-common/src/i18n/ui.ts b/web/libs/app-common/src/i18n/ui.ts
 new file mode 100644
-index 0000000..400f66d
+index 0000000..bfd3e23
 --- /dev/null
 +++ b/web/libs/app-common/src/i18n/ui.ts
 @@ -0,0 +1,24 @@
@@ -7799,7 +7826,7 @@ index 0000000..400f66d
 +
 +let selected: string | undefined;
 +export function setUILanguage(language: string) { selected = language; }
-+function currentLanguage(): string {
++export function currentLanguage(): string {
 +  if (selected) return selected;
 +  try {
 +    const saved = typeof localStorage === "undefined" ? null : localStorage.getItem("label-studio.language");
@@ -18156,6 +18183,25 @@ index 6985b57..a35e663 100644
            </SheetTitle>
            {description && (
              <SheetDescription data-slot="drawer-description" data-testid="drawer-description">
+diff --git a/web/libs/ui/src/lib/enterprise-badge/enterprise-badge.tsx b/web/libs/ui/src/lib/enterprise-badge/enterprise-badge.tsx
+index 6476201..21aa905 100644
+--- a/web/libs/ui/src/lib/enterprise-badge/enterprise-badge.tsx
++++ b/web/libs/ui/src/lib/enterprise-badge/enterprise-badge.tsx
+@@ -1,4 +1,5 @@
+ import { forwardRef } from "react";
++import { uiT } from "@humansignal/app-common/i18n/ui";
+ import { IconSpark } from "../../assets/icons";
+ import { Badge, type BadgeProps } from "../badge/badge";
+ 
+@@ -13,7 +14,7 @@ export type EnterpriseBadgeProps = Omit<BadgeProps, "variant" | "icon"> & {
+  */
+ export const EnterpriseBadge = forwardRef<HTMLDivElement, EnterpriseBadgeProps>(
+   ({ icon = <IconSpark />, children, ...props }, ref) => {
+-    const label = children === undefined ? "Enterprise" : children;
++    const label = children === undefined ? uiT("Enterprise") : children;
+     return (
+       <Badge ref={ref} variant="gradient" icon={icon} {...props}>
+         {label}
 diff --git a/web/libs/ui/src/lib/enterprise-upgrade-overlay/enterprise-upgrade-overlay.tsx b/web/libs/ui/src/lib/enterprise-upgrade-overlay/enterprise-upgrade-overlay.tsx
 index 504b87f..1cae600 100644
 --- a/web/libs/ui/src/lib/enterprise-upgrade-overlay/enterprise-upgrade-overlay.tsx

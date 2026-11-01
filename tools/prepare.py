@@ -15,7 +15,7 @@ patch=root/'patches/localization.patch'
 if git('apply','--reverse','--check',str(patch),check=False).returncode:
  if subprocess.check_output(['git','status','--porcelain'],cwd=src,text=True).strip():
   raise SystemExit('Upstream has unrelated local changes; refusing to overwrite them.')
- git('apply','--check',str(patch));git('apply',str(patch))
+ git('apply','--check','--whitespace=error',str(patch));git('apply',str(patch))
 subprocess.run([sys.executable,str(root/'tools/compile-catalogs.py')],check=True)
 subprocess.run([sys.executable,str(root/'tools/restore-links.py')],check=True)
 print('Prepared upstream',head)

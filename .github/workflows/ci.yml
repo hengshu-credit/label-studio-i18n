@@ -28,6 +28,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - run: mkdir -p artifacts
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -53,6 +54,8 @@ jobs:
             COMMIT_SHA=${{ github.sha }}
             COMMIT_BRANCH=hengshu-credit/main
       - run: docker compose -f ci/compose.yaml up -d --wait --wait-timeout 300
+      - run: docker compose -f ci/compose.yaml cp ci/seed.py label-studio:/tmp/seed.py
+      - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/seed.py
       - run: npx playwright install --with-deps chromium
       - run: npx playwright test
       - if: always()
