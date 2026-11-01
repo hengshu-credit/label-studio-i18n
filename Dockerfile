@@ -1,6 +1,3 @@
-ARG NODE_VERSION=22
-ARG PYTHON_VERSION=3.12
-ARG UV_VERSION=0.13.5
 
 ################################ Overview
 
@@ -16,10 +13,9 @@ ARG UV_VERSION=0.13.5
 # (maintained by the monorepo sync); uv fetches it during the build.
 
 ################################ Stage: uv (pinned uv binary)
-FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
 ################################ Stage: frontend-builder (build frontend assets)
-FROM --platform=${BUILDPLATFORM} oven/bun:1.3.11-alpine AS frontend-deps
+FROM --platform=${BUILDPLATFORM} oven/bun:1.3.11-alpine@sha256:7ed9f74c326d1c260abe247ac423ccbf5ac92af62bb442d515d1f92f21e8ea9b AS frontend-deps
 ENV BUILD_NO_SERVER=true \
     BUILD_NO_HASH=true \
     BUILD_NO_CHUNKS=true \
@@ -48,7 +44,7 @@ RUN --mount=type=cache,target=/root/.bun/install/cache,id=bun-install-cache-lso,
     bun run build
 
 ################################ Stage: venv-builder (prepare the virtualenv)
-FROM python:${PYTHON_VERSION}-slim-bookworm AS venv-builder
+FROM python:3.12-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254 AS venv-builder
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -62,7 +58,7 @@ ENV PYTHONUNBUFFERED=1 \
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential git libpcre2-dev && rm -rf /var/lib/apt/lists/*
 
 # Install uv
-COPY --from=uv /uv /usr/local/bin/uv
+RUN pip install --no-cache-dir uv==0.13.5
 
 WORKDIR /label-studio
 
@@ -104,7 +100,7 @@ FROM scratch AS lockfile
 COPY --from=frontend-deps /label-studio/web/bun.lock /bun.lock
 
 ################################### Stage: prod
-FROM python:${PYTHON_VERSION}-slim-bookworm AS production
+FROM python:3.12-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254 AS production
 
 ENV LS_DIR=/label-studio \
     HOME=/label-studio \

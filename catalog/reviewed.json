@@ -1370,5 +1370,9 @@
   "us-east-1 (default)": "us-east-1（默认）",
   ".*\\.(jpg|png)$ - imports only JPG, PNG files": ".*\\.(jpg|png)$ - 仅导入 JPG、PNG 文件",
   ".*\\.(json|jsonl|parquet)$ - imports task definitions": ".*\\.(json|jsonl|parquet)$ - 导入任务定义",
-  "[{\"id\": 1, \"section\": \"annotation-actions\", \"element\": \"button\", \"label\": \"Save\", \"key\": \"Ctrl+S\"}]": "[{\"id\": 1, \"section\": \"annotation-actions\", \"element\": \"button\", \"label\": \"Save\", \"key\": \"Ctrl+S\"}]"
+  "[{\"id\": 1, \"section\": \"annotation-actions\", \"element\": \"button\", \"label\": \"Save\", \"key\": \"Ctrl+S\"}]": "[{\"id\": 1, \"section\": \"annotation-actions\", \"element\": \"button\", \"label\": \"Save\", \"key\": \"Ctrl+S\"}]",
+  "Webhooks Settings": "Webhook 设置",
+  "Predictions Settings": "预测设置",
+  "Cloud Storage Settings": "云存储设置",
+  "Model Settings": "模型设置"
 }

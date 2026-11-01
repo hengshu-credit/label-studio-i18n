@@ -1773,5 +1773,9 @@
   "Auto": "Auto",
   "Light": "Light",
   "Dark": "Dark",
-  "Unselect": "Unselect"
+  "Unselect": "Unselect",
+  "Webhooks Settings": "Webhooks Settings",
+  "Predictions Settings": "Predictions Settings",
+  "Cloud Storage Settings": "Cloud Storage Settings",
+  "Model Settings": "Model Settings"
 }

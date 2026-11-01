@@ -1773,5 +1773,9 @@
   "Auto": "自动",
   "Light": "浅色",
   "Dark": "深色",
-  "Unselect": "取消选择"
+  "Unselect": "取消选择",
+  "Webhooks Settings": "Webhook 设置",
+  "Predictions Settings": "预测设置",
+  "Cloud Storage Settings": "云存储设置",
+  "Model Settings": "模型设置"
 }

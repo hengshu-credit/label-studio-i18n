@@ -3905,7 +3905,7 @@ index a1c1f3a..cfcbc03 100644
            </span>
          </div>
 diff --git a/web/apps/labelstudio/src/pages/Home/HomePage.tsx b/web/apps/labelstudio/src/pages/Home/HomePage.tsx
-index 7cb984a..64988c1 100644
+index 7cb984a..ed05ef5 100644
 --- a/web/apps/labelstudio/src/pages/Home/HomePage.tsx
 +++ b/web/apps/labelstudio/src/pages/Home/HomePage.tsx
 @@ -1,3 +1,4 @@
@@ -3956,6 +3956,15 @@ index 7cb984a..64988c1 100644
      icon: UserPlusIcon,
      type: "inviteMembers",
    },
+@@ -74,7 +75,7 @@ export const HomePage: Page = () => {
+   const sortedProjects = useAtomValue(sortedProjectsAtom);
+   const visitedIds = useAtomValue(visitedIdsAtom);
+ 
+-  useUpdatePageTitle("Home");
++  useUpdatePageTitle(__uiT("Home"));
+ 
+   // Fetch regular projects
+   const { data, isFetching, isSuccess, isError } = useQuery({
 @@ -141,12 +142,8 @@ export const HomePage: Page = () => {
        <div className="grid grid-cols-[minmax(0,1fr)_450px] gap-6">
          <section className="flex flex-col gap-6">
@@ -4074,7 +4083,7 @@ index 5c61ab8..48037b8 100644
      </div>
    );
 diff --git a/web/apps/labelstudio/src/pages/Organization/Models/ModelsPage.tsx b/web/apps/labelstudio/src/pages/Organization/Models/ModelsPage.tsx
-index 45eb3a7..a78e7ee 100644
+index 45eb3a7..2a405fe 100644
 --- a/web/apps/labelstudio/src/pages/Organization/Models/ModelsPage.tsx
 +++ b/web/apps/labelstudio/src/pages/Organization/Models/ModelsPage.tsx
 @@ -1,3 +1,4 @@
@@ -4082,6 +4091,15 @@ index 45eb3a7..a78e7ee 100644
  import { buttonVariant, Space } from "@humansignal/ui";
  import { useUpdatePageTitle } from "@humansignal/core";
  import { cn } from "apps/labelstudio/src/utils/bem";
+@@ -6,7 +7,7 @@ import type { Page } from "../../types/Page";
+ import { EmptyList } from "./@components/EmptyList";
+ 
+ export const ModelsPage: Page = () => {
+-  useUpdatePageTitle("Models");
++  useUpdatePageTitle(__uiT("Models"));
+ 
+   return (
+     <div className={cn("prompter").toClassName()}>
 @@ -15,16 +16,14 @@ export const ModelsPage: Page = () => {
    );
  };
@@ -4197,7 +4215,7 @@ index 960f1ae..66f042e 100644
                          </CopyableTooltip>
                        </div>
 diff --git a/web/apps/labelstudio/src/pages/Organization/PeoplePage/PeoplePage.jsx b/web/apps/labelstudio/src/pages/Organization/PeoplePage/PeoplePage.jsx
-index 408ac3e..f6f82a7 100644
+index 408ac3e..b950338 100644
 --- a/web/apps/labelstudio/src/pages/Organization/PeoplePage/PeoplePage.jsx
 +++ b/web/apps/labelstudio/src/pages/Organization/PeoplePage/PeoplePage.jsx
 @@ -1,3 +1,4 @@
@@ -4205,6 +4223,15 @@ index 408ac3e..f6f82a7 100644
  import { Button } from "@humansignal/ui";
  import { useCallback, useMemo, useRef, useState } from "react";
  import { useUpdatePageTitle } from "@humansignal/core";
+@@ -21,7 +22,7 @@ export const PeoplePage = () => {
+   const [selectedUser, setSelectedUser] = useState(null);
+   const [invitationOpen, setInvitationOpen] = useState(false);
+ 
+-  useUpdatePageTitle("People");
++  useUpdatePageTitle(__uiT("People"));
+ 
+   const selectUser = useCallback(
+     (user) => {
 @@ -34,12 +35,12 @@ export const PeoplePage = () => {
  
    const apiTokensSettingsModalProps = useMemo(
@@ -4311,7 +4338,7 @@ index f398c54..dfa6b4d 100644
    exact: true,
    layout: MenuLayout,
 diff --git a/web/apps/labelstudio/src/pages/Projects/Projects.jsx b/web/apps/labelstudio/src/pages/Projects/Projects.jsx
-index 593bb40..33fac04 100644
+index 593bb40..c85ba53 100644
 --- a/web/apps/labelstudio/src/pages/Projects/Projects.jsx
 +++ b/web/apps/labelstudio/src/pages/Projects/Projects.jsx
 @@ -1,3 +1,4 @@
@@ -4319,6 +4346,15 @@ index 593bb40..33fac04 100644
  import React, { useState } from "react";
  import { useParams as useRouterParams } from "react-router";
  import { Redirect } from "react-router-dom";
+@@ -29,7 +30,7 @@ export const ProjectsPage = () => {
+   const [totalItems, setTotalItems] = useState(1);
+   const setContextProps = useContextProps();
+ 
+-  useUpdatePageTitle("Projects");
++  useUpdatePageTitle(__uiT("Projects"));
+   const defaultPageSize = Number.parseInt(localStorage.getItem("pages:projects-list") ?? 30);
+ 
+   const [modal, setModal] = React.useState(false);
 @@ -141,7 +142,7 @@ export const ProjectsPage = () => {
    );
  };
@@ -4400,7 +4436,7 @@ index 3075f9f..b755f9a 100644
                  </Button>
                </Dropdown.Trigger>
 diff --git a/web/apps/labelstudio/src/pages/Settings/AnnotationSettings.jsx b/web/apps/labelstudio/src/pages/Settings/AnnotationSettings.jsx
-index d4fad0d..85cf36c 100644
+index d4fad0d..8f762a1 100644
 --- a/web/apps/labelstudio/src/pages/Settings/AnnotationSettings.jsx
 +++ b/web/apps/labelstudio/src/pages/Settings/AnnotationSettings.jsx
 @@ -1,3 +1,4 @@
@@ -4408,6 +4444,15 @@ index d4fad0d..85cf36c 100644
  import { useCallback, useContext, useEffect, useRef, useState } from "react";
  import { Button } from "@humansignal/ui";
  import { useUpdatePageTitle, createTitleFromSegments } from "@humansignal/core";
+@@ -15,7 +16,7 @@ export const AnnotationSettings = () => {
+   const formRef = useRef();
+   const [collab, setCollab] = useState(null);
+ 
+-  useUpdatePageTitle(createTitleFromSegments([project?.title, "Annotation Settings"]));
++  useUpdatePageTitle(createTitleFromSegments([project?.title, __uiT("Annotation Settings")]));
+ 
+   useEffect(() => {
+     pageContext.setProps({ formRef });
 @@ -28,7 +29,7 @@ export const AnnotationSettings = () => {
    return (
      <div className={cn("annotation-settings").toClassName()}>
@@ -4501,7 +4546,7 @@ index a39468a..29d197a 100644
              {...props}
            />
 diff --git a/web/apps/labelstudio/src/pages/Settings/DangerZone.jsx b/web/apps/labelstudio/src/pages/Settings/DangerZone.jsx
-index 7daed28..bcc7c11 100644
+index 7daed28..bae3c53 100644
 --- a/web/apps/labelstudio/src/pages/Settings/DangerZone.jsx
 +++ b/web/apps/labelstudio/src/pages/Settings/DangerZone.jsx
 @@ -1,3 +1,4 @@
@@ -4509,6 +4554,15 @@ index 7daed28..bcc7c11 100644
  import { useMemo, useState } from "react";
  import { useHistory } from "react-router";
  import { Button, Typography, useToast } from "@humansignal/ui";
+@@ -19,7 +20,7 @@ export const DangerZone = () => {
+   const toast = useToast();
+   const [processing, setProcessing] = useState(null);
+ 
+-  useUpdatePageTitle(createTitleFromSegments([project?.title, "Danger Zone"]));
++  useUpdatePageTitle(createTitleFromSegments([project?.title, __uiT("Danger Zone")]));
+ 
+   const showDangerConfirmation = ({ title, message, requiredWord, buttonText, onConfirm }) => {
+     const isDev = process.env.NODE_ENV === "development";
 @@ -38,7 +39,7 @@ export const DangerZone = () => {
                {message}
              </Typography>
@@ -4804,7 +4858,7 @@ index 3c423d4..008bca3 100644
  GeneralSettings.path = "/";
  GeneralSettings.exact = true;
 diff --git a/web/apps/labelstudio/src/pages/Settings/LabelingSettings.jsx b/web/apps/labelstudio/src/pages/Settings/LabelingSettings.jsx
-index 11ac063..5e0026e 100644
+index 11ac063..1e561d8 100644
 --- a/web/apps/labelstudio/src/pages/Settings/LabelingSettings.jsx
 +++ b/web/apps/labelstudio/src/pages/Settings/LabelingSettings.jsx
 @@ -1,3 +1,4 @@
@@ -4812,6 +4866,15 @@ index 11ac063..5e0026e 100644
  import { useCallback, useMemo, useState } from "react";
  import { useUpdatePageTitle, createTitleFromSegments } from "@humansignal/core";
  import { useProject } from "../../providers/ProjectProvider";
+@@ -10,7 +11,7 @@ export const LabelingSettings = () => {
+   const [essentialDataChanged, setEssentialDataChanged] = useState(false);
+   const hasChanges = config !== project.label_config;
+ 
+-  useUpdatePageTitle(createTitleFromSegments([project?.title, "Labeling Interface Settings"]));
++  useUpdatePageTitle(createTitleFromSegments([project?.title, __uiT("Labeling Interface Settings")]));
+ 
+   const saveConfig = useCallback(async () => {
+     const res = await updateProject({
 @@ -65,5 +66,5 @@ export const LabelingSettings = () => {
    );
  };
@@ -4967,7 +5030,7 @@ index 7415308..9be5314 100644
      </div>
    );
 diff --git a/web/apps/labelstudio/src/pages/Settings/MachineLearningSettings/MachineLearningSettings.jsx b/web/apps/labelstudio/src/pages/Settings/MachineLearningSettings/MachineLearningSettings.jsx
-index 3300719..8a742ef 100644
+index 3300719..09130a9 100644
 --- a/web/apps/labelstudio/src/pages/Settings/MachineLearningSettings/MachineLearningSettings.jsx
 +++ b/web/apps/labelstudio/src/pages/Settings/MachineLearningSettings/MachineLearningSettings.jsx
 @@ -1,3 +1,4 @@
@@ -4975,6 +5038,15 @@ index 3300719..8a742ef 100644
  import { useCallback, useContext, useEffect, useState } from "react";
  import { NavLink } from "react-router-dom";
  import { Button, Typography, Spinner, EmptyState, SimpleCard } from "@humansignal/ui";
+@@ -20,7 +21,7 @@ export const MachineLearningSettings = () => {
+   const [loading, setLoading] = useState(false);
+   const [loaded, setLoaded] = useState(false);
+ 
+-  useUpdatePageTitle(createTitleFromSegments([project?.title, "Model Settings"]));
++  useUpdatePageTitle(createTitleFromSegments([project?.title, __uiT("Model Settings")]));
+ 
+   const fetchBackends = useCallback(async () => {
+     setLoading(true);
 @@ -39,7 +40,7 @@ export const MachineLearningSettings = () => {
    const startTrainingModal = useCallback(
      (backend) => {
@@ -5293,7 +5365,7 @@ index ec55d8b..68770ee 100644
            }
          >
 diff --git a/web/apps/labelstudio/src/pages/Settings/PredictionsSettings/PredictionsSettings.jsx b/web/apps/labelstudio/src/pages/Settings/PredictionsSettings/PredictionsSettings.jsx
-index 6279385..cd1ee18 100644
+index 6279385..bfa4c0b 100644
 --- a/web/apps/labelstudio/src/pages/Settings/PredictionsSettings/PredictionsSettings.jsx
 +++ b/web/apps/labelstudio/src/pages/Settings/PredictionsSettings/PredictionsSettings.jsx
 @@ -1,3 +1,4 @@
@@ -5301,6 +5373,15 @@ index 6279385..cd1ee18 100644
  import { useCallback, useContext, useEffect, useState } from "react";
  import { Divider } from "../../../components/Divider/Divider";
  import { EmptyState, SimpleCard } from "@humansignal/ui";
+@@ -17,7 +18,7 @@ export const PredictionsSettings = () => {
+   const [loading, setLoading] = useState(false);
+   const [loaded, setLoaded] = useState(false);
+ 
+-  useUpdatePageTitle(createTitleFromSegments([project?.title, "Predictions Settings"]));
++  useUpdatePageTitle(createTitleFromSegments([project?.title, __uiT("Predictions Settings")]));
+ 
+   const fetchVersions = useCallback(async () => {
+     setLoading(true);
 @@ -41,20 +42,14 @@ export const PredictionsSettings = () => {
  
    return (
@@ -5485,7 +5566,7 @@ index 02bd6e8..66543ef 100644
              {buttonLabel}
            </Button>
 diff --git a/web/apps/labelstudio/src/pages/Settings/StorageSettings/StorageSettings.jsx b/web/apps/labelstudio/src/pages/Settings/StorageSettings/StorageSettings.jsx
-index 097b114..11efd0c 100644
+index 097b114..6a4ed1a 100644
 --- a/web/apps/labelstudio/src/pages/Settings/StorageSettings/StorageSettings.jsx
 +++ b/web/apps/labelstudio/src/pages/Settings/StorageSettings/StorageSettings.jsx
 @@ -1,3 +1,4 @@
@@ -5493,6 +5574,15 @@ index 097b114..11efd0c 100644
  import { Button, EmptyState, SimpleCard, Spinner, Tooltip, Typography } from "@humansignal/ui";
  import {
    IconCloudCustom,
+@@ -24,7 +25,7 @@ export const StorageSettings = () => {
+   const sourceStorageRef = useRef();
+   const targetStorageRef = useRef();
+ 
+-  useUpdatePageTitle(createTitleFromSegments([project?.title, "Cloud Storage Settings"]));
++  useUpdatePageTitle(createTitleFromSegments([project?.title, __uiT("Cloud Storage Settings")]));
+ 
+   // Fetch storage data at parent level
+   const sourceStorage = useStorageCard("", project?.id);
 @@ -51,14 +52,9 @@ export const StorageSettings = () => {
  
    return (
@@ -6548,7 +6638,7 @@ index 5d72694..ab41220 100644
        )}
      </>
 diff --git a/web/apps/labelstudio/src/pages/WebhookPage/WebhookPage.jsx b/web/apps/labelstudio/src/pages/WebhookPage/WebhookPage.jsx
-index 6061d22..28fd9a8 100644
+index 6061d22..f81cbf9 100644
 --- a/web/apps/labelstudio/src/pages/WebhookPage/WebhookPage.jsx
 +++ b/web/apps/labelstudio/src/pages/WebhookPage/WebhookPage.jsx
 @@ -1,3 +1,4 @@
@@ -6556,6 +6646,15 @@ index 6061d22..28fd9a8 100644
  import { useCallback, useEffect, useMemo, useState } from "react";
  
  import { useAPI } from "../../providers/ApiProvider";
+@@ -18,7 +19,7 @@ const Webhook = () => {
+   const api = useAPI();
+   const { project } = useProject();
+ 
+-  useUpdatePageTitle(createTitleFromSegments([project?.title, "Webhooks Settings"]));
++  useUpdatePageTitle(createTitleFromSegments([project?.title, __uiT("Webhooks Settings")]));
+ 
+   const projectId = useMemo(() => {
+     if (history.location.pathname.startsWith("/projects")) {
 @@ -113,7 +114,7 @@ const Webhook = () => {
  };
  
@@ -7847,7 +7946,7 @@ index 0000000..bfd3e23
 +    Object.prototype.hasOwnProperty.call(values, key) ? String(values[key]) : placeholder);
 +}
 diff --git a/web/libs/app-common/src/pages/AccountSettings/AccountSettings.tsx b/web/libs/app-common/src/pages/AccountSettings/AccountSettings.tsx
-index 23ff7d4..37ee720 100644
+index 23ff7d4..d85a404 100644
 --- a/web/libs/app-common/src/pages/AccountSettings/AccountSettings.tsx
 +++ b/web/libs/app-common/src/pages/AccountSettings/AccountSettings.tsx
 @@ -1,3 +1,4 @@
@@ -7855,6 +7954,28 @@ index 23ff7d4..37ee720 100644
  import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@humansignal/ui/lib/card-new/card";
  import { useMemo, isValidElement } from "react";
  import { Redirect, Route, Switch, useParams, useRouteMatch } from "react-router-dom";
+@@ -37,10 +38,10 @@ const AccountSettingsSection = () => {
+   );
+ 
+   const pageTitleText = useMemo(() => {
+-    if (!currentSection) return "My Account";
++    if (!currentSection) return __uiT("My Account");
+ 
+     if (typeof currentSection.title === "string") {
+-      return createTitleFromSegments([currentSection.title, "My Account"]);
++      return createTitleFromSegments([currentSection.title, __uiT("My Account")]);
+     }
+ 
+     const titleFromId = currentSection.id
+@@ -48,7 +49,7 @@ const AccountSettingsSection = () => {
+       .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+       .join(" ");
+ 
+-    return createTitleFromSegments([titleFromId, "My Account"]);
++    return createTitleFromSegments([titleFromId, __uiT("My Account")]);
+   }, [currentSection]);
+ 
+   useUpdatePageTitle(pageTitleText);
 @@ -127,12 +128,12 @@ const AccountSettingsPage = () => {
    );
  };
