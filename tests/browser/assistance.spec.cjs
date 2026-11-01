@@ -13,9 +13,11 @@ async function login(page,context){
 test('translation defaults, credentials, engine/language switching and reference result',async({page,context})=>{
   await login(page,context);
   await page.goto('/projects/1/data?task=1');
-  await page.getByText('翻译',{exact:true}).click();
+  // The editor also renders a hidden drag ghost with the same tab text.
+  await page.locator('[id="翻译-draggable"]').getByText('翻译',{exact:true}).click();
   const panel=page.getByTestId('translation-panel');
   await expect(panel).toBeVisible();
+  await expect(panel).toHaveCSS('display','flex');
   await expect(panel.getByLabel('翻译引擎')).toHaveValue('azure');
   await expect(panel.getByLabel('原文语言')).toHaveValue('auto');
   await expect(panel.getByLabel('目标语言')).toHaveValue('zh');
