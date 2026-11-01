@@ -105,5 +105,20 @@ class TransformersTests(unittest.TestCase):
         body['params']={**body['params'],'login':'','password':'','hostname':'http://local','context':None}
         self.assertEqual(client.post('/predict',json=body).json()['results'][0]['model_version'],client.post('/setup',json=setup).json()['model_version'])
 
+    def test_candidate_requires_explicit_publish_and_cannot_cross_project(self):
+        body=self.body();base=self.runtime.setup(body)['model_version']
+        body['params'].update(publish=False,validation_split=.2,epochs=1,job_id='job1')
+        body['annotations']=[{**body['tasks'][0],'annotations':[{'result':[{'from_name':'category','to_name':'text','type':'choices','value':{'choices':['yes']}}]}]}]
+        # One sample may hash into validation; use no split for this publication contract.
+        body['params']['validation_split']=0
+        trained=self.runtime.train(body)
+        self.assertEqual(self.runtime.setup(body)['model_version'],base)
+        with self.assertRaisesRegex(ValueError,'another project'):
+            self.runtime.promote({**body,'project':'other','version':trained['model_version']})
+        self.runtime.promote({**body,'version':trained['model_version']})
+        self.assertEqual(self.runtime.setup(body)['model_version'],trained['model_version'])
+        body['params'].update(epochs=2,job_id='job2')
+        self.assertEqual(self.runtime.setup(body)['model_version'],trained['model_version'])
+
 
 if __name__ == '__main__':unittest.main()

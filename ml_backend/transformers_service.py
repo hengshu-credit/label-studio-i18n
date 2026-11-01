@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 import threading
 import uuid
@@ -47,6 +48,8 @@ class Runtime:
         self.device = device
         self.lock = threading.RLock()
         self.cached = None
+        self.training_status = {}
+        self.cancellations = {}
 
     def config(self, body):
         from transformers import AutoConfig, AutoTokenizer
@@ -91,7 +94,8 @@ class Runtime:
             raise ValueError('A fast tokenizer with character offsets is required.')
         files = [(str(f.relative_to(path)), f.stat().st_size, f.stat().st_mtime_ns)
                  for f in sorted(path.rglob('*')) if f.is_file()]
-        identity = digest([str(body.get('project')), params, xml, str(path), files])
+        identity_params = {k: params.get(k) for k in ('base_model','model_task','model_revision','model_control','backend_id','label_map','initialize_head','max_length')}
+        identity = digest([str(body.get('project')), identity_params, xml, str(path), files])
         directory = self.output / identity
         pointer = directory / 'current.json'
         version = json.loads(pointer.read_text())['version'] if pointer.exists() else 'base'
@@ -141,9 +145,9 @@ class Runtime:
         return encoded, offsets
 
     def setup(self, body):
-        with self.lock:
-            cfg = self.config(body)
-            return {'model_version': cfg['model_version']}
+        # Metadata remains available while GPU training holds the model lock.
+        cfg = self.config(body)
+        return {'model_version': cfg['model_version']}
 
     def predict(self, body):
         import torch
@@ -210,7 +214,7 @@ class Runtime:
                 regions = [r for r in annotation.get('result',[]) if r.get('from_name') == c['name'] and r.get('to_name') == c['target']]
                 if c['kind'] == 'Choices':
                     if len(regions) != 1 or regions[0].get('type') != 'choices' or len(regions[0]['value'].get('choices',[])) != 1:
-                        continue
+                        raise ValueError(f'Task {task.get("id")} needs exactly one submitted classification for {c["name"]}.')
                     target = label_ids[regions[0]['value']['choices'][0]]
                 else:
                     spans = sorted((r['value']['start'], r['value']['end'], r['value']['labels'][0], r['value'].get('text')) for r in regions if r.get('type') == 'labels')
@@ -232,47 +236,105 @@ class Runtime:
                         target.append(label_ids[f'{"I" if i in seen else "B"}-{label}']); seen.add(i)
                     if len(seen) != len(spans):
                         raise ValueError('An entity has no corresponding token.')
-                rows.append((encoded,target))
+                group = re.sub(r'\d+', '#', re.sub(r'https?://\S+', '<url>', text)).strip().lower()
+                group = re.sub(r'\s+', ' ', group)
+                rows.append((encoded,target,digest(group)))
         if not rows:
             raise ValueError('No usable human annotations for this labeling control.')
         return rows
+
+    def status(self, body):
+        cfg = self.config(body)
+        return self.training_status.get(cfg['identity'], {'status':'idle'})
+
+    def cancel(self, body):
+        cfg = self.config(body)
+        event = self.cancellations.get(cfg['identity'])
+        if event: event.set()
+        return {'cancel_requested': bool(event)}
+
+    def promote(self, body):
+        with self.lock:
+            cfg = self.config(body)
+            full = body.get('version','')
+            prefix = f'hf-{cfg["identity"]}-'
+            if not full.startswith(prefix): raise ValueError('Candidate belongs to another project or model configuration.')
+            version = full[len(prefix):]
+            if not re.fullmatch(r'[a-f0-9]{16}',version): raise ValueError('Invalid candidate version.')
+            candidate = cfg['directory']/version
+            if not (candidate/'training-report.json').is_file(): raise ValueError('Candidate is incomplete or unavailable.')
+            report = json.loads((candidate/'training-report.json').read_text())
+            pointer = cfg['directory']/'current.json';temporary=pointer.with_suffix('.tmp')
+            temporary.write_text(json.dumps({'version':version,'samples':report['samples']}));os.replace(temporary,pointer)
+            self.cached=None
+            return {'model_version':full,'published':True}
 
     def train(self, body):
         import torch
         with self.lock:
             cfg = self.config(body)
-            rows = self.training_rows(cfg, body)
+            try:
+                rows = self.training_rows(cfg, body)
+            except (ValueError, KeyError) as exc:
+                self.training_status[cfg['identity']]={'status':'failed','error':str(exc)}
+                raise
             epochs = int(cfg['params'].get('epochs', 1))
             rate = float(cfg['params'].get('learning_rate', 2e-5))
-            if not 1 <= epochs <= 10 or not math.isfinite(rate) or not 0 < rate <= 0.01:
-                raise ValueError('epochs must be 1–10; learning_rate must be in (0, 0.01].')
+            split = float(cfg['params'].get('validation_split',0))
+            if not 1 <= epochs <= 10 or not math.isfinite(rate) or not 0 < rate <= 0.01 or not 0<=split<=0.4:
+                raise ValueError('Invalid epochs, learning_rate or validation_split.')
+            training = [row for row in rows if int(row[2][:8],16)%10000>=split*10000]
+            validation = [row for row in rows if int(row[2][:8],16)%10000<split*10000]
+            if not training: raise ValueError('No training groups remain after validation split.')
             torch.manual_seed(42)
             model = self.load(cfg, training=True)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=rate)
-            model.train()
+            event = threading.Event();self.cancellations[cfg['identity']]=event
+            state={'status':'training','completed_steps':0,'total_steps':len(training)*epochs}
+            self.training_status[cfg['identity']]=state
+            def evaluate():
+                from sklearn.metrics import accuracy_score, f1_score
+                truth=[];predicted=[];model.eval()
+                with torch.inference_mode():
+                    for encoded,target,_ in validation:
+                        logits=model(**{k:v.to(model.device) for k,v in encoded.items()}).logits[0].cpu()
+                        if isinstance(target,list):
+                            for y,p in zip(target,logits.argmax(-1).tolist()):
+                                if y!=-100:truth.append(y);predicted.append(p)
+                        else:truth.append(target);predicted.append(int(logits.argmax()))
+                if not truth:return {'samples':0,'accuracy':None,'macro_f1':None}
+                return {'samples':len(validation),'accuracy':accuracy_score(truth,predicted),
+                        'macro_f1':f1_score(truth,predicted,average='macro',zero_division=0)}
+            before=evaluate();optimizer=torch.optim.AdamW(model.parameters(),lr=rate)
             try:
+                model.train()
                 for _ in range(epochs):
-                    for encoded, target in rows:
+                    for index in torch.randperm(len(training)).tolist():
+                        encoded,target,group=training[index]
+                        if event.is_set():raise ValueError('Training cancelled; previous model retained.')
                         optimizer.zero_grad(set_to_none=True)
-                        labels = torch.tensor([target], device=model.device)
-                        loss = model(**{k:v.to(model.device) for k,v in encoded.items()}, labels=labels).loss
-                        if not torch.isfinite(loss):
-                            raise ValueError('Non-finite training loss; previous checkpoint retained.')
-                        loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
-                version = uuid.uuid4().hex[:16]
-                destination = cfg['directory'] / version
-                model.save_pretrained(destination, safe_serialization=True)
-                cfg['tokenizer'].save_pretrained(destination)
-                pointer = cfg['directory'] / 'current.json'
-                temporary = pointer.with_suffix('.tmp')
-                temporary.write_text(json.dumps({'version':version,'samples':len(rows)}))
-                os.replace(temporary, pointer)
-                return {'model_version':f'hf-{cfg["identity"]}-{version}', 'samples':len(rows)}
+                        labels=torch.tensor([target],device=model.device)
+                        loss=model(**{k:v.to(model.device) for k,v in encoded.items()},labels=labels).loss
+                        if not torch.isfinite(loss):raise ValueError('Non-finite training loss; previous checkpoint retained.')
+                        loss.backward();torch.nn.utils.clip_grad_norm_(model.parameters(),1.0);optimizer.step()
+                        state['completed_steps']+=1;state['loss']=float(loss.detach())
+                after=evaluate();version=uuid.uuid4().hex[:16];destination=cfg['directory']/version
+                if event.is_set():raise ValueError('Training cancelled; previous model retained.')
+                model.save_pretrained(destination,safe_serialization=True);cfg['tokenizer'].save_pretrained(destination)
+                report={'model_version':f'hf-{cfg["identity"]}-{version}','samples':len(training),'validation_samples':len(validation),
+                        'before':before,'after':after,'project':str(body.get('project')),'split_policy':'normalized template groups',
+                        'published':False,'epochs':epochs}
+                (destination/'training-report.json').write_text(json.dumps(report))
+                if cfg['params'].get('publish',True):
+                    self.promote({**body,'version':report['model_version']});report['published']=True
+                state.update(status='completed',model_version=report['model_version'])
+                return report
+            except Exception as exc:
+                state.update(status='cancelled' if event.is_set() else 'failed',error=str(exc))
+                raise
             finally:
-                self.cached = None
-                del optimizer, model
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                self.cached=None;self.cancellations.pop(cfg['identity'],None)
+                del optimizer,model
+                if torch.cuda.is_available():torch.cuda.empty_cache()
 
 
 def create_app(output, device=None):
@@ -289,12 +351,14 @@ def create_app(output, device=None):
     def endpoint(method):
         def call(body: dict):
             try:
+                if method in ('predict','promote') and any(s.get('status')=='training' for s in runtime.training_status.values()):
+                    raise HTTPException(503, 'GPU training is in progress. Existing saved predictions remain available; retry after training completes.')
                 return getattr(runtime, method)(body)
             except (ValueError, KeyError, TypeError, OSError, RuntimeError) as exc:
                 raise HTTPException(422, str(exc)) from exc
         return call
-    for method in ('setup','predict','train'):
-        app.post('/'+method)(endpoint(method))
+    for path, method in [('setup','setup'),('predict','predict'),('train','train'),('training-status','status'),('cancel-training','cancel'),('promote','promote')]:
+        app.post('/'+path)(endpoint(method))
     return app
 
 
