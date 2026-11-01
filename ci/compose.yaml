@@ -1,14 +1,14 @@
 name: label-studio-i18n-ci
 services:
   label-studio:
-    image: label-studio-i18n:ci
+    image: ${TEST_IMAGE:-label-studio-i18n:ci}
     environment:
       LABEL_STUDIO_USERNAME: ci@example.invalid
       LABEL_STUDIO_PASSWORD: ci-only-synthetic-password
       LABEL_STUDIO_DISABLE_TELEMETRY: "true"
       LABEL_STUDIO_BASE_DATA_DIR: /label-studio/data
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:${TEST_PORT:-8080}:8080"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=10)"]
       interval: 10s

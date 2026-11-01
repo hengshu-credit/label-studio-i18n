@@ -1,7 +1,7 @@
 const {test,expect}=require('@playwright/test');
 for(const language of ['en','zh-hans']){
  test(`login, application and account language: ${language}`,async({page,context})=>{
-  await context.addCookies([{name:'django_language',value:language,url:'http://127.0.0.1:8080'}]);
+  await context.addCookies([{name:'django_language',value:language,url:process.env.LABEL_STUDIO_URL||'http://127.0.0.1:8080'}]);
   await page.addInitScript(lang=>localStorage.setItem('label-studio.language',lang==='en'?'en':'zh-CN'),language);
   await page.goto('/user/login/');
   await expect(page.locator('h2')).toHaveText(language==='en'?'Log in':'登录');

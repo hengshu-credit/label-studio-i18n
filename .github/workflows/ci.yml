@@ -56,6 +56,8 @@ jobs:
       - run: docker compose -f ci/compose.yaml up -d --wait --wait-timeout 300
       - run: docker compose -f ci/compose.yaml cp ci/seed.py label-studio:/tmp/seed.py
       - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/seed.py
+      - run: docker compose -f ci/compose.yaml cp ci/test_assistance.py label-studio:/tmp/test_assistance.py
+      - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/test_assistance.py
       - run: npx playwright install --with-deps chromium
       - run: npx playwright test
       - if: always()

@@ -1391,6 +1391,569 @@ index d86c7af..b062416 100644
        </p>
      </div>
  
+diff --git a/label_studio/projects/models.py b/label_studio/projects/models.py
+index d19ece5..56b03df 100644
+--- a/label_studio/projects/models.py
++++ b/label_studio/projects/models.py
+@@ -391,7 +391,11 @@ class Project(ProjectMixin, FsmHistoryStateModel):
+ 
+     @property
+     def ml_backend(self):
+-        return fast_first(self.ml_backends.all())
++        # The prelabeling selector stores a live backend title in model_version.
++        # Respect that choice instead of always invoking the oldest connection.
++        backends = list(self.ml_backends.all())
++        return next((backend for backend in backends if backend.title == self.model_version),
++                    backends[0] if backends else None)
+ 
+     @property
+     def should_retrieve_predictions(self):
+diff --git a/label_studio/tasks/api.py b/label_studio/tasks/api.py
+index d3cd3f2..e1fa054 100644
+--- a/label_studio/tasks/api.py
++++ b/label_studio/tasks/api.py
+@@ -397,7 +397,7 @@ class TaskAPI(generics.RetrieveUpdateDestroyAPIView):
+         }
+ 
+     def maybe_evaluate_predictions(self, project, request):
+-        """Ask the ML backend for predictions when the task has none yet.
++        """Retrieve predictions when the selected model has no result for this task.
+ 
+         get_object() runs the whole PreparedTaskManager query, which takes tens of
+         seconds on tasks with thousands of annotations, so it must run exactly once
+@@ -407,11 +407,16 @@ class TaskAPI(generics.RetrieveUpdateDestroyAPIView):
+             return
+ 
+         # prefetched by prefetch(); .exists() would issue an extra query on every GET
+-        if self.task.predictions.all():
++        existing_predictions = list(self.task.predictions.all())
++        selected_backend = project.ml_backend
++        if project.model_version and not project.ml_backend_in_model_version:
++            return  # A stored prediction version was selected, not a live backend.
++        if selected_backend and any(p.model_version == selected_backend.model_version for p in existing_predictions):
++            return
++        if not project.model_version and existing_predictions:
+             return
+ 
+-        # project.ml_backend slices the queryset, which bypasses the prefetch cache
+-        if not project.ml_backends.all():
++        if selected_backend is None:
+             return
+ 
+         evaluate_predictions([self.task])
+@@ -429,10 +434,9 @@ class TaskAPI(generics.RetrieveUpdateDestroyAPIView):
+         predictions = self.task.predictions.all()
+         self.task.total_predictions = len(predictions)
+         self.task.predictions_model_versions = [p.model_version for p in predictions]
+-        # This path only runs when the task had no predictions, so every prediction here
+-        # was just created by the project's own backend. That is exactly the set
+-        # annotate_predictions_score() would average over its model_version filter.
+-        scores = [p.score for p in predictions if p.score is not None]
++        # Match annotate_predictions_score(): other models may already have predictions.
++        selected_version = self.task.project.ml_backend.model_version if self.task.project.ml_backend_in_model_version else self.task.project.model_version
++        scores = [p.score for p in predictions if p.score is not None and (not selected_version or p.model_version == selected_version)]
+         self.task.predictions_score = sum(scores) / len(scores) if scores else None
+ 
+     def get(self, request, pk):
+diff --git a/label_studio/tasks/translation.py b/label_studio/tasks/translation.py
+new file mode 100644
+index 0000000..e48420b
+--- /dev/null
++++ b/label_studio/tasks/translation.py
+@@ -0,0 +1,472 @@
++"""Authenticated, on-demand text translation with explicit engine selection and local limits."""
++
++import hashlib
++import base64
++import html
++import json
++from pathlib import Path
++import secrets
++import sqlite3
++import time
++from datetime import datetime, timezone
++from cryptography.fernet import Fernet, InvalidToken
++
++import requests
++from defusedxml.ElementTree import fromstring
++from django.conf import settings
++from django.shortcuts import get_object_or_404
++from rest_framework.permissions import IsAuthenticated
++from rest_framework.response import Response
++from rest_framework.views import APIView
++from tasks.models import Task
++
++LANGUAGES = {
++    "zh": "Chinese (Simplified)",
++    "zh-TW": "Chinese (Traditional)",
++    "en": "English",
++    "th": "Thai",
++    "vi": "Vietnamese",
++    "ru": "Russian",
++    "id": "Indonesian",
++    "es": "Spanish",
++    "fr": "French",
++    "de": "German",
++    "ja": "Japanese",
++    "ko": "Korean",
++    "pt": "Portuguese",
++    "ar": "Arabic",
++    "hi": "Hindi",
++    "tl": "Filipino",
++    "uz": "Uzbek",
++    "pa": "Punjabi",
++    "it": "Italian",
++}
++BAIDU_CODES = {
++    "zh": "zh",
++    "zh-TW": "cht",
++    "en": "en",
++    "th": "th",
++    "vi": "vie",
++    "ru": "ru",
++    "es": "spa",
++    "fr": "fra",
++    "de": "de",
++    "ja": "jp",
++    "ko": "kor",
++    "pt": "pt",
++    "ar": "ara",
++    "it": "it",
++}
++ENGINES = {
++    "azure": {"label": "Azure Translator F0", "free_characters": 2000000},
++    "baidu": {"label": "Baidu Translate", "free_characters": 1000000},
++    "google": {"label": "Google Cloud Translation NMT", "free_characters": 500000},
++}
++
++
++class TranslationFailure(Exception):
++    def __init__(self, message, status=400):
++        super().__init__(message)
++        self.status = status
++
++
++def _cipher():
++    key = hashlib.sha256(
++        (settings.SECRET_KEY + ":translation-provider-config-v1").encode()
++    ).digest()
++    return Fernet(base64.urlsafe_b64encode(key))
++
++
++def read_config(organization_id):
++    con = _cache()
++    try:
++        row = con.execute(
++            "SELECT value FROM provider_config WHERE organization_id=?",
++            (organization_id,),
++        ).fetchone()
++        config = json.loads(_cipher().decrypt(row[0]).decode()) if row else {}
++        if not isinstance(config, dict):
++            raise ValueError()
++        return config
++    except (ValueError, InvalidToken) as exc:
++        raise TranslationFailure("Translation configuration is invalid.", 503) from exc
++    finally:
++        con.close()
++
++
++def save_config(organization_id, engine, body):
++    if engine not in ENGINES:
++        raise TranslationFailure("Unsupported translation engine.")
++    changes = {}
++    for field in ("key", "region", "app_id", "secret"):
++        value = body.get(field, "")
++        if not isinstance(value, str) or len(value) > 4096:
++            raise TranslationFailure("Invalid API configuration.")
++        if value.strip():
++            changes[field] = value.strip()
++    if "monthly_limit" in body:
++        try:
++            limit = int(body["monthly_limit"])
++        except (ValueError, TypeError):
++            raise TranslationFailure("Invalid monthly character limit.")
++        if not 0 <= limit <= ENGINES[engine]["free_characters"]:
++            raise TranslationFailure("Invalid monthly character limit.")
++        changes["monthly_limit"] = limit
++    con = _cache()
++    try:
++        con.execute("BEGIN IMMEDIATE")
++        row = con.execute(
++            "SELECT value FROM provider_config WHERE organization_id=?",
++            (organization_id,),
++        ).fetchone()
++        config = json.loads(_cipher().decrypt(row[0]).decode()) if row else {}
++        if not isinstance(config, dict):
++            raise ValueError()
++        if body.get("clear") is True:
++            config.pop(engine, None)
++        else:
++            config[engine] = {**config.get(engine, {}), **changes}
++        encrypted = _cipher().encrypt(json.dumps(config).encode())
++        con.execute(
++            "INSERT OR REPLACE INTO provider_config VALUES(?,?)",
++            (organization_id, encrypted),
++        )
++        con.commit()
++    except (ValueError, InvalidToken) as exc:
++        raise TranslationFailure("Translation configuration is invalid.", 503) from exc
++    finally:
++        con.close()
++
++
++def configured(engine, cfg):
++    return (
++        bool(cfg.get("app_id") and cfg.get("secret"))
++        if engine == "baidu"
++        else bool(cfg.get("key"))
++    )
++
++
++def limit_for(engine, cfg):
++    # Baidu defaults conservatively to the standard plan; advanced users can set 1,000,000.
++    default = 50000 if engine == "baidu" else ENGINES[engine]["free_characters"]
++    return min(
++        max(int(cfg.get("monthly_limit", default)), 0),
++        ENGINES[engine]["free_characters"],
++    )
++
++
++def capabilities(organization_id):
++    config = read_config(organization_id)
++    providers = []
++    for key, info in ENGINES.items():
++        cfg = config.get(key, {})
++        providers.append(
++            {
++                "id": key,
++                **info,
++                "configured": configured(key, cfg),
++                "monthly_limit": limit_for(key, cfg),
++                "languages": {
++                    k: v
++                    for k, v in LANGUAGES.items()
++                    if key != "baidu" or k in BAIDU_CODES
++                },
++            }
++        )
++    available = [p for p in providers if p["configured"]]
++    default = max(available or providers, key=lambda p: p["monthly_limit"])["id"]
++    return {
++        "providers": providers,
++        "default_engine": default,
++        "default_source": "auto",
++        "default_target": "zh",
++    }
++
++
++def _cache():
++    path = Path(settings.BASE_DATA_DIR) / "translation-cache.sqlite3"
++    con = sqlite3.connect(path, timeout=20)
++    con.execute("PRAGMA journal_mode=WAL")
++    con.executescript(
++        """CREATE TABLE IF NOT EXISTS results(key TEXT PRIMARY KEY,result TEXT NOT NULL);
++      CREATE TABLE IF NOT EXISTS usage(account TEXT,month TEXT,characters INTEGER NOT NULL,PRIMARY KEY(account,month));
++      CREATE TABLE IF NOT EXISTS pending(key TEXT PRIMARY KEY,created REAL NOT NULL);
++      CREATE TABLE IF NOT EXISTS provider_config(organization_id INTEGER PRIMARY KEY,value BLOB NOT NULL);"""
++    )
++    return con
++
++
++def call_provider(engine, cfg, text, source, target):
++    # Fixed official endpoints only. Credentials never appear in URLs or error messages.
++    session = requests.Session()
++    try:
++        if engine == "azure":
++            code = lambda x: {"zh": "zh-Hans", "zh-TW": "zh-Hant", "tl": "fil"}.get(
++                x, x
++            )
++            params = {"api-version": "3.0", "to": code(target), "textType": "plain"}
++            if source != "auto":
++                params["from"] = code(source)
++            headers = {"Ocp-Apim-Subscription-Key": cfg["key"]}
++            if cfg.get("region"):
++                headers["Ocp-Apim-Subscription-Region"] = cfg["region"]
++            response = session.post(
++                "https://api.cognitive.microsofttranslator.com/translate",
++                params=params,
++                headers=headers,
++                json=[{"Text": text}],
++                timeout=(10, 45),
++                allow_redirects=False,
++            )
++        elif engine == "google":
++            body = {
++                "q": text,
++                "target": "zh-CN" if target == "zh" else target,
++                "format": "text",
++                "model": "nmt",
++            }
++            if source != "auto":
++                body["source"] = "zh-CN" if source == "zh" else source
++            response = session.post(
++                "https://translation.googleapis.com/language/translate/v2",
++                headers={"X-Goog-Api-Key": cfg["key"]},
++                json=body,
++                timeout=(10, 45),
++                allow_redirects=False,
++            )
++        else:
++            salt = secrets.token_hex(16)
++            signature = hashlib.md5(
++                (cfg["app_id"] + text + salt + cfg["secret"]).encode("utf-8")
++            ).hexdigest()
++            response = session.post(
++                "https://fanyi-api.baidu.com/api/trans/vip/translate",
++                data={
++                    "q": text,
++                    "from": "auto" if source == "auto" else BAIDU_CODES[source],
++                    "to": BAIDU_CODES[target],
++                    "appid": cfg["app_id"],
++                    "salt": salt,
++                    "sign": signature,
++                },
++                timeout=(10, 45),
++                allow_redirects=False,
++            )
++        if response.status_code == 429:
++            raise TranslationFailure(
++                "Translation provider rate limit reached. Try again later.", 429
++            )
++        if response.status_code in (401, 403):
++            raise TranslationFailure(
++                "Translation credentials or API permissions are invalid.", 503
++            )
++        if response.status_code != 200:
++            raise TranslationFailure("Translation provider is unavailable.", 502)
++        data = response.json()
++        if engine == "azure":
++            item = data[0]
++            translated = item["translations"][0]["text"]
++            detected = item.get("detectedLanguage", {}).get("language", source)
++            detected = {"zh-Hans": "zh", "zh-Hant": "zh-TW", "fil": "tl"}.get(
++                detected, detected
++            )
++        elif engine == "google":
++            item = data["data"]["translations"][0]
++            translated = html.unescape(item["translatedText"])
++            detected = item.get("detectedSourceLanguage", source)
++            detected = "zh" if detected == "zh-CN" else detected
++        else:
++            if "error_code" in data:
++                raise TranslationFailure(
++                    "Translation provider rejected the request. Check the account quota and language pair.",
++                    502,
++                )
++            translated = "\n".join(x["dst"] for x in data["trans_result"])
++            detected = {v: k for k, v in BAIDU_CODES.items()}.get(
++                data.get("from"), source
++            )
++        if not isinstance(translated, str) or not translated.strip():
++            raise ValueError("Empty translation")
++        return {
++            "translation": translated,
++            "detected_source": detected,
++            "target": target,
++            "engine": engine,
++        }
++    except TranslationFailure:
++        raise
++    except (
++        requests.RequestException,
++        ValueError,
++        KeyError,
++        IndexError,
++        TypeError,
++    ) as exc:
++        raise TranslationFailure(
++            "Translation request failed. Check the service connection and try again.",
++            502,
++        ) from None
++    finally:
++        session.close()
++
++
++def translate_text(text, engine, source, target, organization_id):
++    if engine not in ENGINES:
++        raise TranslationFailure("Unsupported translation engine.")
++    allowed = BAIDU_CODES if engine == "baidu" else LANGUAGES
++    if target not in allowed or (source != "auto" and source not in allowed):
++        raise TranslationFailure("Unsupported translation language.")
++    if not isinstance(text, str) or not text.strip():
++        raise TranslationFailure("This task has no inline text to translate.")
++    if len(text) > 5000:
++        raise TranslationFailure("Text exceeds the translation request limit.")
++    if source == target:
++        return {
++            "translation": text,
++            "detected_source": source,
++            "target": target,
++            "engine": engine,
++            "cached": True,
++        }
++    cfg = read_config(organization_id).get(engine, {})
++    if not configured(engine, cfg):
++        raise TranslationFailure(
++            "This translation engine is not configured. Ask the administrator to configure its API key.",
++            503,
++        )
++    if engine == "baidu" and len(text) > (
++        6000 if limit_for(engine, cfg) > 50000 else 1000
++    ):
++        raise TranslationFailure(
++            "Text exceeds this Baidu plan limit. Use the advanced plan or another engine."
++        )
++    account = (
++        engine
++        + ":"
++        + hashlib.sha256(str(cfg.get("key") or cfg.get("app_id")).encode()).hexdigest()
++    )
++    key = hashlib.sha256(
++        json.dumps(
++            [organization_id, account, source, target, text], ensure_ascii=False
++        ).encode()
++    ).hexdigest()
++    month = datetime.now(timezone.utc).strftime("%Y-%m")
++    characters = len(text.encode("utf-16-le")) // 2
++    con = _cache()
++    try:
++        con.execute("BEGIN IMMEDIATE")
++        hit = con.execute("SELECT result FROM results WHERE key=?", (key,)).fetchone()
++        if hit:
++            con.rollback()
++            return {**json.loads(hit[0]), "cached": True}
++        pending = con.execute(
++            "SELECT created FROM pending WHERE key=?", (key,)
++        ).fetchone()
++        if pending and time.time() - pending[0] < 120:
++            raise TranslationFailure(
++                "This text is already being translated. Try again shortly.", 429
++            )
++        used = con.execute(
++            "SELECT characters FROM usage WHERE account=? AND month=?", (account, month)
++        ).fetchone()
++        if (used[0] if used else 0) + characters > limit_for(engine, cfg):
++            raise TranslationFailure(
++                "The local monthly translation limit has been reached.", 429
++            )
++        con.execute("INSERT OR REPLACE INTO pending VALUES(?,?)", (key, time.time()))
++        con.execute(
++            "INSERT INTO usage VALUES(?,?,?) ON CONFLICT(account,month) DO UPDATE SET characters=characters+excluded.characters",
++            (account, month, characters),
++        )
++        con.commit()
++        # Reserve before the request, including failed attempts whose billing status is unknown.
++        try:
++            result = call_provider(engine, cfg, text, source, target)
++            with con:
++                con.execute(
++                    "INSERT OR REPLACE INTO results VALUES(?,?)",
++                    (key, json.dumps(result, ensure_ascii=False)),
++                )
++            return {**result, "cached": False}
++        finally:
++            with con:
++                con.execute("DELETE FROM pending WHERE key=?", (key,))
++    finally:
++        con.close()
++
++
++class TranslationOptionsAPI(APIView):
++    permission_classes = [IsAuthenticated]
++
++    def _organization(self, request):
++        org = request.user.active_organization
++        if org is None:
++            raise TranslationFailure("Permission denied.", 403)
++        return org
++
++    def _response(self, request, org):
++        return {
++            **capabilities(org.id),
++            "can_configure": bool(
++                request.user.is_superuser or org.created_by_id == request.user.id
++            ),
++        }
++
++    def get(self, request):
++        try:
++            return Response(self._response(request, self._organization(request)))
++        except TranslationFailure as exc:
++            return Response({"detail": str(exc)}, status=exc.status)
++
++    def post(self, request):
++        try:
++            if not isinstance(request.data, dict):
++                raise TranslationFailure("Invalid API configuration.")
++            org = self._organization(request)
++            if not (request.user.is_superuser or org.created_by_id == request.user.id):
++                raise TranslationFailure(
++                    "Only the organization owner can configure translation API keys.",
++                    403,
++                )
++            save_config(org.id, request.data.get("engine"), request.data)
++            return Response(self._response(request, org))
++        except TranslationFailure as exc:
++            return Response({"detail": str(exc)}, status=exc.status)
++
++
++class TaskTranslationAPI(APIView):
++    permission_classes = [IsAuthenticated]
++
++    def post(self, request, pk):
++        task = get_object_or_404(
++            Task.objects.select_related("project").filter(
++                project__organization=request.user.active_organization
++            ),
++            pk=pk,
++        )
++        if not task.has_permission(request.user):
++            return Response({"detail": "Permission denied."}, status=403)
++        try:
++            if not isinstance(request.data, dict):
++                raise TranslationFailure("Invalid API configuration.")
++            fields = [
++                x.get("value", "")[1:]
++                for x in fromstring(task.project.label_config).iter("Text")
++                if x.get("value", "").startswith("$")
++                and x.get("valueType", "text") == "text"
++            ]
++            field = request.data.get("field") or next(
++                (f for f in fields if isinstance(task.data.get(f), str)), None
++            )
++            if field not in fields:
++                raise TranslationFailure("This task has no inline text to translate.")
++            result = translate_text(
++                task.data.get(field),
++                request.data.get("engine", "azure"),
++                request.data.get("source", "auto"),
++                request.data.get("target", "zh"),
++                task.project.organization_id,
++            )
++            return Response({**result, "task_id": task.id, "field": field})
++        except TranslationFailure as exc:
++            return Response({"detail": str(exc)}, status=exc.status)
+diff --git a/label_studio/tasks/urls.py b/label_studio/tasks/urls.py
+index 88b0004..b926d9b 100644
+--- a/label_studio/tasks/urls.py
++++ b/label_studio/tasks/urls.py
+@@ -4,6 +4,7 @@ from django.urls import include, path
+ from rest_framework import routers
+ 
+ from . import api
++from .translation import TaskTranslationAPI, TranslationOptionsAPI
+ 
+ app_name = 'tasks'
+ 
+@@ -11,6 +12,8 @@ router = routers.DefaultRouter()
+ router.register(r'predictions', api.PredictionAPI, basename='prediction')
+ 
+ _api_urlpatterns = [
++    path('translation-options/', TranslationOptionsAPI.as_view(), name='translation-options'),
++    path('<int:pk>/translate/', TaskTranslationAPI.as_view(), name='task-translate'),
+     # CRUD
+     path('', api.TaskListAPI.as_view(), name='task-list'),
+     path('<int:pk>/', api.TaskAPI.as_view(), name='task-detail'),
 diff --git a/label_studio/templates/403.html b/label_studio/templates/403.html
 index ab720a1..5ae3817 100644
 --- a/label_studio/templates/403.html
@@ -4519,32 +5082,142 @@ index d4fad0d..8f762a1 100644
 +AnnotationSettings.title = __uiT("Annotation");
  AnnotationSettings.path = "/annotation";
 diff --git a/web/apps/labelstudio/src/pages/Settings/AnnotationSettings/ModelVersionSelector.jsx b/web/apps/labelstudio/src/pages/Settings/AnnotationSettings/ModelVersionSelector.jsx
-index a39468a..29d197a 100644
+index a39468a..20c67cb 100644
 --- a/web/apps/labelstudio/src/pages/Settings/AnnotationSettings/ModelVersionSelector.jsx
 +++ b/web/apps/labelstudio/src/pages/Settings/AnnotationSettings/ModelVersionSelector.jsx
-@@ -1,3 +1,4 @@
-+import { uiT as __uiT } from "@humansignal/app-common/i18n/ui";
- import { useCallback, useContext, useEffect, useState } from "react";
+@@ -1,95 +1,41 @@
+-import { useCallback, useContext, useEffect, useState } from "react";
++import { uiT as t } from "@humansignal/app-common/i18n/ui";
++import { useCallback, useContext, useEffect, useRef, useState } from "react";
  import { useAPI } from "../../../providers/ApiProvider";
- import { Select } from "../../../components/Form";
-@@ -75,7 +76,7 @@ export const ModelVersionSelector = ({
+-import { Select } from "../../../components/Form";
++import { FormField } from "../../../components/Form/FormField";
+ import { ProjectContext } from "../../../providers/ProjectProvider";
  
-   return (
-     <div>
+-export const ModelVersionSelector = ({
+-  name = "model_version",
+-  valueName = "model_version",
+-  apiName = "projectModelVersions",
+-  ...props
+-}) => {
+-  const api = useAPI();
+-  const { project } = useContext(ProjectContext);
+-  const [loading, setLoading] = useState(true);
+-  const [versions, setVersions] = useState([]);
+-  const [models, setModels] = useState([]);
+-  const [version, setVersion] = useState(null);
+-  const [placeholder, setPlaceholder] = useState("");
+-
+-  useEffect(() => {
+-    setVersion(project?.[valueName] || null);
+-  }, [project?.[valueName], versions]);
+-
+-  const fetchMLVersions = useCallback(async () => {
+-    const pk = project?.id;
+-
+-    if (!pk) return;
+-
+-    const modelVersions = await api.callApi(apiName, {
+-      params: {
+-        pk,
+-        extended: true,
+-        include_live_models: true,
+-      },
+-    });
+-
+-    if (modelVersions?.live?.length > 0) {
+-      const liveModels = modelVersions.live.map((item) => {
+-        const label = `${item.title} (${item.readable_state})`;
+-
+-        return {
+-          group: "Models",
+-          value: item.title,
+-          label,
+-        };
+-      });
+-
+-      setModels(liveModels);
+-    }
+-
+-    if (modelVersions?.static?.length > 0) {
+-      const staticModels = modelVersions.static.map((item) => {
+-        const label = `${item.model_version} (${item.count} predictions)`;
+-
+-        return {
+-          group: "Predictions",
+-          value: item.model_version,
+-          label,
+-        };
+-      });
+-
+-      setVersions(staticModels);
+-    }
+-
+-    if (!modelVersions?.static?.length && !modelVersions?.live?.length) {
+-      setPlaceholder("No model or predictions available");
+-    }
+-
+-    setLoading(false);
+-  }, [project?.id, apiName]);
+-
+-  useEffect(() => {
+-    fetchMLVersions();
+-  }, [fetchMLVersions]);
+-
+-  return (
+-    <div>
 -      <label>Select which predictions or which model you want to use:</label>
-+      <label>{__uiT("Select which predictions or which model you want to use:")}</label>
-       <div style={{ display: "flex", alignItems: "center", width: 400 }}>
-         <div style={{ flex: 1, paddingRight: 16 }}>
-           <Select
-@@ -84,7 +85,7 @@ export const ModelVersionSelector = ({
-             value={version}
-             onChange={setVersion}
-             options={[...models, ...versions]}
+-      <div style={{ display: "flex", alignItems: "center", width: 400 }}>
+-        <div style={{ flex: 1, paddingRight: 16 }}>
+-          <Select
+-            name={name}
+-            disabled={!versions.length && !models.length}
+-            value={version}
+-            onChange={setVersion}
+-            options={[...models, ...versions]}
 -            placeholder={placeholder || "Please select model or predictions"}
-+            placeholder={placeholder || __uiT("Please select model or predictions")}
-             isInProgress={loading}
-             {...props}
-           />
+-            isInProgress={loading}
+-            {...props}
+-          />
+-        </div>
+-      </div>
+-    </div>
+-  );
++export const ModelVersionSelector = ({name="model_version",valueName="model_version",apiName="projectModelVersions",...props}) => {
++  const api=useAPI();const {project}=useContext(ProjectContext);
++  const [loading,setLoading]=useState(true),[models,setModels]=useState([]),[versions,setVersions]=useState([]);
++  const [version,setVersion]=useState(""),[error,setError]=useState(false);
++  const sequence=useRef(0);
++  useEffect(()=>setVersion(project?.[valueName]||""),[project?.id,project?.[valueName]]);
++  const refresh=useCallback(async()=>{
++    if(!project?.id)return;
++    const current=++sequence.current;setLoading(true);setError(false);
++    try {
++      const data=await api.callApi(apiName,{params:{pk:project.id,extended:true,include_live_models:true}});
++      if(current!==sequence.current)return;
++      if(!data||data.error)throw Error("Unable to load models");
++      setModels(data.live||[]);setVersions(data.static||[]);
++    }catch{if(current===sequence.current){setError(true);setModels([]);setVersions([]);}}
++    finally{if(current===sequence.current)setLoading(false);}
++  },[api,apiName,project?.id]);
++  useEffect(()=>{refresh();return()=>{sequence.current++;};},[refresh]);
++  return <div>
++    <label htmlFor={`prelabel-${name}`}>{t("Select which predictions or which model you want to use:")}</label>
++    <FormField name={name} setValue={v=>setVersion(v||"")} {...props}>
++      {ref=><select id={`prelabel-${name}`} data-testid="prelabel-model-selector" ref={ref} name={name}
++        style={{display:"block",width:"100%",maxWidth:560,padding:10,border:"1px solid var(--color-neutral-border, #ccc)",borderRadius:6,color:"inherit",background:"var(--color-neutral-surface, white)"}}
++        value={version} onChange={e=>setVersion(e.target.value)} disabled={loading||(!models.length&&!versions.length)}>
++        <option value="" disabled>{t(loading?"Loading...":"Please select model or predictions")}</option>
++        {models.length>0&&<optgroup label={t("Models")}>{models.map(m=><option key={`model-${m.id}`} value={m.title}>{m.title} ({t(m.readable_state)})</option>)}</optgroup>}
++        {versions.length>0&&<optgroup label={t("Predictions")}>{versions.map(v=><option key={`version-${v.model_version}`} value={v.model_version}>{v.model_version} ({v.count} {t("Predictions")})</option>)}</optgroup>}
++      </select>}
++    </FormField>
++    {!loading&&!models.length&&!versions.length&&<p>{t("No model or predictions available")}</p>}
++    {error&&<p role="alert">{t("Unable to load prelabeling models.")}</p>}
++    <button type="button" onClick={refresh} disabled={loading} style={{marginTop:8}}>{t("Refresh models")}</button>
++    <p style={{fontSize:12,marginTop:8}}>{t("Save this selection, then reopen the task to retrieve predictions from the selected model. Existing manual annotations are preserved.")}</p>
++  </div>;
+ };
 diff --git a/web/apps/labelstudio/src/pages/Settings/DangerZone.jsx b/web/apps/labelstudio/src/pages/Settings/DangerZone.jsx
 index 7daed28..bae3c53 100644
 --- a/web/apps/labelstudio/src/pages/Settings/DangerZone.jsx
@@ -14767,7 +15440,7 @@ index 63ee0e0..8d4175a 100644
        {isAllHidden ? (
          <IconOutlinerEyeClosed width={16} height={16} />
 diff --git a/web/libs/editor/src/components/SidePanels/TabPanels/Tabs.tsx b/web/libs/editor/src/components/SidePanels/TabPanels/Tabs.tsx
-index 09043dc..da7eb89 100644
+index 09043dc..2603605 100644
 --- a/web/libs/editor/src/components/SidePanels/TabPanels/Tabs.tsx
 +++ b/web/libs/editor/src/components/SidePanels/TabPanels/Tabs.tsx
 @@ -1,3 +1,4 @@
@@ -14775,6 +15448,15 @@ index 09043dc..da7eb89 100644
  import { useRef, useState } from "react";
  import { IconCollapseSmall, IconExpandSmall, IconOutlinerDrag } from "@humansignal/icons";
  import { useDrag } from "../../../hooks/useDrag";
+@@ -222,7 +223,7 @@ export const Tabs = (
+               crowded:
+                 !props.locked &&
+                 props.panelViews.length > 3 &&
+-                props.panelViews.some((view) => view.name === HOST_VIEW_NAME),
++                props.panelViews.some((view) => view.name === HOST_VIEW_NAME || view.name === "translation"),
+             })
+             .toClassName()}
+         >
 @@ -283,7 +284,7 @@ export const Tabs = (
                  cursor: "pointer",
                }}
@@ -14785,7 +15467,7 @@ index 09043dc..da7eb89 100644
                {props.bottomCollapsed ? <IconExpandSmall /> : <IconCollapseSmall />}
              </Button>
 diff --git a/web/libs/editor/src/components/SidePanels/TabPanels/utils.ts b/web/libs/editor/src/components/SidePanels/TabPanels/utils.ts
-index 0c04780..9becf6f 100644
+index 0c04780..3db771a 100644
 --- a/web/libs/editor/src/components/SidePanels/TabPanels/utils.ts
 +++ b/web/libs/editor/src/components/SidePanels/TabPanels/utils.ts
 @@ -1,3 +1,4 @@
@@ -14793,7 +15475,21 @@ index 0c04780..9becf6f 100644
  import type { FC, MutableRefObject, ReactNode } from "react";
  import { clamp } from "../../../utils/utilities";
  import {
-@@ -184,38 +185,38 @@ export const panelComponents: { [key: string]: FC<PanelProps> } = {
+@@ -10,6 +11,7 @@ import {
+ } from "../constants";
+ import { Comments, Custom, History, Host, Info, Relations } from "../DetailsPanel/DetailsPanel";
+ import { OutlinerComponent } from "../OutlinerPanel/OutlinerPanel";
++import { TranslationPanel } from "../TranslationPanel/TranslationPanel";
+ import type { PanelProps } from "../PanelBase";
+ import {
+   emptyPanel,
+@@ -179,46 +181,48 @@ export const panelComponents: { [key: string]: FC<PanelProps> } = {
+   info: Info as FC<PanelProps>,
+   custom: Custom as FC<PanelProps>,
+   [HOST_VIEW_NAME]: Host as FC<PanelProps>,
++  translation: TranslationPanel as FC<PanelProps>,
+ };
+ 
  const panelViews = [
    {
      name: "regions",
@@ -14838,6 +15534,220 @@ index 0c04780..9becf6f 100644
      component: panelComponents.custom as FC<PanelProps>,
      active: false,
    },
++  { name: "translation", title: __uiT("Translation"), component: panelComponents.translation, active: false },
+ ];
+ 
+ // Custom tab for special tags; will be placed in "regions-relations" panel by default
+@@ -238,7 +242,7 @@ export const enterprisePanelDefault: Record<string, PanelBBox> = {
+     detached: false,
+     alignment: Side.right,
+     maxHeight: DEFAULT_PANEL_MAX_HEIGHT,
+-    panelViews: [panelViews[3], panelViews[4], panelViews[1]],
++    panelViews: [panelViews[3], panelViews[4], panelViews[1], panelViews[6]],
+   },
+   "regions-relations": {
+     order: 2,
+@@ -271,7 +275,7 @@ export const openSourcePanelDefault: Record<string, PanelBBox> = {
+     detached: false,
+     alignment: Side.right,
+     maxHeight: DEFAULT_PANEL_MAX_HEIGHT,
+-    panelViews: [panelViews[3], panelViews[1]],
++    panelViews: [panelViews[3], panelViews[1], panelViews[6]],
+   },
+   "regions-relations": {
+     order: 2,
+@@ -308,7 +312,7 @@ export const partialEmptyBaseProps = {
+   setSidePanelCollapsed: () => {},
+   dragTop: false,
+   dragBottom: false,
+-  panelViews: [panelViews[0], panelViews[1], panelViews[2], panelViews[3], panelViews[4]],
++  panelViews: [panelViews[0], panelViews[1], panelViews[2], panelViews[3], panelViews[4], panelViews[6]],
+ };
+ 
+ export const resizers = ["top-left", "top-right", "bottom-left", "bottom-right", "top", "bottom", "right", "left"];
+@@ -335,7 +339,12 @@ export const restorePanel = (
+ ): StoredPanelState => {
+   const previousState = window.localStorage.getItem("panelState");
+   const parsed: StoredPanelState | null = previousState && JSON.parse(previousState);
+-  const panelData = parsed && parsed.panelData;
++  let panelData = parsed && parsed.panelData;
++  // Add the new tab without discarding the user's existing docking geometry.
++  if (panelData && !Object.values(panelData).some(p=>p.panelViews.some(v=>v.name==="translation"))) {
++    const target=Object.keys(panelData).find(key=>panelData[key].panelViews.some(v=>v.name==="info"));
++    if (target) panelData={...panelData,[target]:{...panelData[target],panelViews:[...panelData[target].panelViews,{...panelViews[6]}]}};
++  }
+   const defaultCollapsedSide = { [Side.left]: false, [Side.right]: false };
+   const collapsedSide = parsed?.collapsedSide ?? defaultCollapsedSide;
+   // The host tab is not counted: whether a host offers it says nothing about how old the saved layout is.
+@@ -375,6 +384,8 @@ export const restoreComponentsToState = (panelData: Record<string, PanelBBox>) =
+ 
+     panel.panelViews.forEach((view: { name: string; component: FC<PanelProps> }) => {
+       view.component = panelComponents[view.name];
++      const definition=panelViews.find(item=>item.name===view.name);
++      if(definition && view.name!=="custom")Object.assign(view,{title:definition.title});
+     });
+   });
+ 
+diff --git a/web/libs/editor/src/components/SidePanels/TranslationPanel/TranslationPanel.prefix.css b/web/libs/editor/src/components/SidePanels/TranslationPanel/TranslationPanel.prefix.css
+new file mode 100644
+index 0000000..2783eec
+--- /dev/null
++++ b/web/libs/editor/src/components/SidePanels/TranslationPanel/TranslationPanel.prefix.css
+@@ -0,0 +1,14 @@
++.translation-panel { display:flex; flex-direction:column; gap:12px; padding:14px; min-width:0; overflow:auto; font-size:14px; }
++.translation-panel label { display:flex; flex-direction:column; gap:6px; font-weight:600; min-width:0; }
++.translation-panel select,.translation-panel textarea,.translation-panel input { width:100%; box-sizing:border-box; padding:8px; border:1px solid var(--color-neutral-border,#cbd5e1); border-radius:6px; color:var(--color-neutral-content,#1f2937); background:var(--color-neutral-surface,#fff); font:inherit; }
++.translation-panel textarea { line-height:1.6; resize:vertical; min-height:150px; }
++.translation-panel__languages { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
++.translation-panel button { padding:8px 12px; border:1px solid var(--color-neutral-border,#cbd5e1); border-radius:6px; cursor:pointer; }
++.translation-panel__button { color:var(--color-primary-content,#fff); background:var(--color-primary-background,#4e5baa); }
++.translation-panel button:disabled { opacity:.5; cursor:not-allowed; }
++.translation-panel__hint { margin:0; font-size:12px; color:var(--color-neutral-content-subtler,#64748b); line-height:1.5; }
++.translation-panel__error { margin:0; color:var(--color-negative-content,#b91c1c); }
++.translation-panel__config { border:1px solid var(--color-neutral-border,#cbd5e1); padding:10px; border-radius:6px; }
++.translation-panel__config summary { cursor:pointer; font-weight:600; }
++.translation-panel__config label,.translation-panel__config p,.translation-panel__actions { margin-top:10px; }
++.translation-panel__actions { display:flex; gap:8px; flex-wrap:wrap; }
+diff --git a/web/libs/editor/src/components/SidePanels/TranslationPanel/TranslationPanel.tsx b/web/libs/editor/src/components/SidePanels/TranslationPanel/TranslationPanel.tsx
+new file mode 100644
+index 0000000..b339d2f
+--- /dev/null
++++ b/web/libs/editor/src/components/SidePanels/TranslationPanel/TranslationPanel.tsx
+@@ -0,0 +1,134 @@
++import { inject, observer } from "mobx-react";
++import { useEffect, useRef, useState } from "react";
++import { uiT as t } from "@humansignal/app-common/i18n/ui";
++import { cn } from "../../../utils/bem";
++import "./TranslationPanel.prefix.css";
++
++type Provider = {id:string;label:string;configured:boolean;monthly_limit:number;languages:Record<string,string>};
++type Preferences = {engine:string;source:string;target:string};
++const storageKey = "label-studio.translation-preferences";
++function readPreferences(): Preferences {
++  try { return {engine:"",source:"auto",target:"zh",...JSON.parse(localStorage.getItem(storageKey)||"{}")}; }
++  catch { return {engine:"",source:"auto",target:"zh"}; }
++}
++function csrf() {
++  return decodeURIComponent(document.cookie.split("; ").find(v=>v.startsWith("csrftoken="))?.split("=").slice(1).join("=")||"");
++}
++
++export const TranslationPanel = inject("store")(observer(({store,isActive=true}:any) => {
++  const taskId = store?.task?.id;
++  const [providers,setProviders] = useState<Provider[]>([]);
++  const [prefs,setPrefs] = useState<Preferences>(readPreferences);
++  const [result,setResult] = useState<any>(null);
++  const [error,setError] = useState("");
++  const [busy,setBusy] = useState(false);
++  const [canConfigure,setCanConfigure] = useState(false);
++  const [credentials,setCredentials] = useState({key:"",region:"",app_id:"",secret:""});
++  const [monthlyLimit,setMonthlyLimit] = useState(0);
++  const [saving,setSaving] = useState(false);
++  const [saved,setSaved] = useState(false);
++  const request = useRef<AbortController|null>(null);
++  const generation = useRef(0);
++  const provider = providers.find(p=>p.id===prefs.engine);
++
++  useEffect(()=>{
++    if(!isActive)return;
++    const controller=new AbortController();
++    fetch("/api/tasks/translation-options/",{credentials:"same-origin",signal:controller.signal})
++      .then(async response=>{const data=await response.json();if(!response.ok)throw Error(data.detail||"Unable to load translation engines.");return data;})
++      .then(data=>{
++        setProviders(data.providers);
++        setCanConfigure(data.can_configure);
++        setPrefs(old=>({...old,engine:data.providers.some((p:Provider)=>p.id===old.engine)?old.engine:data.default_engine}));
++      }).catch(e=>{if(e.name!=="AbortError")setError(e.message);});
++    return ()=>controller.abort();
++  },[isActive]);
++
++  useEffect(()=>{
++    generation.current++;request.current?.abort();setBusy(false);setResult(null);setError("");
++    try {localStorage.setItem(storageKey,JSON.stringify(prefs));} catch {}
++    return ()=>request.current?.abort();
++  },[taskId,prefs.engine,prefs.source,prefs.target,isActive]);
++
++  useEffect(()=>{
++    setCredentials({key:"",region:"",app_id:"",secret:""});setSaved(false);
++    setMonthlyLimit(provider?.monthly_limit||0);
++  },[prefs.engine,provider?.monthly_limit]);
++
++  async function saveCredentials(clear=false) {
++    setSaving(true);setSaved(false);setError("");
++    try {
++      const response=await fetch("/api/tasks/translation-options/",{method:"POST",credentials:"same-origin",
++        headers:{"Content-Type":"application/json","X-CSRFToken":csrf()},
++        body:JSON.stringify({engine:prefs.engine,...credentials,monthly_limit:monthlyLimit,clear})});
++      const data=await response.json();if(!response.ok)throw Error(data.detail||"Unable to save API configuration.");
++      setProviders(data.providers);setCredentials({key:"",region:"",app_id:"",secret:""});setSaved(true);
++    } catch(e:any){setError(e.message);} finally{setSaving(false);}
++  }
++
++  function change(key:keyof Preferences,value:string) {
++    setPrefs(old=>{
++      const next={...old,[key]:value};const engine=providers.find(p=>p.id===next.engine);
++      if(engine && next.source!=="auto" && !engine.languages[next.source])next.source="auto";
++      if(engine && !engine.languages[next.target])next.target="zh";
++      return next;
++    });
++  }
++  async function translate() {
++    request.current?.abort();const controller=new AbortController();request.current=controller;
++    const current=++generation.current;setBusy(true);setError("");setResult(null);
++    try {
++      const response=await fetch(`/api/tasks/${taskId}/translate/`,{method:"POST",credentials:"same-origin",signal:controller.signal,
++        headers:{"Content-Type":"application/json","X-CSRFToken":csrf()},body:JSON.stringify(prefs)});
++      const data=await response.json();if(!response.ok)throw Error(data.detail||"Translation request failed.");
++      if(current===generation.current)setResult(data);
++    } catch(e:any) {if(e.name!=="AbortError"&&current===generation.current)setError(e.message);}
++    finally {if(current===generation.current)setBusy(false);}
++  }
++  if(!isActive)return null;
++  return <section className={cn("translation-panel").toClassName()} data-testid="translation-panel">
++    <label>{t("Translation engine")}
++      <select aria-label={t("Translation engine")} value={prefs.engine} onChange={e=>change("engine",e.target.value)}>
++        {!providers.length&&<option value="">{t("Loading...")}</option>}
++        {providers.map(p=><option key={p.id} value={p.id}>{p.label}{p.configured?"":` (${t("Not configured")})`}</option>)}
++      </select>
++    </label>
++    <div className={cn("translation-panel").elem("languages").toClassName()}>
++      <label>{t("Source language")}<select aria-label={t("Source language")} value={prefs.source} onChange={e=>change("source",e.target.value)}>
++        <option value="auto">{t("Auto-detect")}</option>
++        {Object.entries(provider?.languages||{}).map(([code,label])=><option key={code} value={code}>{t(label)}</option>)}
++      </select></label>
++      <label>{t("Target language")}<select aria-label={t("Target language")} value={prefs.target} onChange={e=>change("target",e.target.value)}>
++        {Object.entries(provider?.languages||{zh:"Chinese (Simplified)"}).map(([code,label])=><option key={code} value={code}>{t(label)}</option>)}
++      </select></label>
++    </div>
++    {provider&&<p className={cn("translation-panel").elem("hint").toClassName()}>{t("Local monthly character limit")}: {provider.monthly_limit.toLocaleString()}</p>}
++    {provider&&!provider.configured&&<p role="status">{t(canConfigure?"Configure an API key below to enable this engine.":"Ask the organization owner to configure this translation engine.")}</p>}
++    {provider&&canConfigure&&<details className={cn("translation-panel").elem("config").toClassName()}>
++      <summary>{t("API settings")}</summary>
++      <p className={cn("translation-panel").elem("hint").toClassName()}>{t("Keys are encrypted on the server and are never returned to the browser. Leave a field blank to keep its saved value.")}</p>
++      {prefs.engine==="baidu"?<>
++        <label>App ID<input aria-label="App ID" autoComplete="off" value={credentials.app_id} onChange={e=>setCredentials(v=>({...v,app_id:e.target.value}))}/></label>
++        <label>{t("Secret Key")}<input aria-label={t("Secret Key")} type="password" autoComplete="new-password" value={credentials.secret} onChange={e=>setCredentials(v=>({...v,secret:e.target.value}))}/></label>
++      </>:<label>API Key<input aria-label="API Key" type="password" autoComplete="new-password" value={credentials.key} onChange={e=>setCredentials(v=>({...v,key:e.target.value}))}/></label>}
++      {prefs.engine==="azure"&&<label>{t("Azure region")}<input aria-label={t("Azure region")} autoComplete="off" value={credentials.region} onChange={e=>setCredentials(v=>({...v,region:e.target.value}))}/></label>}
++      <label>{t("Local monthly character limit")}<input aria-label={t("Local monthly character limit")} type="number" min={0} max={providers.find(p=>p.id===prefs.engine)?.id==='azure'?2000000:prefs.engine==='baidu'?1000000:500000} value={monthlyLimit} onChange={e=>setMonthlyLimit(Number(e.target.value))}/></label>
++      <p className={cn("translation-panel").elem("hint").toClassName()}>{t("Calls stop at this local limit. Provider billing and usage outside this application are separate.")}</p>
++      <div className={cn("translation-panel").elem("actions").toClassName()}>
++        <button type="button" disabled={saving} onClick={()=>saveCredentials()}>{t(saving?"Saving...":"Save API settings")}</button>
++        {provider.configured&&<button type="button" disabled={saving} onClick={()=>saveCredentials(true)}>{t("Remove saved key")}</button>}
++      </div>
++      {saved&&<p role="status">{t("API settings saved. Existing keys are not displayed.")}</p>}
++    </details>}
++    <button type="button" className={cn("translation-panel").elem("button").toClassName()} disabled={busy||!taskId||!provider?.configured} onClick={translate}>
++      {t(busy?"Translating...":"Translate current text")}
++    </button>
++    {error&&<p role="alert" className={cn("translation-panel").elem("error").toClassName()}>{t(error)}</p>}
++    {result&&<>
++      <p className={cn("translation-panel").elem("hint").toClassName()}>{t("Detected language")}: {t(provider?.languages[result.detected_source]||result.detected_source)}{result.cached?` · ${t("Cached translation")}`:""}</p>
++      <textarea aria-label={t("Translation result")} readOnly rows={10} value={result.translation}/>
++      <button type="button" onClick={()=>navigator.clipboard.writeText(result.translation)}>{t("Copy translation")}</button>
++    </>}
++    <p className={cn("translation-panel").elem("hint").toClassName()}>{t("Translation is for reference only. Annotate the original text; translations never replace task data or annotations.")}</p>
++  </section>;
++}));
 diff --git a/web/libs/editor/src/components/TaskSummary/Aggregation.tsx b/web/libs/editor/src/components/TaskSummary/Aggregation.tsx
 index a6d9485..6bad500 100644
 --- a/web/libs/editor/src/components/TaskSummary/Aggregation.tsx

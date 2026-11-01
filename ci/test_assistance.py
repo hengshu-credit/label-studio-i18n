@@ -1,0 +1,308 @@
+"""Contract/security regressions. Run only in the disposable synthetic CI instance."""
+
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, "/label-studio/label_studio")
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "core.settings.label_studio")
+import django
+
+django.setup()
+from django.test import override_settings
+from rest_framework.test import APIRequestFactory, force_authenticate
+from projects.models import Project
+from tasks.models import Task
+from tasks.api import TaskAPI
+from tasks import translation as tr
+from users.models import User
+
+
+class TranslationTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.settings = override_settings(
+            BASE_DATA_DIR=self.directory.name, SECRET_KEY="synthetic-test-only"
+        )
+        self.settings.enable()
+        self.addCleanup(self.directory.cleanup)
+        self.addCleanup(self.settings.disable)
+        self.owner = User.objects.get(email="ci@example.invalid")
+        self.org = self.owner.active_organization_id
+        self.factory = APIRequestFactory()
+
+    def api(self, view, method, data=None, user=None, **kwargs):
+        request = getattr(self.factory, method)("/test/", data=data, format="json")
+        if user is not False:
+            force_authenticate(request, user=user or self.owner)
+        return view.as_view()(request, **kwargs)
+
+    def enable(self, engine="azure", **extra):
+        tr.save_config(self.org, engine, {"key": "synthetic-key-not-real", **extra})
+
+    def test_defaults_configuration_encryption_and_removal(self):
+        self.assertEqual(tr.capabilities(self.org)["default_engine"], "azure")
+        self.enable("google")
+        self.assertEqual(tr.capabilities(self.org)["default_engine"], "google")
+        response = self.api(
+            tr.TranslationOptionsAPI,
+            "post",
+            {"engine": "azure", "key": "synthetic-secret", "region": "eastasia"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["default_engine"], "azure")
+        self.assertNotIn("synthetic-secret", json.dumps(response.data))
+        con = tr._cache()
+        stored = con.execute("SELECT value FROM provider_config").fetchone()[0]
+        con.close()
+        self.assertNotIn(b"synthetic-secret", stored)
+        self.assertEqual(tr.read_config(self.org)["azure"]["key"], "synthetic-secret")
+        tr.save_config(self.org, "azure", {"key": "", "monthly_limit": 15})
+        self.assertEqual(tr.read_config(self.org)["azure"]["key"], "synthetic-secret")
+        tr.save_config(self.org, "azure", {"clear": True})
+        self.assertNotIn("azure", tr.read_config(self.org))
+        self.assertEqual(tr.read_config(self.org + 10000), {})
+
+    def test_authentication_and_owner_only_key_configuration(self):
+        self.assertIn(
+            self.api(tr.TranslationOptionsAPI, "get", user=False).status_code,
+            (401, 403),
+        )
+        member = SimpleNamespace(
+            is_authenticated=True,
+            is_superuser=False,
+            id=-100,
+            active_organization=self.owner.active_organization,
+        )
+        response = self.api(
+            tr.TranslationOptionsAPI,
+            "post",
+            {"engine": "azure", "key": "x"},
+            user=member,
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(tr.read_config(self.org), {})
+
+    def test_task_uses_original_text_and_preserves_annotations(self):
+        self.enable()
+        task = Task.objects.get(pk=1)
+        before = (task.data, task.annotations.count(), task.drafts.count())
+        with patch.object(
+            tr,
+            "call_provider",
+            return_value={"translation": "合成译文", "detected_source": "en"},
+        ) as call:
+            result = self.api(
+                tr.TaskTranslationAPI,
+                "post",
+                {"engine": "azure", "source": "auto", "target": "zh"},
+                pk=task.pk,
+            )
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(call.call_args.args[2], task.data["content"])
+            self.assertEqual(call.call_args.args[3:], ("auto", "zh"))
+        task.refresh_from_db()
+        self.assertEqual(
+            (task.data, task.annotations.count(), task.drafts.count()), before
+        )
+        bad = self.api(
+            tr.TaskTranslationAPI, "post", {"field": "private-other-field"}, pk=task.pk
+        )
+        self.assertEqual(bad.status_code, 400)
+
+    def test_cross_organization_task_is_hidden(self):
+        stranger = SimpleNamespace(is_authenticated=True, active_organization=None)
+        result = self.api(tr.TaskTranslationAPI, "post", {}, user=stranger, pk=1)
+        self.assertEqual(result.status_code, 404)
+
+    def test_cache_is_scoped_and_local_cap_counts_unicode(self):
+        self.enable(monthly_limit=4)
+        with patch.object(
+            tr,
+            "call_provider",
+            return_value={"translation": "你好", "detected_source": "th"},
+        ) as call:
+            first = tr.translate_text("ก😀", "azure", "auto", "zh", self.org)
+            second = tr.translate_text("ก😀", "azure", "auto", "zh", self.org)
+            self.assertFalse(first["cached"])
+            self.assertTrue(second["cached"])
+            self.assertEqual(call.call_count, 1)
+            with self.assertRaisesRegex(tr.TranslationFailure, "monthly"):
+                tr.translate_text("ab", "azure", "auto", "zh", self.org)
+            tr.translate_text("c", "azure", "auto", "zh", self.org)
+            with self.assertRaisesRegex(tr.TranslationFailure, "not configured"):
+                tr.translate_text("ก😀", "azure", "auto", "zh", self.org + 10000)
+
+    def test_failures_are_sanitized_and_release_pending_reservation(self):
+        self.enable()
+        with patch.object(tr.requests, "Session") as session:
+            session.return_value.post.side_effect = tr.requests.RequestException(
+                "secret-provider-response"
+            )
+            for _ in range(2):
+                with self.assertRaises(tr.TranslationFailure) as error:
+                    tr.translate_text("synthetic", "azure", "auto", "zh", self.org)
+                self.assertNotIn("secret-provider-response", str(error.exception))
+                self.assertEqual(error.exception.status, 502)
+
+    def test_official_provider_request_and_detection_contracts(self):
+        cases = [
+            (
+                "azure",
+                {"key": "fake", "region": "eastasia"},
+                [
+                    {
+                        "detectedLanguage": {"language": "th"},
+                        "translations": [{"text": "测试"}],
+                    }
+                ],
+                "https://api.cognitive.microsofttranslator.com/translate",
+            ),
+            (
+                "google",
+                {"key": "fake"},
+                {
+                    "data": {
+                        "translations": [
+                            {
+                                "translatedText": "A &amp; B",
+                                "detectedSourceLanguage": "th",
+                            }
+                        ]
+                    }
+                },
+                "https://translation.googleapis.com/language/translate/v2",
+            ),
+            (
+                "baidu",
+                {"app_id": "fake-app", "secret": "fake-secret"},
+                {"from": "th", "trans_result": [{"dst": "测试"}]},
+                "https://fanyi-api.baidu.com/api/trans/vip/translate",
+            ),
+        ]
+        for engine, cfg, payload, url in cases:
+            with self.subTest(engine=engine), patch.object(
+                tr.requests, "Session"
+            ) as factory:
+                response = factory.return_value.post.return_value
+                response.status_code = 200
+                response.json.return_value = payload
+                result = tr.call_provider(engine, cfg, "ทดสอบ", "auto", "zh")
+                self.assertEqual(result["detected_source"], "th")
+                args, kwargs = factory.return_value.post.call_args
+                self.assertEqual(args[0], url)
+                self.assertFalse(kwargs["allow_redirects"])
+                self.assertNotIn("fake", args[0])
+                if engine == "azure":
+                    self.assertNotIn("from", kwargs["params"])
+                    self.assertEqual(kwargs["params"]["to"], "zh-Hans")
+                    self.assertEqual(kwargs["json"], [{"Text": "ทดสอบ"}])
+                elif engine == "google":
+                    self.assertNotIn("source", kwargs["json"])
+                    self.assertEqual(kwargs["json"]["target"], "zh-CN")
+                    self.assertEqual(result["translation"], "A & B")
+                    self.assertEqual(kwargs["headers"]["X-Goog-Api-Key"], "fake")
+                else:
+                    body = kwargs["data"]
+                    self.assertEqual(body["from"], "auto")
+                    expected = hashlib.md5(
+                        ("fake-appทดสอบ" + body["salt"] + "fake-secret").encode()
+                    ).hexdigest()
+                    self.assertEqual(body["sign"], expected)
+
+    def test_input_validation_and_explicit_language(self):
+        for args in [
+            ("x", "evil", "auto", "zh"),
+            ("x", "baidu", "auto", "uz"),
+            ("", "azure", "auto", "zh"),
+        ]:
+            with self.assertRaises(tr.TranslationFailure):
+                tr.translate_text(*args, self.org)
+        self.assertEqual(
+            tr.translate_text("original", "azure", "en", "en", self.org)["translation"],
+            "original",
+        )
+        with self.assertRaises(tr.TranslationFailure):
+            tr.save_config(self.org, "azure", {"monthly_limit": 2000001})
+        with patch.object(tr.requests, "Session") as session:
+            session.return_value.post.return_value.status_code = 200
+            session.return_value.post.return_value.json.return_value = [
+                {"translations": [{"text": "test"}]}
+            ]
+            tr.call_provider("azure", {"key": "fake"}, "你好", "zh", "en")
+            self.assertEqual(
+                session.return_value.post.call_args.kwargs["params"]["from"], "zh-Hans"
+            )
+            tr.call_provider("azure", {"key": "fake"}, "synthetic", "tl", "zh")
+            self.assertEqual(
+                session.return_value.post.call_args.kwargs["params"]["from"], "fil"
+            )
+
+
+class SelectedModelTests(unittest.TestCase):
+    def setUp(self):
+        self.project = Project.objects.get(pk=1)
+        self.original = self.project.model_version
+        self.addCleanup(
+            lambda: Project.objects.filter(pk=1).update(model_version=self.original)
+        )
+        self.backends = list(self.project.ml_backends.order_by("id"))
+        self.assertGreaterEqual(len(self.backends), 2)
+
+    def test_selected_backend_drives_prediction_evaluation(self):
+        from data_manager.functions import evaluate_predictions
+        from ml.models import MLBackend
+
+        self.project.model_version = self.backends[1].title
+        self.assertEqual(self.project.ml_backend.pk, self.backends[1].pk)
+        task = Task.objects.get(pk=1)
+        task.project = self.project
+        with patch.object(
+            MLBackend, "predict_tasks", autospec=True, return_value=None
+        ) as call:
+            evaluate_predictions([task])
+            self.assertEqual(call.call_args.args[0].pk, self.backends[1].pk)
+
+    def test_old_model_predictions_do_not_block_selected_model(self):
+        self.project.model_version = self.backends[1].title
+        task = Task.objects.get(pk=1)
+        task.project = self.project
+        api = TaskAPI()
+        api.task = task
+        with patch("tasks.api.evaluate_predictions") as evaluate, patch.object(
+            api, "refresh_predictions"
+        ):
+            api.maybe_evaluate_predictions(self.project, None)
+            evaluate.assert_called_once_with([task])
+        # Selecting an existing stored version never calls a live model.
+        self.project.model_version = "synthetic-ci"
+        with patch("tasks.api.evaluate_predictions") as evaluate:
+            api.maybe_evaluate_predictions(self.project, None)
+            evaluate.assert_not_called()
+
+    def test_selected_cached_prediction_is_reused(self):
+        self.project.model_version = self.backends[0].title
+        self.backends[0].model_version = "synthetic-ci"
+        self.backends[0].save(update_fields=["model_version"])
+        self.addCleanup(
+            lambda: type(self.backends[0])
+            .objects.filter(pk=self.backends[0].pk)
+            .update(model_version="ci-first")
+        )
+        task = Task.objects.get(pk=1)
+        task.project = self.project
+        api = TaskAPI()
+        api.task = task
+        with patch("tasks.api.evaluate_predictions") as evaluate:
+            api.maybe_evaluate_predictions(self.project, None)
+            evaluate.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
