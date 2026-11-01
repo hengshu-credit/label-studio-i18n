@@ -1,0 +1,35 @@
+name: label-studio-i18n
+services:
+  label-studio:
+    image: hengshu/label-studio-i18n:local
+    build:
+      context: ./upstream
+      dockerfile: ../Dockerfile
+      target: production
+      args:
+        COMMIT_VERSION: 1.24.0.dev0-hengshu-i18n
+        COMMIT_SHA: ${SOURCE_REVISION:-80436a3f82675b816a8ce3d8b3e8cd0371bd119e}
+        COMMIT_BRANCH: hengshu-credit/main
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${LABEL_STUDIO_PORT:-8080}:8080"
+    environment:
+      LABEL_STUDIO_BASE_DATA_DIR: /label-studio/data
+      LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED: "true"
+      LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT: /label-studio/local-files
+      LABEL_STUDIO_DISABLE_TELEMETRY: "true"
+      SSRF_PROTECTION_ENABLED: "true"
+      ML_BLOCK_LOCAL_IP: ${ML_BLOCK_LOCAL_IP:-true}
+    volumes:
+      - type: bind
+        source: ${LABEL_STUDIO_DATA_DIR:-./data}
+        target: /label-studio/data
+      - type: bind
+        source: ${LABEL_STUDIO_LOCAL_FILES_DIR:-./local-files}
+        target: /label-studio/local-files
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=10)"]
+      interval: 20s
+      timeout: 15s
+      start_period: 120s
+      retries: 8

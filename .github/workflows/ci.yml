@@ -1,0 +1,64 @@
+name: Localization CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  resources:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        locale: [en, zh-CN]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+        env:
+          TEST_LOCALE: ${{ matrix.locale }}
+  build-and-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: npm ci
+      - run: python tools/prepare.py
+      - run: node tools/check-source.cjs
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          file: Dockerfile
+          target: production
+          load: true
+          tags: label-studio-i18n:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            COMMIT_VERSION=1.24.0.dev0-hengshu-i18n
+            COMMIT_SHA=${{ github.sha }}
+            COMMIT_BRANCH=hengshu-credit/main
+      - run: docker compose -f ci/compose.yaml up -d --wait --wait-timeout 300
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test
+      - if: always()
+        run: docker compose -f ci/compose.yaml logs --no-color > artifacts/container.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: localization-validation
+          path: artifacts/

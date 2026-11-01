@@ -1,0 +1,14 @@
+{
+  "name": "hengshu-label-studio-i18n",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Reproducible Chinese/English localization overlay for Label Studio",
+  "scripts": {
+    "test": "node --test tests/*.test.cjs"
+  },
+  "devDependencies": {
+    "@babel/parser": "7.28.5",
+    "@babel/traverse": "7.28.5",
+    "@playwright/test": "1.56.1"
+  }
+}

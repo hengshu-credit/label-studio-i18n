@@ -1,0 +1,9 @@
+/upstream/
+/node_modules/
+/artifacts/
+*.log
+.env
+**/__pycache__/
+**/*.sqlite*
+**/data/
+**/cache/

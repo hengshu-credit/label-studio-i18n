@@ -1,0 +1,12 @@
+Label Studio Chinese/English localization overlay
+
+Based on HumanSignal/label-studio, distributed under the Apache License, Version 2.0.
+Upstream source: https://github.com/HumanSignal/label-studio
+Pinned upstream revision: 80436a3f82675b816a8ce3d8b3e8cd0371bd119e
+
+The internationalization foundation incorporates work from wanxinlei1:
+https://github.com/HumanSignal/label-studio/pull/9898
+Revision: f492bfc2a90c8cc1da2f25fd9121ef0de40ade7f
+
+Additional localization, adaptation, packaging and validation are maintained by hengshu-credit.
+Original copyright and license notices remain in the fetched source and built image.

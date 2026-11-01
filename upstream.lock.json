@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/HumanSignal/label-studio.git",
+  "branch": "develop",
+  "commit": "80436a3f82675b816a8ce3d8b3e8cd0371bd119e",
+  "version": "1.24.0.dev0",
+  "checked_at": "2026-11-01",
+  "i18n_foundation_pr": "https://github.com/HumanSignal/label-studio/pull/9898",
+  "i18n_foundation_commit": "f492bfc2a90c8cc1da2f25fd9121ef0de40ade7f"
+}
