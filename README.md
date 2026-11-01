@@ -48,6 +48,10 @@ docker compose up -d --wait --wait-timeout 300
 
 官方套餐说明：[Azure](https://azure.microsoft.com/en-us/pricing/details/translator/)、[Google](https://cloud.google.com/products/translate/pricing)、[百度](https://fanyi-api.baidu.com/product/112)。必须先开通相应官方 API，界面不提供共享密钥。
 
+### 本地 Transformers 主动学习
+
+项目模型后台可配置 Hugging Face 缓存 ID 或已训练模型本地目录，分类与实体识别分别选择；支持人工标注训练、版本保存、候选池刷新与低置信度优先采样。需要启动本地推理服务及 Compose 中的主动学习 worker。详见 [配置、模型格式与边界说明](ml_backend/README.md)。
+
 ### 预标注模型选择
 
 在「项目设置 → 标注 → 预标注」选择连接的模型或已存储预测版本，点击保存。重新打开任务时，后端调用所选模型；已有其他模型的预测不会阻止获取当前模型结果，同一模型已缓存结果会复用。人工标注和草稿保留。分类与 NER 若需要单独选择，应分别添加对应 ML 服务连接。

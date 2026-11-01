@@ -7,6 +7,16 @@ on:
 permissions:
   contents: read
 jobs:
+  transformers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install -r ml_backend/requirements.txt
+      - run: python -m unittest discover -s ml_backend -p 'test_*.py' -v
   resources:
     runs-on: ubuntu-latest
     strategy:
@@ -60,6 +70,8 @@ jobs:
       - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/optimize-sqlite-listing.py --database /label-studio/data/label_studio.sqlite3
       - run: docker compose -f ci/compose.yaml cp ci/test_assistance.py label-studio:/tmp/test_assistance.py
       - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/test_assistance.py
+      - run: docker compose -f ci/compose.yaml cp ci/test_active_learning.py label-studio:/tmp/test_active_learning.py
+      - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/test_active_learning.py
       - run: npx playwright install --with-deps chromium
       - run: npx playwright test
       - if: always()

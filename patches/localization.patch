@@ -1338,6 +1338,296 @@ index 84331b7..03605fd 100644
              ('contains', False, 'contains', []),
              ('contains', 1.5, 'contains', []),
              ('regex', '7', 'contains', []),
+diff --git a/label_studio/ml/active_learning.py b/label_studio/ml/active_learning.py
+new file mode 100644
+index 0000000..fba3365
+--- /dev/null
++++ b/label_studio/ml/active_learning.py
+@@ -0,0 +1,84 @@
++"""Durable, bounded active-learning rounds. Executed by one dedicated worker."""
++import hashlib
++import json
++from django.db.models import Count, Max, Exists, OuterRef, Q
++from django.utils import timezone
++from tasks.models import Annotation, Prediction
++from tasks.serializers import TaskSimpleSerializer
++from ml.models import MLBackend, MLBackendState
++
++
++def bounded(params, key, default, maximum):
++    value = int(params.get(key, default))
++    if not 1 <= value <= maximum:
++        raise ValueError(f'{key} must be between 1 and {maximum}')
++    return value
++
++
++def run_round(backend):
++    project = backend.project
++    params = backend.model_params()
++    pool_size = bounded(params, 'candidate_pool_size', 32, 512)
++    minimum = bounded(params, 'min_training_samples', 10, 10000)
++    interval = bounded(params, 'train_every', 10, 10000)
++    annotations = Annotation.objects.filter(project=project, was_cancelled=False)
++    summary = annotations.aggregate(count=Count('id'), latest=Max('updated_at'))
++    signature = {**summary, 'latest': str(summary['latest']), 'config': hashlib.sha256(
++        json.dumps([params, project.label_config], sort_keys=True).encode()).hexdigest()}
++    state = dict(backend.learning_state)
++    previous = state.get('trained', {})
++    changed = signature != previous
++    due = (state.get('requested') or previous.get('config') != signature['config'] or
++           summary['count'] >= previous.get('count', 0) + interval or
++           summary['count'] <= previous.get('count', 0))
++    if summary['count'] >= minimum and (changed or state.get('requested')) and due:
++        # Serialize only submitted human annotations, never predictions or drafts.
++        if summary['count'] > 10000:
++            raise ValueError('More than 10000 annotations: use an external training job; no annotations were truncated.')
++        tasks = []
++        for annotation in annotations.select_related('task').order_by('id'):
++            tasks.append({'id': annotation.task_id, 'data': annotation.task.data,
++                          'annotations': [{'id': annotation.pk, 'result': annotation.result,
++                                           'was_cancelled': False}]})
++        MLBackend.objects.filter(pk=backend.pk).update(state=MLBackendState.TRAINING)
++        response = backend.api._request('train', {
++            'project': backend.api._create_project_uid(project), 'label_config': project.label_config,
++            'annotations': tasks, 'params': params,
++        }, verbose=False, timeout=3600)
++        if response.is_error or not response.response.get('model_version'):
++            raise ValueError(response.error_message or 'Training must return a completed model_version')
++        state.update(trained=signature, requested=False, trained_at=timezone.now().isoformat())
++        # Persist before prediction: a prediction failure must not repeat successful training.
++        MLBackend.objects.filter(pk=backend.pk).update(learning_state=state)
++    backend.learning_state = state
++    backend.update_state()
++    if backend.not_ready:
++        raise ValueError(backend.error_message or 'ML backend is unavailable')
++    current = Prediction.objects.filter(task=OuterRef('pk'), model_version=backend.model_version)
++    available = project.tasks.filter(is_labeled=False).annotate(has_current=Exists(current)).filter(has_current=False)
++    # Consecutive rounds fill the pool, rather than scoring millions of tasks on submission.
++    scored_count = project.tasks.filter(is_labeled=False, predictions__model_version=backend.model_version,
++                                       predictions__score__isnull=False).distinct().count()
++    capacity = max(0, pool_size - scored_count)
++    batch = list(available.order_by('id')[:capacity])
++    if batch:
++        instances = backend.predict_tasks(batch)
++        if not isinstance(instances, list) or len(instances) != len(batch):
++            raise ValueError('Prediction refresh did not return one prediction per candidate')
++        if any(p.score is None or not 0 <= p.score <= 1 for p in instances):
++            Prediction.objects.filter(pk__in=[p.pk for p in instances]).delete()
++            raise ValueError('Active learning requires a finite confidence score from 0 to 1')
++    state.update(status='ready', error=None, candidate_pool_size=pool_size, last_checked=timezone.now().isoformat())
++    MLBackend.objects.filter(pk=backend.pk).update(learning_state=state, state=MLBackendState.CONNECTED, error_message=None)
++
++
++def process_backends():
++    for backend in MLBackend.objects.filter(Q(active_learning=True) | Q(learning_state__requested=True)).select_related('project'):
++        try:
++            run_round(backend)
++        except Exception as exc:
++            backend.refresh_from_db()
++            state = {**backend.learning_state, 'status': 'error', 'error': str(exc)[:1000],
++                     'last_checked': timezone.now().isoformat()}
++            MLBackend.objects.filter(pk=backend.pk).update(state=MLBackendState.ERROR,
++                learning_state=state, error_message=f'Active learning: {str(exc)[:1000]}')
+diff --git a/label_studio/ml/api_connector.py b/label_studio/ml/api_connector.py
+index 37280a3..14e7071 100644
+--- a/label_studio/ml/api_connector.py
++++ b/label_studio/ml/api_connector.py
+@@ -226,8 +226,9 @@ class MLApi(BaseHTTPAPI):
+ 
+         return request
+ 
+-    def make_predictions(self, tasks, project, context=None):
++    def make_predictions(self, tasks, project, context=None, model_params=None):
+         request = self._prep_prediction_req(tasks, project, context=context)
++        request['params'].update(model_params or {})
+         return self._request(PREDICT_URL, request, verbose=False, timeout=TIMEOUT_PREDICT)
+ 
+     def health(self):
+diff --git a/label_studio/ml/management/__init__.py b/label_studio/ml/management/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/label_studio/ml/management/commands/__init__.py b/label_studio/ml/management/commands/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/label_studio/ml/management/commands/active_learning_worker.py b/label_studio/ml/management/commands/active_learning_worker.py
+new file mode 100644
+index 0000000..870d684
+--- /dev/null
++++ b/label_studio/ml/management/commands/active_learning_worker.py
+@@ -0,0 +1,28 @@
++import time
++from pathlib import Path
++from django.conf import settings
++from django.core.management.base import BaseCommand, CommandError
++from django.db import close_old_connections
++from ml.active_learning import process_backends
++
++
++class Command(BaseCommand):
++    help = 'Run durable active learning rounds (one worker per shared data directory).'
++
++    def add_arguments(self, parser):
++        parser.add_argument('--once', action='store_true')
++        parser.add_argument('--interval', type=int, default=15)
++
++    def handle(self, *args, **options):
++        import fcntl  # Worker runs in the Linux Label Studio container.
++        with (Path(settings.BASE_DATA_DIR) / 'active-learning.lock').open('w') as lock:
++            try:
++                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            except BlockingIOError as exc:
++                raise CommandError('An active learning worker is already running.') from exc
++            while True:
++                close_old_connections()
++                process_backends()
++                if options['once']:
++                    return
++                time.sleep(max(5, options['interval']))
+diff --git a/label_studio/ml/migrations/0008_active_learning.py b/label_studio/ml/migrations/0008_active_learning.py
+new file mode 100644
+index 0000000..8e00430
+--- /dev/null
++++ b/label_studio/ml/migrations/0008_active_learning.py
+@@ -0,0 +1,13 @@
++from django.db import migrations, models
++
++
++class Migration(migrations.Migration):
++    dependencies = [('ml', '0007_auto_20240314_1957')]
++    operations = [
++        migrations.AddField(model_name='mlbackend', name='base_model', field=models.CharField(max_length=1024, blank=True, default='')),
++        migrations.AddField(model_name='mlbackend', name='model_task', field=models.CharField(max_length=32, default='text-classification', choices=[('text-classification', 'Text classification'), ('token-classification', 'Named entity recognition')])),
++        migrations.AddField(model_name='mlbackend', name='model_revision', field=models.CharField(max_length=128, blank=True, default='')),
++        migrations.AddField(model_name='mlbackend', name='model_control', field=models.CharField(max_length=128, blank=True, default='')),
++        migrations.AddField(model_name='mlbackend', name='active_learning', field=models.BooleanField(default=False)),
++        migrations.AddField(model_name='mlbackend', name='learning_state', field=models.JSONField(default=dict, blank=True)),
++    ]
+diff --git a/label_studio/ml/models.py b/label_studio/ml/models.py
+index 4ffa6b5..71ec99f 100644
+--- a/label_studio/ml/models.py
++++ b/label_studio/ml/models.py
+@@ -38,6 +38,21 @@ class MLBackendAuth(models.TextChoices):
+ class MLBackend(models.Model):
+     """ """
+ 
++    base_model = models.CharField(max_length=1024, blank=True, default='')
++    model_task = models.CharField(max_length=32, default='text-classification', choices=[
++        ('text-classification', 'Text classification'), ('token-classification', 'Named entity recognition')])
++    model_revision = models.CharField(max_length=128, blank=True, default='')
++    model_control = models.CharField(max_length=128, blank=True, default='')
++    active_learning = models.BooleanField(default=False)
++    learning_state = models.JSONField(default=dict, blank=True)
++
++    def model_params(self):
++        if not self.base_model:
++            return self.extra_params or {}
++        return {**(self.extra_params or {}), 'base_model': self.base_model,
++                'model_task': self.model_task, 'model_revision': self.model_revision,
++                'model_control': self.model_control, 'backend_id': self.pk}
++
+     state = models.CharField(
+         max_length=2,
+         choices=MLBackendState.choices,
+@@ -180,7 +195,7 @@ class MLBackend(models.Model):
+             self.url,
+             self.project,
+             self.auth_method,
+-            extra_params=self.extra_params,
++            extra_params=self.model_params(),
+             basic_auth_user=self.basic_auth_user,
+             basic_auth_pass=self.basic_auth_pass,
+         )
+@@ -217,10 +232,16 @@ class MLBackend(models.Model):
+                     logger.debug(f'Changing model version: {self.model_version} -> {model_version}')
+                     self.model_version = model_version
+                 self.error_message = None
+-        self.save()
++        self.save(update_fields=['state', 'model_version', 'error_message'])
+         return model_version
+ 
+     def train(self):
++        if self.base_model:
++            state = dict(self.learning_state)
++            state['requested'] = True
++            self.learning_state = state
++            self.save(update_fields=['learning_state'])
++            return
+         train_response = self.api.train(self.project)
+         if train_response.is_error:
+             self.state = MLBackendState.ERROR
+@@ -290,7 +311,7 @@ class MLBackend(models.Model):
+             return []
+ 
+     def _get_predictions_from_ml_backend(self, serialized_tasks: List[Dict]) -> List[Dict]:
+-        result = self.api.make_predictions(serialized_tasks, self.project)
++        result = self.api.make_predictions(serialized_tasks, self.project, model_params=self.model_params())
+ 
+         # response validation
+         if result.is_error:
+@@ -508,7 +529,7 @@ def modify_project_model_version(sender, instance, **kwargs):
+ 
+ @receiver(post_save, sender=MLBackend)
+ def create_ml_webhook(sender, instance, created, **kwargs):
+-    if not created:
++    if not created or instance.base_model:
+         return
+     ml_backend = instance
+     webhook_url = ml_backend.url.rstrip('/') + '/webhook'
+diff --git a/label_studio/ml/serializers.py b/label_studio/ml/serializers.py
+index 3fb2f1e..ad579f4 100644
+--- a/label_studio/ml/serializers.py
++++ b/label_studio/ml/serializers.py
+@@ -79,7 +79,13 @@ class MLBackendSerializer(serializers.ModelSerializer):
+             raise serializers.ValidationError(message)
+ 
+     def _validate_setup(self, attrs):
+-        setup_response = MLBackend.setup_(**attrs)
++        params = dict(attrs.get('extra_params') or {})
++        if attrs.get('base_model', getattr(self.instance, 'base_model', '')):
++            params.update({key: attrs.get(key, getattr(self.instance, key, '')) for key in
++                           ('base_model', 'model_task', 'model_revision', 'model_control')})
++            params['model_task'] = params['model_task'] or 'text-classification'
++            params['backend_id'] = self.instance.pk if self.instance else None
++        setup_response = MLBackend.setup_(**{**attrs, 'extra_params': params})
+ 
+         if setup_response.is_error:
+             message = (
+@@ -94,14 +100,24 @@ class MLBackendSerializer(serializers.ModelSerializer):
+     def validate(self, attrs):
+         attrs = super().validate(attrs)
+ 
+-        self._validate_authentication(attrs)
+-        self._validate_healthcheck(attrs)
+-        self._validate_setup(attrs)
++        if attrs.get('active_learning', getattr(self.instance, 'active_learning', False)):
++            if not attrs.get('base_model', getattr(self.instance, 'base_model', '')):
++                raise serializers.ValidationError('Configure a Transformers base model before enabling active learning.')
++            if attrs.get('is_interactive', getattr(self.instance, 'is_interactive', False)):
++                raise serializers.ValidationError('Active learning requires a non-interactive backend.')
++        complete = {field: getattr(self.instance, field) for field in
++                    ('url', 'project', 'auth_method', 'basic_auth_user', 'basic_auth_pass', 'extra_params')
++                    } if self.instance else {}
++        complete.update(attrs)
++        self._validate_authentication(complete)
++        self._validate_healthcheck(complete)
++        self._validate_setup(complete)
+ 
+         return attrs
+ 
+     class Meta:
+         model = MLBackend
++        read_only_fields = ['learning_state']
+         fields = [
+             'id',
+             'state',
+@@ -115,6 +131,7 @@ class MLBackendSerializer(serializers.ModelSerializer):
+             'basic_auth_pass',
+             'basic_auth_pass_is_set',
+             'description',
++            'base_model', 'model_task', 'model_revision', 'model_control', 'active_learning', 'learning_state',
+             'extra_params',
+             'model_version',
+             'timeout',
 diff --git a/label_studio/organizations/templates/organizations/people_list.html b/label_studio/organizations/templates/organizations/people_list.html
 index d86c7af..b062416 100644
 --- a/label_studio/organizations/templates/organizations/people_list.html
@@ -1391,6 +1681,21 @@ index d86c7af..b062416 100644
        </p>
      </div>
  
+diff --git a/label_studio/projects/functions/next_task.py b/label_studio/projects/functions/next_task.py
+index 040a8a0..9ef61c0 100644
+--- a/label_studio/projects/functions/next_task.py
++++ b/label_studio/projects/functions/next_task.py
+@@ -147,7 +147,9 @@ def _try_uncertainty_sampling(
+     user: User,
+     prepared_tasks: QuerySet[Task],
+ ) -> Union[Task, None]:
+-    task_with_current_predictions = tasks.filter(predictions__model_version=project.model_version)
++    backend = project.ml_backends.filter(title=project.model_version).first()
++    version = backend.model_version if backend else project.model_version
++    task_with_current_predictions = tasks.filter(predictions__model_version=version, predictions__score__isnull=False)
+     if task_with_current_predictions.exists():
+         logger.debug('Use uncertainty sampling')
+         # collect all clusters already solved by user, count number of solved task in them
 diff --git a/label_studio/projects/models.py b/label_studio/projects/models.py
 index d19ece5..56b03df 100644
 --- a/label_studio/projects/models.py
@@ -1455,6 +1760,20 @@ index d3cd3f2..e1fa054 100644
          self.task.predictions_score = sum(scores) / len(scores) if scores else None
  
      def get(self, request, pk):
+diff --git a/label_studio/tasks/models.py b/label_studio/tasks/models.py
+index 9785528..2bbc111 100644
+--- a/label_studio/tasks/models.py
++++ b/label_studio/tasks/models.py
+@@ -1568,7 +1568,8 @@ def update_ml_backend(sender, instance, **kwargs):
+         # start training every N annotation
+         if annotation_count % project.min_annotations_to_start_training == 0:
+             for ml_backend in project.ml_backends.all():
+-                ml_backend.train()
++                if not ml_backend.base_model:
++                    ml_backend.train()
+ 
+ 
+ def bulk_update_stats_project_tasks(tasks, project=None):
 diff --git a/label_studio/tasks/translation.py b/label_studio/tasks/translation.py
 new file mode 100644
 index 0000000..e48420b
@@ -5398,7 +5717,7 @@ index 7daed28..bae3c53 100644
 +DangerZone.title = __uiT("Danger Zone");
  DangerZone.path = "/danger-zone";
 diff --git a/web/apps/labelstudio/src/pages/Settings/GeneralSettings.jsx b/web/apps/labelstudio/src/pages/Settings/GeneralSettings.jsx
-index 3c423d4..008bca3 100644
+index 3c423d4..2789e3f 100644
 --- a/web/apps/labelstudio/src/pages/Settings/GeneralSettings.jsx
 +++ b/web/apps/labelstudio/src/pages/Settings/GeneralSettings.jsx
 @@ -1,3 +1,4 @@
@@ -5406,13 +5725,14 @@ index 3c423d4..008bca3 100644
  import { Badge, Button, Select, Typography, Tooltip, EnterpriseBadge } from "@humansignal/ui";
  import { useCallback, useContext } from "react";
  import { IconSpark } from "@humansignal/icons";
-@@ -19,29 +20,28 @@ export const GeneralSettings = () => {
+@@ -19,29 +20,29 @@ export const GeneralSettings = () => {
    const colors = ["#FDFDFC", "#FF4C25", "#FF750F", "#ECB800", "#9AC422", "#34988D", "#617ADA", "#CC6FBE"];
  
    const samplings = [
 -    { value: "Sequential", label: "Sequential", description: "Tasks are ordered by Task ID" },
 -    { value: "Uniform", label: "Random", description: "Tasks are chosen with uniform random" },
 +    { value: "Sequential", label: __uiT("Sequential"), description: __uiT("Tasks are ordered by Task ID") },
++    { value: "Uncertainty", label: __uiT("Uncertainty"), description: __uiT("Label the least confident predictions from the selected model first.") },
 +    { value: "Uniform", label: __uiT("Random"), description: __uiT("Tasks are chosen with uniform random") },
    ];
  
@@ -5444,7 +5764,7 @@ index 3c423d4..008bca3 100644
                      <a
                        target="_blank"
                        href={createURL(
-@@ -53,13 +53,11 @@ export const GeneralSettings = () => {
+@@ -53,13 +54,11 @@ export const GeneralSettings = () => {
                        )}
                        rel="noreferrer"
                        className="underline hover:no-underline"
@@ -5460,7 +5780,7 @@ index 3c423d4..008bca3 100644
                  {colors.map((color) => (
                    <RadioGroup.Button key={color} value={color}>
                      <div className={cn("color").toClassName()} style={{ "--background": color }} />
-@@ -67,12 +65,12 @@ export const GeneralSettings = () => {
+@@ -67,61 +66,23 @@ export const GeneralSettings = () => {
                  ))}
                </RadioGroup>
  
@@ -5475,40 +5795,44 @@ index 3c423d4..008bca3 100644
                      description={description}
                    />
                  ))}
-@@ -81,9 +79,8 @@ export const GeneralSettings = () => {
-                     key="uncertainty-sampling"
-                     value=""
-                     label={
+-                {isFF(FF_LSDV_E_297) && (
+-                  <RadioGroup.Button
+-                    key="uncertainty-sampling"
+-                    value=""
+-                    label={
 -                      <>
 -                        Uncertainty sampling{" "}
 -                        <Tooltip title="Available on Label Studio Enterprise">
-+                      <>{" "}{__uiT("Uncertainty sampling")}{" "}
-+                        <Tooltip title={__uiT("Available on Label Studio Enterprise")}>
-                           <Badge
-                             variant="enterprise"
-                             icon={<IconSpark />}
-@@ -96,8 +93,7 @@ export const GeneralSettings = () => {
-                     }
-                     disabled
-                     description={
+-                          <Badge
+-                            variant="enterprise"
+-                            icon={<IconSpark />}
+-                            size="small"
+-                            look="ghost"
+-                            className="ml-tightest"
+-                          />
+-                        </Tooltip>
+-                      </>
+-                    }
+-                    disabled
+-                    description={
 -                      <>
 -                        Tasks are chosen according to model uncertainty score (active learning mode).{" "}
-+                      <>{" "}{__uiT("Tasks are chosen according to model uncertainty score (active learning mode).")}{" "}
-                         <a
-                           target="_blank"
-                           href={createURL("https://docs.humansignal.com/guide/active_learning", {
-@@ -105,9 +101,7 @@ export const GeneralSettings = () => {
-                             treatment: "workspaces",
-                           })}
-                           rel="noreferrer"
+-                        <a
+-                          target="_blank"
+-                          href={createURL("https://docs.humansignal.com/guide/active_learning", {
+-                            experiment: "project_settings_workspace",
+-                            treatment: "workspaces",
+-                          })}
+-                          rel="noreferrer"
 -                        >
 -                          Learn more
 -                        </a>
-+                        >{" "}{__uiT("Learn more")}{" "}</a>
-                       </>
-                     }
-                   />
-@@ -117,11 +111,9 @@ export const GeneralSettings = () => {
+-                      </>
+-                    }
+-                  />
+-                )}
+               </RadioGroup>
+             </Form.Row>
  
              <Form.Actions>
                <Form.Indicator>
@@ -5522,7 +5846,7 @@ index 3c423d4..008bca3 100644
              </Form.Actions>
            </Form>
          </div>
-@@ -131,6 +123,6 @@ export const GeneralSettings = () => {
+@@ -131,6 +92,6 @@ export const GeneralSettings = () => {
    );
  };
  
@@ -5556,7 +5880,7 @@ index 11ac063..1e561d8 100644
 +LabelingSettings.title = __uiT("Labeling Interface");
  LabelingSettings.path = "/labeling";
 diff --git a/web/apps/labelstudio/src/pages/Settings/MachineLearningSettings/Forms.jsx b/web/apps/labelstudio/src/pages/Settings/MachineLearningSettings/Forms.jsx
-index d393a7e..0f64cf1 100644
+index d393a7e..2fd1c44 100644
 --- a/web/apps/labelstudio/src/pages/Settings/MachineLearningSettings/Forms.jsx
 +++ b/web/apps/labelstudio/src/pages/Settings/MachineLearningSettings/Forms.jsx
 @@ -1,3 +1,4 @@
@@ -5564,6 +5888,15 @@ index d393a7e..0f64cf1 100644
  import { useState } from "react";
  import { Button } from "@humansignal/ui";
  import { ErrorWrapper } from "../../../components/Error/Error";
+@@ -12,7 +13,7 @@ const CustomBackendForm = ({ action, backend, project, onSubmit }) => {
+   return (
+     <Form
+       action={action}
+-      formData={{ ...(backend ?? {}) }}
++      formData={{ model_task: "text-classification", ...(backend ?? {}) }}
+       params={{ pk: backend?.id }}
+       onSubmit={async (response) => {
+         if (!response.error_message) {
 @@ -23,20 +24,20 @@ const CustomBackendForm = ({ action, backend, project, onSubmit }) => {
        <Input type="hidden" name="project" value={project.id} />
  
@@ -5590,7 +5923,7 @@ index d393a7e..0f64cf1 100644
            ]}
            value={selectedAuthMethod}
            onChange={setAuthMethod}
-@@ -45,11 +46,11 @@ const CustomBackendForm = ({ action, backend, project, onSubmit }) => {
+@@ -45,19 +46,32 @@ const CustomBackendForm = ({ action, backend, project, onSubmit }) => {
  
        {(backend?.auth_method === "BASIC_AUTH" || selectedAuthMethod === "BASIC_AUTH") && (
          <Form.Row columnCount={2}>
@@ -5605,7 +5938,20 @@ index d393a7e..0f64cf1 100644
            )}
          </Form.Row>
        )}
-@@ -57,7 +58,7 @@ const CustomBackendForm = ({ action, backend, project, onSubmit }) => {
+ 
++      <Form.Row columnCount={1}>
++        <Input name="base_model" label={__uiT("Transformers model ID or local directory")} />
++        <Select name="model_task" label={__uiT("Model task")} options={[
++          {value: "text-classification", label: __uiT("Text classification")},
++          {value: "token-classification", label: __uiT("Named entity recognition")},
++        ]} />
++        <Input name="model_revision" label={__uiT("Model revision (optional)")} />
++        <Input name="model_control" label={__uiT("Labeling control name (required if ambiguous)")} />
++        <Toggle name="active_learning" label={__uiT("Enable automatic active learning")}
++          description={__uiT("Train on submitted annotations and refresh a bounded candidate pool. Requires the active learning worker and Transformers backend.")} />
++        <p>{__uiT("Use a model directory on the inference server. Classification needs a sequence classification head; NER needs a BIO token classification head. Existing label mappings are preserved.")}</p>
++      </Form.Row>
++
        <Form.Row columnCount={1}>
          <TextArea
            name="extra_params"
@@ -5614,7 +5960,7 @@ index d393a7e..0f64cf1 100644
            style={{ minHeight: 120 }}
          />
        </Form.Row>
-@@ -65,15 +66,13 @@ const CustomBackendForm = ({ action, backend, project, onSubmit }) => {
+@@ -65,15 +79,13 @@ const CustomBackendForm = ({ action, backend, project, onSubmit }) => {
        <Form.Row columnCount={1}>
          <Toggle
            name="is_interactive"
@@ -5634,7 +5980,7 @@ index d393a7e..0f64cf1 100644
  
        <Form.ResponseParser>
 diff --git a/web/apps/labelstudio/src/pages/Settings/MachineLearningSettings/MachineLearningList.jsx b/web/apps/labelstudio/src/pages/Settings/MachineLearningSettings/MachineLearningList.jsx
-index 7415308..9be5314 100644
+index 7415308..daca9a8 100644
 --- a/web/apps/labelstudio/src/pages/Settings/MachineLearningSettings/MachineLearningList.jsx
 +++ b/web/apps/labelstudio/src/pages/Settings/MachineLearningSettings/MachineLearningList.jsx
 @@ -1,3 +1,4 @@
@@ -5674,7 +6020,17 @@ index 7415308..9be5314 100644
                <IconEllipsis />
              </Button>
            </Dropdown.Trigger>
-@@ -95,9 +94,7 @@ const BackendCard = ({ backend, onStartTrain, onEdit, onDelete, onTestRequest })
+@@ -92,12 +91,17 @@ const BackendCard = ({ backend, onStartTrain, onEdit, onDelete, onTestRequest })
+       </div>
+ 
+       <div className={rootClass.elem("meta").toClassName()}>
++        {backend.base_model && <div style={{overflowWrap: "anywhere"}}>{backend.model_task}: {backend.base_model}</div>}
++        {backend.active_learning && <div>
++          <strong>{__uiT("Enable automatic active learning")}</strong>
++          <div>{backend.learning_state?.last_checked || __uiT("Waiting for active learning worker")}</div>
++          {backend.learning_state?.error && <div role="alert">{backend.learning_state.error}</div>}
++          {backend.learning_state?.trained_at && <div>{__uiT("Last trained")}: {backend.learning_state.trained_at}</div>}
++        </div>}
          <div className={rootClass.elem("group").toClassName()}>{truncate(backend.url, 20, 10, "...")}</div>
          <div className={rootClass.elem("group").toClassName()}>
            <Tooltip title={format(parseISO(backend.created_at), "yyyy-MM-dd HH:mm:ss")}>
@@ -5685,7 +6041,7 @@ index 7415308..9be5314 100644
                  addSuffix: true,
                })}
              </span>
-@@ -115,11 +112,11 @@ const BackendState = ({ backend }) => {
+@@ -115,11 +119,11 @@ const BackendState = ({ backend }) => {
      <div className={cn("ml").elem("status").toClassName()}>
        <span className={cn("ml").elem("indicator").mod({ state }).toClassName()} />
        <Oneof value={state} className={cn("ml").elem("status-label").toClassName()}>
@@ -5703,7 +6059,7 @@ index 7415308..9be5314 100644
      </div>
    );
 diff --git a/web/apps/labelstudio/src/pages/Settings/MachineLearningSettings/MachineLearningSettings.jsx b/web/apps/labelstudio/src/pages/Settings/MachineLearningSettings/MachineLearningSettings.jsx
-index 3300719..09130a9 100644
+index 3300719..586a3f9 100644
 --- a/web/apps/labelstudio/src/pages/Settings/MachineLearningSettings/MachineLearningSettings.jsx
 +++ b/web/apps/labelstudio/src/pages/Settings/MachineLearningSettings/MachineLearningSettings.jsx
 @@ -1,3 +1,4 @@
@@ -5743,11 +6099,11 @@ index 3300719..09130a9 100644
        const action = backend ? "updateMLBackend" : "addMLBackend";
        const modalProps = {
 -        title: `${backend ? "Edit" : "Connect"} Model`,
-+        title: __uiT("{{value0}} Model", {value0: (backend ? "Edit" : "Connect")}),
++        title: backend ? __uiT("Edit Model") : __uiT("Connect Model"),
          style: { width: 760 },
          closeOnClickOutside: false,
          body: (
-@@ -98,9 +99,7 @@ export const MachineLearningSettings = () => {
+@@ -98,27 +99,28 @@ export const MachineLearningSettings = () => {
    return (
      <section>
        <div className="w-[42rem]">
@@ -5756,9 +6112,14 @@ index 3300719..09130a9 100644
 -        </Typography>
 +        <Typography variant="headline" size="medium" className="mb-base">{" "}{__uiT("Model")}{" "}</Typography>
          {loading && <Spinner size={32} />}
++        {loaded && backends.length > 0 && (
++          <Button className="mb-base" onClick={() => showMLFormModal()} aria-label={__uiT("Add machine learning model")}>
++            {__uiT("Connect Model")}
++          </Button>
++        )}
          {loaded && backends.length === 0 && (
            <SimpleCard title="" className="bg-primary-background border-primary-border-subtler p-base">
-@@ -108,17 +107,15 @@ export const MachineLearningSettings = () => {
+             <EmptyState
                size="medium"
                variant="primary"
                icon={<IconModels />}
@@ -5780,7 +6141,7 @@ index 3300719..09130a9 100644
                }
                footer={
                  !window.APP_SETTINGS?.whitelabel_is_active && (
-@@ -128,11 +125,9 @@ export const MachineLearningSettings = () => {
+@@ -128,11 +130,9 @@ export const MachineLearningSettings = () => {
                        target="_blank"
                        rel="noopener noreferrer"
                        data-testid="ml-help-link"
@@ -5794,16 +6155,14 @@ index 3300719..09130a9 100644
                      </a>
                    </Typography>
                  )
-@@ -150,24 +145,13 @@ export const MachineLearningSettings = () => {
+@@ -150,24 +150,13 @@ export const MachineLearningSettings = () => {
  
          {backends.length > 0 && (
            <div className="my-wide">
 -            <Typography size="small" className="text-neutral-content-subtler">
 -              A connected model has been detected! If you wish to fetch predictions from this model, please follow these
 -              steps:
-+            <Typography size="small" className="text-neutral-content-subtler">{" "}{__uiT("A connected model has been detected! If you wish to fetch predictions from this model, please follow these steps:")}{" "}</Typography>
-+            <Typography size="small" className="text-neutral-content-subtler mt-base">{" "}{__uiT("1. Navigate to the")}{" "}<i>{__uiT("Data Manager")}</i>.
-             </Typography>
+-            </Typography>
 -            <Typography size="small" className="text-neutral-content-subtler mt-base">
 -              1. Navigate to the <i>Data Manager</i>.
 -            </Typography>
@@ -5812,7 +6171,9 @@ index 3300719..09130a9 100644
 -            </Typography>
 -            <Typography size="small" className="text-neutral-content-subtler mt-tighter">
 -              3. Click on <i>Batch predictions</i> from the <i>Actions</i> menu.
--            </Typography>
++            <Typography size="small" className="text-neutral-content-subtler">{" "}{__uiT("A connected model has been detected! If you wish to fetch predictions from this model, please follow these steps:")}{" "}</Typography>
++            <Typography size="small" className="text-neutral-content-subtler mt-base">{" "}{__uiT("1. Navigate to the")}{" "}<i>{__uiT("Data Manager")}</i>.
+             </Typography>
 -            <Typography size="small" className="text-neutral-content-subtler mt-base">
 -              If you want to use the model predictions for prelabeling, please configure this in the{" "}
 -              <NavLink to="annotation" className="hover:underline">
@@ -5825,7 +6186,12 @@ index 3300719..09130a9 100644
                .
              </Typography>
            </div>
-@@ -186,8 +170,8 @@ export const MachineLearningSettings = () => {
+@@ -182,12 +171,12 @@ export const MachineLearningSettings = () => {
+           {backends.length > 0 && (
+             <div className="p-wide border border-neutral-border rounded-md">
+               <Form.Row columnCount={1}>
+-                <Label text="Configuration" large />
++                <Label text={__uiT("Configuration")} large />
  
                  <div>
                    <Toggle
@@ -5836,7 +6202,7 @@ index 3300719..09130a9 100644
                      name="start_training_on_annotation_update"
                    />
                  </div>
-@@ -198,11 +182,9 @@ export const MachineLearningSettings = () => {
+@@ -198,11 +187,9 @@ export const MachineLearningSettings = () => {
            {backends.length > 0 && (
              <Form.Actions>
                <Form.Indicator>
@@ -5850,7 +6216,7 @@ index 3300719..09130a9 100644
              </Form.Actions>
            )}
          </Form>
-@@ -211,5 +193,5 @@ export const MachineLearningSettings = () => {
+@@ -211,5 +198,5 @@ export const MachineLearningSettings = () => {
    );
  };
  

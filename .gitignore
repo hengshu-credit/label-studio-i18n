@@ -1,6 +1,7 @@
 /upstream/
 /node_modules/
 /artifacts/
+/test-results/
 *.log
 .env
 **/__pycache__/

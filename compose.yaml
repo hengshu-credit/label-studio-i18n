@@ -1,5 +1,20 @@
 name: label-studio-i18n
 services:
+  active-learning:
+    image: hengshu/label-studio-i18n:local
+    entrypoint: ["python", "/label-studio/label_studio/manage.py", "active_learning_worker"]
+    restart: unless-stopped
+    depends_on:
+      label-studio:
+        condition: service_healthy
+    environment:
+      LABEL_STUDIO_BASE_DATA_DIR: /label-studio/data
+      LABEL_STUDIO_DISABLE_TELEMETRY: "true"
+      ML_BLOCK_LOCAL_IP: ${ML_BLOCK_LOCAL_IP:-true}
+    volumes:
+      - type: bind
+        source: ${LABEL_STUDIO_DATA_DIR:-./data}
+        target: /label-studio/data
   label-studio:
     image: hengshu/label-studio-i18n:local
     build:

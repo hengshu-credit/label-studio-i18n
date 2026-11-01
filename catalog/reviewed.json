@@ -744,7 +744,7 @@
   "Mute": "静音",
   "My role": "我的角色",
   "My Sample Project": "我的示例项目",
-  "Named entity recognition": "命名实体识别",
+  "Named entity recognition": "实体识别",
   "Never expires": "永不过期",
   "New Auth Token": "新建认证令牌",
   "New label": "新建标签",
@@ -1439,5 +1439,18 @@
   "Unsupported translation engine.": "不支持此翻译引擎。",
   "Unsupported translation language.": "此引擎不支持所选语言。",
   "Uzbek": "乌兹别克语",
-  "Vietnamese": "越南语"
+  "Vietnamese": "越南语",
+  "Uncertainty": "不确定性",
+  "Label the least confident predictions from the selected model first.": "优先标注所选模型置信度最低的任务。",
+  "Transformers model ID or local directory": "Transformers 模型 ID 或本地目录",
+  "Model task": "模型任务类型",
+  "Text classification": "文本分类",
+  "Model revision (optional)": "模型版本（可选）",
+  "Labeling control name (required if ambiguous)": "标注控件名（存在多个同类控件时必填）",
+  "Enable automatic active learning": "启用自动主动学习",
+  "Train on submitted annotations and refresh a bounded candidate pool. Requires the active learning worker and Transformers backend.": "根据已提交人工标注训练，并刷新候选任务池。需要运行主动学习工作进程及 Transformers 后端。",
+  "Use a model directory on the inference server. Classification needs a sequence classification head; NER needs a BIO token classification head. Existing label mappings are preserved.": "填写推理服务器上的模型目录。分类需要序列分类头；实体识别需要 BIO 标记分类头。保留已有标签映射。",
+  "Waiting for active learning worker": "等待主动学习工作进程",
+  "Last trained": "最近训练时间",
+  "Edit Model": "编辑模型"
 }

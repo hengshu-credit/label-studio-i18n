@@ -1842,5 +1842,18 @@
   "Unsupported translation engine.": "Unsupported translation engine.",
   "Unsupported translation language.": "Unsupported translation language.",
   "Uzbek": "Uzbek",
-  "Vietnamese": "Vietnamese"
+  "Vietnamese": "Vietnamese",
+  "Uncertainty": "Uncertainty",
+  "Label the least confident predictions from the selected model first.": "Label the least confident predictions from the selected model first.",
+  "Transformers model ID or local directory": "Transformers model ID or local directory",
+  "Model task": "Model task",
+  "Text classification": "Text classification",
+  "Model revision (optional)": "Model revision (optional)",
+  "Labeling control name (required if ambiguous)": "Labeling control name (required if ambiguous)",
+  "Enable automatic active learning": "Enable automatic active learning",
+  "Train on submitted annotations and refresh a bounded candidate pool. Requires the active learning worker and Transformers backend.": "Train on submitted annotations and refresh a bounded candidate pool. Requires the active learning worker and Transformers backend.",
+  "Use a model directory on the inference server. Classification needs a sequence classification head; NER needs a BIO token classification head. Existing label mappings are preserved.": "Use a model directory on the inference server. Classification needs a sequence classification head; NER needs a BIO token classification head. Existing label mappings are preserved.",
+  "Waiting for active learning worker": "Waiting for active learning worker",
+  "Last trained": "Last trained",
+  "Edit Model": "Edit Model"
 }

@@ -1,0 +1,7 @@
+# Existing Anaconda base in the Windows workspace. Do not replace CUDA PyTorch.
+transformers==4.51.3
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+defusedxml>=0.7.1
+safetensors>=0.4.3
+httpx>=0.27,<1
