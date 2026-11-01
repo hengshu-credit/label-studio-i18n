@@ -56,6 +56,8 @@ jobs:
       - run: docker compose -f ci/compose.yaml up -d --wait --wait-timeout 300
       - run: docker compose -f ci/compose.yaml cp ci/seed.py label-studio:/tmp/seed.py
       - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/seed.py
+      - run: docker compose -f ci/compose.yaml cp tools/optimize-sqlite-listing.py label-studio:/tmp/optimize-sqlite-listing.py
+      - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/optimize-sqlite-listing.py --database /label-studio/data/label_studio.sqlite3
       - run: docker compose -f ci/compose.yaml cp ci/test_assistance.py label-studio:/tmp/test_assistance.py
       - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/test_assistance.py
       - run: npx playwright install --with-deps chromium

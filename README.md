@@ -56,6 +56,8 @@ docker compose up -d --wait --wait-timeout 300
 
 CI 另包含翻译权限、密钥加密、不回显、缓存、额度及三个官方请求契约测试，以及模型实际选择回归。云端请求使用模拟响应，真实密钥下的翻译质量和账户额度须在配置后验证。
 
+SQLite 百万级任务项目若列表长时间加载，可在停止服务并备份后运行 `python tools/optimize-sqlite-listing.py --database <数据目录>/label_studio.sqlite3`，随后重新启动服务。此工具增加项目、标注数、预测数、任务 ID 的覆盖索引，使分页统计避免扫描短信正文；只增加索引，不改写任务或标注。CI 在合成数据库上执行该工具后再运行接口和浏览器回归。
+
 ### 界面语言资源
 
 - `catalog/en.json`：英语自然语言源文案。
