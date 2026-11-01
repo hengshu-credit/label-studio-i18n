@@ -14,7 +14,9 @@ for(const language of ['en','zh-hans']){
   await page.reload();
   await expect(page.getByTestId('language-selector')).toContainText(language==='en'?'English':'简体中文');
   await page.goto('/projects');
-  await expect(page.getByText(language==='en'?'Create Project':'创建项目',{exact:true}).first()).toBeVisible();
+  const createProject = page.getByRole('button',{name:language==='en'?'Create new project':'创建新项目',exact:true});
+  await expect(createProject).toBeVisible();
+  await expect(createProject).toHaveText(language==='en'?'Create':'创建');
   await page.goto('/projects/1/data?task=1');
   await expect(page.getByRole('button',{name:language==='en'?'Submit current annotation':'提交当前标注',exact:true})).toBeVisible();
   await expect(page.getByText('Customer category',{exact:false}).first()).toBeVisible();
