@@ -13,7 +13,7 @@ test('learning workspace provider, persistent job, and review decisions',async({
  await expect(panel.getByRole('heading',{name:'Workflow CI local',exact:true})).toBeVisible();
  await panel.getByRole('button',{name:'处理任务',exact:true}).click();
  await panel.getByLabel('模型服务',{exact:true}).selectOption({label:'Workflow CI local'});
- await panel.getByLabel('本次最多处理条数',{exact:true}).fill('1');
+ await panel.getByLabel('样本范围').selectOption('all');await panel.getByLabel('本次最多处理条数',{exact:true}).fill('1');
  const started=page.waitForResponse(r=>r.url().endsWith('/workflow')&&r.request().method()==='POST');
  await panel.getByRole('button',{name:'开始处理',exact:true}).click();const run=await (await started).json();
  const job=panel.getByTestId(`learning-run-${run.id}`);await expect(job).toContainText('排队中');
@@ -33,4 +33,11 @@ test('learning workspace provider, persistent job, and review decisions',async({
  await page.screenshot({path:'artifacts/learning-review.png',fullPage:true,animations:'disabled'});
  await page.setViewportSize({width:900,height:900});await expect(panel).toBeVisible();
  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=document.documentElement.clientWidth+4)).toBeTruthy();
+ // A valid default learning rate must not be blocked by native number-step validation.
+ await page.route('**/workflow?*',async route=>{const response=await route.fetch();const value=await response.json();value.backends.push({id:999,title:'Synthetic training form',base_model:'synthetic'});await route.fulfill({response,json:value});});
+ await panel.getByRole('button',{name:'刷新',exact:true}).click();
+ await panel.getByRole('button',{name:'处理任务',exact:true}).click();await panel.getByLabel('处理方式').selectOption('train');
+ await panel.getByLabel('当前项目训练模型').selectOption('999');
+ await page.route('**/workflow',async route=>{if(route.request().method()!=='POST')return route.continue();const body=route.request().postDataJSON();expect(body.kind).toBe('train');expect(body.learning_rate).toBe(0.00002);await route.fulfill({status:400,json:{detail:'Synthetic training form reached server'}});});
+ await panel.getByRole('button',{name:'开始处理',exact:true}).click();await expect(panel.getByRole('alert')).toContainText('Synthetic training form reached server');
 });

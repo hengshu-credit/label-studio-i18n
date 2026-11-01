@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 import torch
 from transformers import BertConfig, BertForSequenceClassification, BertForTokenClassification, BertTokenizerFast
@@ -119,6 +120,13 @@ class TransformersTests(unittest.TestCase):
         self.assertEqual(self.runtime.setup(body)['model_version'],trained['model_version'])
         body['params'].update(epochs=2,job_id='job2')
         self.assertEqual(self.runtime.setup(body)['model_version'],trained['model_version'])
+
+    def test_tokenizer_is_reused_across_requests_and_projects(self):
+        from transformers import AutoTokenizer
+        body=self.body()
+        with patch.object(AutoTokenizer,'from_pretrained',wraps=AutoTokenizer.from_pretrained) as load:
+            self.runtime.setup(body);self.runtime.predict(body);self.runtime.setup({**body,'project':'another'})
+            self.assertEqual(load.call_count,1)
 
 
 if __name__ == '__main__':unittest.main()

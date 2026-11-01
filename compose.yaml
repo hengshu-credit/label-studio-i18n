@@ -10,6 +10,8 @@ services:
     environment:
       LABEL_STUDIO_BASE_DATA_DIR: /label-studio/data
       LABEL_STUDIO_DISABLE_TELEMETRY: "true"
+      SENTRY_DSN: ""
+      FRONTEND_SENTRY_DSN: ""
       ML_BLOCK_LOCAL_IP: ${ML_BLOCK_LOCAL_IP:-true}
     volumes:
       - type: bind
@@ -33,6 +35,8 @@ services:
       LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED: "true"
       LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT: /label-studio/local-files
       LABEL_STUDIO_DISABLE_TELEMETRY: "true"
+      SENTRY_DSN: ""
+      FRONTEND_SENTRY_DSN: ""
       SSRF_PROTECTION_ENABLED: "true"
       ML_BLOCK_LOCAL_IP: ${ML_BLOCK_LOCAL_IP:-true}
     volumes:

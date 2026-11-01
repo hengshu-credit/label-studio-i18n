@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 import threading
 import uuid
+from collections import OrderedDict
 from defusedxml.ElementTree import fromstring
 from fastapi import FastAPI, HTTPException
 
@@ -50,6 +51,8 @@ class Runtime:
         self.cached = None
         self.training_status = {}
         self.cancellations = {}
+        self.tokenizers = OrderedDict()
+        self.tokenizer_lock = threading.Lock()
 
     def config(self, body):
         from transformers import AutoConfig, AutoTokenizer
@@ -89,11 +92,19 @@ class Runtime:
             raise ValueError('Model id2label does not match project labels. Supply label_map or explicitly set initialize_head=true for a new head.')
         if len(labels) != len(set(labels)):
             raise ValueError('Model labels must map one-to-one to project labels.')
-        tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True, trust_remote_code=False, use_fast=True)
-        if not tokenizer.is_fast:
-            raise ValueError('A fast tokenizer with character offsets is required.')
         files = [(str(f.relative_to(path)), f.stat().st_size, f.stat().st_mtime_ns)
                  for f in sorted(path.rglob('*')) if f.is_file()]
+        tokenizer_key = (str(path), digest(files))
+        with self.tokenizer_lock:
+            tokenizer = self.tokenizers.get(tokenizer_key)
+            if tokenizer is None:
+                tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True, trust_remote_code=False, use_fast=True)
+                self.tokenizers[tokenizer_key] = tokenizer
+                if len(self.tokenizers) > 4:
+                    self.tokenizers.popitem(last=False)
+            self.tokenizers.move_to_end(tokenizer_key)
+        if not tokenizer.is_fast:
+            raise ValueError('A fast tokenizer with character offsets is required.')
         identity_params = {k: params.get(k) for k in ('base_model','model_task','model_revision','model_control','backend_id','label_map','initialize_head','max_length')}
         identity = digest([str(body.get('project')), identity_params, xml, str(path), files])
         directory = self.output / identity

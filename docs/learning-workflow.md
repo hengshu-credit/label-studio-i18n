@@ -6,7 +6,11 @@
 
 “模型服务”可添加 OpenAI、DeepSeek、公开 HTTPS 的兼容 Chat Completions 服务，或当前项目已有的本地 ML / Transformers 连接。云端使用用户填写的模型 ID，不替用户选定或升级收费模型。API 密钥按服务器 Secret Key 加密，接口仅返回是否已配置；更换服务地址/类型会清除旧密钥，避免发送到错误服务。
 
+本地 OpenAI 兼容大模型服务可选择“本地大模型（兼容 API）”，例如 `http://host.docker.internal:11434/v1/chat/completions`。仅允许显式开启本地 ML 访问后的回环地址，不能借此访问任意内网地址；密钥可选。
+
 云端返回 Label Studio result JSON，经过控件名、目标名、标签集合、实体字符偏移校验后才保存 prediction。OpenAI 默认请求严格 JSON Schema；DeepSeek 使用 JSON 模式并由服务器进行同样的最终校验。拒绝、截断、非法 JSON、越界实体和网络错误进入失败队列。云端自报不确定作为复核信号，不伪装成概率分数。
+
+任务完成后点击“用于任务预标注”，把这一批的预测版本设为标注编辑器建议来源；原人工标注不会被覆盖，未处理样本不会自动向云端发起请求。
 
 创建任务时明确选择样本范围及最多处理条数，默认 100，上限 5000。每个项目同时执行一个任务；任务逐项保存进度，重启后续跑，重试不会重做成功项。失败重试由用户显式触发，仍计入每月请求上限；请求失败也保守计费次。本地服务无需云端密钥。后台 worker 每批处理 32 条，在任务之间检查取消。
 
@@ -35,3 +39,18 @@ API 契约测试使用模拟云端响应，只有配置真实账户并调用成�
 生产实例需备份 Label Studio 数据卷、Secret Key 和本地模型输出目录。此部署面向单机共享数据卷；多节点分布式 GPU 调度、大规模离线训练、云端微调及多人复核仲裁不在本实现范围内。
 
 参考：[OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs?api-mode=chat)、[DeepSeek JSON Output](https://api-docs.deepseek.com/guides/json_mode/)。
+
+
+## 结果与固定保留集诊断
+
+每个任务可下载包含完整预测内容的 JSON，避免旧版导出接口只返回预测 ID。预标注及分析完成后，工作台按模型、控件及保留集/标注集显示准确率、Macro F1、覆盖数量和常见混淆。只统计输入哈希仍匹配的工作台预测；没有足够人工参考标签时不制造分数。不同任务的内部验证子集可能不同，比较模型版本应使用相同保留集及 cohort_hash。
+
+## Windows 后台运行
+
+`tools/install-transformers-task.ps1` 注册当前用户登录启动任务 `LabelStudio-Transformers-9092`，使用既有 Anaconda base 的 pythonw，无可见终端；异常退出最多自动重启 5 次。`tools/run-transformers.pyw` 将日志写入 `ml_backend/data/logs`，不记录访问日志。安装后先停止手动启动的同端口实例，再执行 `Start-ScheduledTask -TaskName LabelStudio-Transformers-9092`。可用 `Stop-ScheduledTask` 停止。该方式依赖用户登录，适用于当前 Docker Desktop 单机部署。
+
+默认容器现在使用镜像内置的 Nginx + uWSGI，启动前执行初始化与迁移；保留外部 8080 端口及原有数据挂载。任一服务器退出都会终止同容器另一服务器，由 Compose 重启策略接管。未修改宿主机 Nginx、证书或防火墙。错误上报 DSN 默认关闭；云端文本发送只发生在显式启动的服务任务中。
+
+旧的自动主动学习开关同样排除保留评估样本与未确认的难样本，并在本项目存在工作台任务时让出执行机会。推荐使用工作台候选发布流程来检查效果并保留发布选择。
+
+默认预标注范围是“未标注且没有当前模型预测”，便于连续处理下一批，避免重复消耗同一版本的请求。也可指定任务 ID 或显式重跑全部样本。服务卡支持先试运行 1 条。鉴权、额度或服务不可用会暂停任务并保留未处理队列；提高请求额度或轮换密钥后可重试，修改模型/提示词则需创建新任务。

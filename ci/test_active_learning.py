@@ -48,8 +48,13 @@ class ActiveLearningTests(unittest.TestCase):
         return SimpleNamespace(is_error=False,response=data,error_message=None)
 
     def annotate(self):
-        Annotation.objects.create(project=self.project,task=self.tasks[0],completed_by=self.user,
+        annotation=Annotation.objects.create(project=self.project,task=self.tasks[0],completed_by=self.user,
             result=[{'from_name':'category','to_name':'text','type':'choices','value':{'choices':['yes']}}])
+        from ml.workflow import fingerprint
+        from ml.workflow_models import ReviewCase
+        case=ReviewCase.objects.filter(task=self.tasks[0]).first()
+        if case:
+            case.status='resolved';case.evidence.update(accepted_hash=fingerprint(annotation.result),accepted_data=fingerprint(self.tasks[0].data));case.save()
 
     def test_persistent_training_refresh_and_no_duplicate_round(self):
         run_round(self.backend)
@@ -100,6 +105,17 @@ class ActiveLearningTests(unittest.TestCase):
         self.assertFalse(self.backend.learning_state['requested'])
         self.assertIn('trained',self.backend.learning_state)
         self.assertEqual(len([c for c in self.calls if c[0]=='train']),1)
+
+    def test_automatic_training_excludes_unreviewed_cases_and_holdout(self):
+        run_round(self.backend)
+        Annotation.objects.create(project=self.project,task=self.tasks[0],completed_by=self.user,
+            result=[{'from_name':'category','to_name':'text','type':'choices','value':{'choices':['yes']}}])
+        self.backend.refresh_from_db();run_round(self.backend)
+        self.assertFalse(any(c[0]=='train' for c in self.calls))
+        self.tasks[0].data['_workflow_split']='holdout';self.tasks[0].save()
+        self.annotate()
+        self.backend.refresh_from_db();run_round(self.backend)
+        self.assertFalse(any(c[0]=='train' for c in self.calls))
 
 
 if __name__=='__main__':unittest.main()
