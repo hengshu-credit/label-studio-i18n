@@ -14067,7 +14067,7 @@ index 3333952..9ae9dec 100644
      default:
        break;
    }
-
+ 
 -  if (offsetTop < window.scrollY || !openUpwardForShortViewport) {
 +  // positioner returns viewport coordinates. Add document scroll only once,
 +  // when returning coordinates for the absolutely positioned popup below.
