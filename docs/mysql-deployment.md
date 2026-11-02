@@ -22,6 +22,7 @@ Django 对超过 255 字符的唯一 CharField 会给出保守的 MySQL 检查�
 3. 在一次性迁移容器中运行 `tools/migrate-sqlite-to-mysql.py`，显式指定快照路径、SHA256、目标数据库和 checkpoint。目标须已建好表且没有任务、项目或用户数据。
 4. 工具分批复制所有业务表，保留主键和自增高水位；中断后可从 checkpoint 恢复。Django migration 历史使用 MySQL 实际建表记录，不用 SQLite 的记录覆盖。
 5. 对每张表核对行数，逐字段比较全部记录，检查外键。JSON 比较保留布尔、整数、浮点和 SQL NULL/JSON null 的区别；进度文件不记录 token/session 主键。
+   MySQL 的 JSON 文本解析可能对浮点末位做不同舍入。迁移工具只对这类数值使用原始 double 恢复，再严格核对所有值和浮点位；结构、非数值或无法精确恢复的差异仍中止。`--verify-only` 始终只读，不修复数据。
 6. 仅在 checkpoint 显示 `phase: verified` 后切换应用与 worker 到 `DJANGO_DB=mysql`，检查登录、项目列表、筛选、标注、预标注和学习任务。
 
 当前应用设置：`MYSQL_HOST=mysql`、`MYSQL_PORT=3306`、`MYSQL_NAME=labelstudio`、`MYSQL_USER=labelstudio`、`MYSQL_PASSWORD_FILE=/run/secrets/mysql-password`。

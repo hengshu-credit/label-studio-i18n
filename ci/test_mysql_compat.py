@@ -74,5 +74,22 @@ class MySQLCompatibilityTests(unittest.TestCase):
   self.assertNotEqual(module.comparable('{"value":1.0}','json'),module.comparable('{"value":1}','json'))
   self.assertEqual(module.comparable('{"b":"😀","a":1}','json'),module.comparable('{"a":1,"b":"😀"}','json'))
   self.assertEqual(module.converted('2026-11-02T08:30:00.123456+08:00','datetime(6)'),datetime.datetime(2026,11,2,0,30,0,123456))
+ def test_migration_restores_exact_json_numbers_without_weakening_comparison(self):
+  file=next(path for path in [Path('/tmp/migrate-sqlite-to-mysql.py'),Path('/migration-tools/migrate-sqlite-to-mysql.py')] if path.exists())
+  spec=importlib.util.spec_from_file_location('mysql_numbers',file);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+  original=json.dumps({'metric':0.030546955624355006,'nested':[{'key."quoted':-0.030546955624355006}],'kind':True})
+  with connection.cursor() as cursor:
+   cursor.execute('CREATE TEMPORARY TABLE exact_json_fixture (id INT PRIMARY KEY, payload JSON)')
+   try:
+    cursor.execute('INSERT INTO exact_json_fixture VALUES (1,%s)',[original])
+    cursor.execute('SELECT payload FROM exact_json_fixture WHERE id=1');copied=cursor.fetchone()[0]
+    repaired=module.restore_json_floats(connection,'exact_json_fixture','payload','id',1,original,copied)
+    self.assertEqual(module.comparable(original,'json'),module.comparable(repaired,'json'))
+    wrong=json.dumps({'metric':0.1,'nested':[{'key."quoted':-0.1}],'kind':1})
+    with self.assertRaises(ValueError):module.restore_json_floats(connection,'exact_json_fixture','payload','id',1,wrong,repaired)
+    cursor.execute('SELECT payload FROM exact_json_fixture WHERE id=1')
+    self.assertEqual(module.comparable(original,'json'),module.comparable(cursor.fetchone()[0],'json'))
+    with self.assertRaises(ValueError):module.float_repairs([1,2],[1])
+   finally:cursor.execute('DROP TEMPORARY TABLE exact_json_fixture')
 
 if __name__=='__main__':unittest.main()

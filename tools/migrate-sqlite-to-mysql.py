@@ -9,6 +9,7 @@ import datetime as dt
 import decimal
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -74,6 +75,46 @@ def comparable(value, kind):
         # SQL NULL and JSON null must remain distinct for is-null filters.
         return ('sql-null',) if value is None else ('json', typed_json(json.loads(value)))
     return converted(value, kind)
+
+
+def float_repairs(original, copied, path='$'):
+    """Find numeric parser drift only; never repair structural or nonnumeric changes."""
+    if typed_json(original) == typed_json(copied):
+        return []
+    if isinstance(original, float) and type(copied) in (float, int) and math.isfinite(original):
+        return [(path, original)]
+    if isinstance(original, dict) and isinstance(copied, dict) and original.keys() == copied.keys():
+        return [fix for key in original for fix in float_repairs(
+            original[key], copied[key], path + '.' + json.dumps(key, ensure_ascii=False))]
+    if isinstance(original, list) and isinstance(copied, list) and len(original) == len(copied):
+        return [fix for index, (left, right) in enumerate(zip(original, copied))
+                for fix in float_repairs(left, right, f'{path}[{index}]')]
+    raise ValueError('JSON differs beyond floating-point representation')
+
+
+def restore_json_floats(connection, table, column, primary, pk, original, copied):
+    """Restore source doubles through SQL numeric conversion, then verify every JSON value.
+
+    MySQL's JSON text parser can round a decimal one ULP differently from Python/SQLite.
+    CAST AS DOUBLE bypasses that parser; it is not an approximation or a relaxed comparison.
+    All changes roll back if the original types and exact float bits do not round-trip.
+    """
+    from django.db import transaction
+    for name in (table, column, primary):
+        identifier(name)
+    if original is None or copied is None:
+        raise ValueError('Cannot repair SQL NULL')
+    repairs = float_repairs(json.loads(original), json.loads(copied))
+    with transaction.atomic(using=connection.alias), connection.cursor() as cursor:
+        for path, value in repairs:
+            cursor.execute(
+                f'UPDATE `{table}` SET `{column}`=JSON_SET(`{column}`, %s, CAST(%s AS DOUBLE)) '
+                f'WHERE `{primary}`=%s', [path, value, pk])
+        cursor.execute(f'SELECT `{column}` FROM `{table}` WHERE `{primary}`=%s', [pk])
+        result = cursor.fetchone()[0]
+        if comparable(original, 'json') != comparable(result, 'json'):
+            raise ValueError('Exact JSON floating-point restoration failed')
+    return result
 
 
 def save_state(path, state):
@@ -241,7 +282,15 @@ def migrate(source_path, expected_sha, target_name, checkpoint, batch_size=2000,
                 for original, copied in zip(rows, target_rows):
                     for column, kind, left, right in zip(columns, kinds, original, copied):
                         if comparable(left, kind) != comparable(right, kind):
-                            raise RuntimeError(f'Value mismatch in {table}.{column}, row offset {checked}')
+                            if kind == 'json' and not verify_only:
+                                try:
+                                    right = restore_json_floats(connection, table, column, primary,
+                                                               original[columns.index(primary)], left, right)
+                                except Exception:
+                                    raise RuntimeError(f'Value mismatch in {table}.{column}, row offset {checked}') from None
+                                state['restored_json_number_fields'] = state.get('restored_json_number_fields', 0) + 1
+                            if comparable(left, kind) != comparable(right, kind):
+                                raise RuntimeError(f'Value mismatch in {table}.{column}, row offset {checked}')
                 checked += len(rows)
                 if checked % (batch_size * 100) == 0:
                     print(f'CHECK {table}: {checked}/{expected_count}', flush=True)
