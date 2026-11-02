@@ -6690,7 +6690,7 @@ index 0000000..9e3ce83
 +.labeling-source-card{height:auto!important;min-height:70px;padding:12px!important;white-space:normal}.labeling-source-card.selected{border-color:var(--color-primary-border,#617ada)!important;box-shadow:inset 3px 0 var(--color-primary-border,#617ada)!important}.labeling-workspace__sources>button:not(.labeling-source-card){width:100%;margin:8px 0}.labeling-submit-menu{display:flex;flex-direction:column;padding:6px;gap:4px;min-width:190px}.labeling-submit-menu>button{text-align:left}.labeling-submit-menu>button>span{justify-content:flex-start}.labeling-workspace__notice{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
 diff --git a/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.jsx b/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.jsx
 new file mode 100644
-index 0000000..b07cce0
+index 0000000..de0c730
 --- /dev/null
 +++ b/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.jsx
 @@ -0,0 +1,119 @@
@@ -6715,7 +6715,7 @@ index 0000000..b07cce0
 +
 +const SourceButton=({className="",...props})=><button {...props} className={buttonVariant({variant:"neutral",look:"outlined",size:"small",align:"left"},`labeling-source-card ${className}`)}/>;
 +function SubmitMenu({prediction,onSelect}){const menu=useDropdown();return <div className="labeling-submit-menu" role="menu">{[["stay",prediction?"Accept and inspect":"Submit and inspect"],["exit",prediction?"Accept and exit":"Submit and exit"]].map(([mode,label])=><Button role="menuitem" key={mode} look="string" onClick={()=>{menu?.close();onSelect(mode);}}>{t(label)}</Button>)}</div>;}
-+function SubmitActions({prediction,disabled,onSubmit}){return <ButtonGroup><Button variant="primary" look="filled" disabled={disabled} onClick={()=>onSubmit("next")}>{t(prediction?"Accept and next":"Submit and next")}</Button><Dropdown.Trigger anchorPositioning={false} style={{position:"fixed",positionAnchor:"none",positionTryFallbacks:"none"}} disabled={disabled} alignment="top-right" content={<SubmitMenu prediction={prediction} onSelect={onSubmit}/>}><Button variant="primary" look="filled" disabled={disabled} aria-label={t("More submission options")}><IconChevronDown/></Button></Dropdown.Trigger></ButtonGroup>;}
++function SubmitActions({prediction,disabled,onSubmit}){return <ButtonGroup><Button variant="primary" look="filled" disabled={disabled} onClick={()=>onSubmit("next")}>{t(prediction?"Accept and next":"Submit and next")}</Button><Dropdown.Trigger anchorPositioning={false} disabled={disabled} alignment="top-right" content={<SubmitMenu prediction={prediction} onSelect={onSubmit}/>}><Button variant="primary" look="filled" disabled={disabled} aria-label={t("More submission options")}><IconChevronDown/></Button></Dropdown.Trigger></ButtonGroup>;}
 +function RecentSubmissions({items,onOpen}){const menu=useDropdown();return <div className="labeling-submit-menu" role="menu">{items.map(a=><Button role="menuitem" key={a.id} look="string" onClick={()=>{menu?.close();onOpen(a.task_id);}}>{t("Task")} #{a.task_id} · {new Date(a.updated_at).toLocaleTimeString(currentLanguage(),{hour12:false})}</Button>)}</div>;}
 +
 +export const LabelingWorkspace=()=>{
@@ -6782,7 +6782,7 @@ index 0000000..b07cce0
 + const mine=task?.annotations.find(a=>a.mine),selectedHuman=task?.annotations.find(a=>a.id===view?.id),selectedPrediction=task?.predictions.find(p=>p.id===view?.id);
 + if(!ready)return <div role="status">{t("Loading project...")}</div>;
 + return <main className="labeling-workspace" data-testid="labeling-workspace">
-+  <header className="labeling-workspace__header"><div><h1>{t("Labeling workspace")}</h1><p>{t("Model suggestions become human annotations only after you accept or submit them.")}</p></div><div className="labeling-workspace__actions">{config?.recent_submissions?.length>0&&<Dropdown.Trigger anchorPositioning={false} style={{position:"fixed",positionAnchor:"none",positionTryFallbacks:"none"}} alignment="bottom-right" content={<RecentSubmissions items={config.recent_submissions} onOpen={openSubmitted}/>}><Button>{t("Annotation history")}<IconChevronDown/></Button></Dropdown.Trigger>}{config?.can_manage&&<Button onClick={()=>setShowSettings(!showSettings)}>{t("Task distribution settings")}</Button>}</div></header>
++  <header className="labeling-workspace__header"><div><h1>{t("Labeling workspace")}</h1><p>{t("Model suggestions become human annotations only after you accept or submit them.")}</p></div><div className="labeling-workspace__actions">{config?.recent_submissions?.length>0&&<Dropdown.Trigger anchorPositioning={false} alignment="bottom-right" content={<RecentSubmissions items={config.recent_submissions} onOpen={openSubmitted}/>}><Button>{t("Annotation history")}<IconChevronDown/></Button></Dropdown.Trigger>}{config?.can_manage&&<Button onClick={()=>setShowSettings(!showSettings)}>{t("Task distribution settings")}</Button>}</div></header>
 +  {config&&<div className="labeling-workspace__stats"><span>{t("Task assignment mode")}: {config.mode==="manual"?t("Manual assignment"):t("Automatic assignment")} · {samplingName(config.mode==="manual"?"Sequential sampling":config.sampling)}</span><span>{t("Completed tasks")}: {config.completed_tasks} / {config.task_count}</span><span>{t("My submitted tasks")}: {config.my_completed}</span><span>{t("Reservation")}: {config.reservation_minutes} {t("minutes")}</span></div>}
 +  {error&&<div role="alert" className="labeling-workspace__error">{error}</div>}{notice&&<div role="status" className="labeling-workspace__notice">{notice}</div>}
 +  {lastSubmitted&&<div className="labeling-workspace__notice" role="status"><span>{t("Last submitted task")}: #{lastSubmitted.task}</span><Button look="string" onClick={()=>openSubmitted(lastSubmitted.task)}>{t("View submitted result")}</Button></div>}
@@ -14041,6 +14041,43 @@ index 594df11..b726a91 100644
  
  export interface ViewAllToggleProps {
    isActive: boolean;
+diff --git a/web/libs/core/src/lib/utils/dom.ts b/web/libs/core/src/lib/utils/dom.ts
+index 3333952..9ae9dec 100644
+--- a/web/libs/core/src/lib/utils/dom.ts
++++ b/web/libs/core/src/lib/utils/dom.ts
+@@ -157,25 +157,27 @@ export const alignElements = (
+     case "bottom-center":
+       offsetTop = pos.bottom + padding;
+       offsetLeft = pos.horizontalCenter;
+-      maxHeight = window.scrollY + window.innerHeight - offsetTop;
++      maxHeight = window.innerHeight - offsetTop;
+       break;
+     case "bottom-left":
+       offsetTop = pos.bottom + padding;
+       offsetLeft = pos.horizontalLeft;
+-      maxHeight = window.scrollY + window.innerHeight - offsetTop;
++      maxHeight = window.innerHeight - offsetTop;
+       break;
+     case "bottom-right":
+       offsetTop = pos.bottom + padding;
+       offsetLeft = pos.horizontalRight;
+-      maxHeight = window.scrollY + window.innerHeight - offsetTop;
++      maxHeight = window.innerHeight - offsetTop;
+       break;
+     default:
+       break;
+   }
+
+-  if (offsetTop < window.scrollY || !openUpwardForShortViewport) {
++  // positioner returns viewport coordinates. Add document scroll only once,
++  // when returning coordinates for the absolutely positioned popup below.
++  if (offsetTop < 0 || !openUpwardForShortViewport) {
+     offsetTop = pos.bottom + padding;
+-    maxHeight = window.scrollY + window.innerHeight - offsetTop;
++    maxHeight = window.innerHeight - offsetTop;
+     resultAlign[0] = "bottom";
+   }
+   // If the dropdown has more space on the top, then we should align it to the top
 diff --git a/web/libs/core/src/providers/api-provider.tsx b/web/libs/core/src/providers/api-provider.tsx
 index c82f812..ada6f58 100644
 --- a/web/libs/core/src/providers/api-provider.tsx
@@ -21994,6 +22031,25 @@ index 6985b57..a35e663 100644
            </SheetTitle>
            {description && (
              <SheetDescription data-slot="drawer-description" data-testid="drawer-description">
+diff --git a/web/libs/ui/src/lib/dropdown/dropdown.tsx b/web/libs/ui/src/lib/dropdown/dropdown.tsx
+index d07e1a4..96b83d2 100644
+--- a/web/libs/ui/src/lib/dropdown/dropdown.tsx
++++ b/web/libs/ui/src/lib/dropdown/dropdown.tsx
+@@ -423,10 +423,11 @@ const DropdownComponent = forwardRef<DropdownRef, DropdownProps>(
+       const styles = {
+         // Apply anchor positioning styles OR JS-calculated offset for fallback
+         ...(useAnchor ? anchorStyles : (offset ?? {})),
+-        // When not using anchor positioning with cursor, ensure fixed positioning
+-        ...(!useAnchor && cursorPosition
++        // alignElements returns document coordinates; cursor positions are
++        // viewport coordinates. Match the positioning mode to those units.
++        ...(!useAnchor
+           ? {
+-              position: "fixed",
++              position: cursorPosition ? "fixed" : "absolute",
+               positionAnchor: "none",
+               positionTryFallbacks: "none",
+             }
 diff --git a/web/libs/ui/src/lib/enterprise-badge/enterprise-badge.tsx b/web/libs/ui/src/lib/enterprise-badge/enterprise-badge.tsx
 index 6476201..21aa905 100644
 --- a/web/libs/ui/src/lib/enterprise-badge/enterprise-badge.tsx
