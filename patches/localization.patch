@@ -1,3 +1,43 @@
+diff --git a/deploy/docker-entrypoint.d/common/20-wait-for-db.sh b/deploy/docker-entrypoint.d/common/20-wait-for-db.sh
+index 2b7f23c..c6e0f83 100755
+--- a/deploy/docker-entrypoint.d/common/20-wait-for-db.sh
++++ b/deploy/docker-entrypoint.d/common/20-wait-for-db.sh
+@@ -73,10 +73,31 @@ if [[ -n "${POSTGRE_HOST:-}" ]]; then
+   echo >&3 "=> Postgres is up."
+ elif [ -n "${MYSQL_HOST:-}" ]; then
+   echo >&3 "=> Waiting for MySQL..."
+-  while ! mysqladmin ping -h"$MYSQL_HOST" -P"${MYSQL_PORT:-3306}" --silent; do
+-      echo >&3 "==> MySQL is unavailable - sleeping..."
+-      sleep 1
+-  done
++  python3 <<'PY'
++import os
++import sys
++import time
++from pathlib import Path
++import MySQLdb
++
++secret_file = os.getenv('MYSQL_PASSWORD_FILE')
++password = Path(secret_file).read_text().strip() if secret_file else os.getenv('MYSQL_PASSWORD', '')
++deadline = time.monotonic() + int(os.getenv('DB_WAIT_TIMEOUT', '180'))
++while True:
++    try:
++        conn = MySQLdb.connect(host=os.environ['MYSQL_HOST'], port=int(os.getenv('MYSQL_PORT', '3306')),
++                               user=os.getenv('MYSQL_USER', 'root'), password=password,
++                               database=os.getenv('MYSQL_NAME', 'labelstudio'), charset='utf8mb4', connect_timeout=5)
++        with conn.cursor() as cursor:
++            cursor.execute('SELECT 1')
++        conn.close()
++        break
++    except MySQLdb.Error as error:
++        code = error.args[0] if error.args else 'unknown'
++        if code in (1044, 1045) or time.monotonic() >= deadline:
++            sys.exit(f'MySQL connection check failed (code {code}). Check database access and secret files.')
++        time.sleep(1)
++PY
+   echo >&3 "=> MySQL is up."
+ else
+   echo >&3 "=> Skipping wait for database."
 diff --git a/deploy/docker-entrypoint.sh b/deploy/docker-entrypoint.sh
 index 5a75641..55b67c0 100755
 --- a/deploy/docker-entrypoint.sh
@@ -27,6 +67,48 @@ index 5a75641..55b67c0 100755
  elif [ "$1" = "label-studio-uwsgi" ]; then
    exec_entrypoint "$ENTRYPOINT_PATH/app/"
    exec_or_wrap_n_exec uwsgi --ini /label-studio/deploy/uwsgi.ini
+diff --git a/label_studio/core/management/commands/locked_migrate.py b/label_studio/core/management/commands/locked_migrate.py
+index ad0d134..920b928 100644
+--- a/label_studio/core/management/commands/locked_migrate.py
++++ b/label_studio/core/management/commands/locked_migrate.py
+@@ -1,5 +1,6 @@
+ import logging
+ import time
++import hashlib
+
+ from django.conf import settings
+ from django.core.management.commands.migrate import Command as MigrateCommand
+@@ -28,10 +29,30 @@ class Command(MigrateCommand):
+
+     def handle(self, *args, **options):
+         lock_id = options.pop('migrate_lock_id')
++        if connections['default'].vendor == 'sqlite':
++            return super().handle(*args, **options)
+
+         # Create a separate database connection to hold the lock
+         separate_lock_connection = connections.create_connection('default')
+         connections[LOCKED_MIGRATE_CMD_CONNECTION_ALIAS] = separate_lock_connection
++        if separate_lock_connection.vendor == 'mysql':
++            database = str(separate_lock_connection.settings_dict['NAME'])
++            lock_name = 'labelstudio-migrate-' + hashlib.sha256(f'{database}:{lock_id}'.encode()).hexdigest()[:32]
++            acquired = False
++            try:
++                with separate_lock_connection.cursor() as cursor:
++                    cursor.execute('SELECT GET_LOCK(%s, %s)', [lock_name, MAX_WAIT_TIME])
++                    acquired = cursor.fetchone()[0] == 1
++                if not acquired:
++                    raise TimeoutError('Failed to acquire MySQL migration lock within 5 minutes.')
++                return super().handle(*args, **options)
++            finally:
++                try:
++                    if acquired:
++                        with separate_lock_connection.cursor() as cursor:
++                            cursor.execute('SELECT RELEASE_LOCK(%s)', [lock_name])
++                finally:
++                    separate_lock_connection.close()
+         try:
+             # Use a transaction to hold the lock for the duration of the migration
+             with transaction.atomic(using=LOCKED_MIGRATE_CMD_CONNECTION_ALIAS):
 diff --git a/label_studio/core/middleware.py b/label_studio/core/middleware.py
 index 1e18de7..7b5dd6f 100644
 --- a/label_studio/core/middleware.py
