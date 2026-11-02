@@ -2913,10 +2913,10 @@ index 040a8a0..9ef61c0 100644
          # collect all clusters already solved by user, count number of solved task in them
 diff --git a/label_studio/projects/labeling.py b/label_studio/projects/labeling.py
 new file mode 100644
-index 0000000..05bb47b
+index 0000000..8c5e3c1
 --- /dev/null
 +++ b/label_studio/projects/labeling.py
-@@ -0,0 +1,352 @@
+@@ -0,0 +1,419 @@
 +"""Explicit human confirmation and a reserved, project-scoped labeling queue."""
 +import copy
 +import datetime
@@ -3065,6 +3065,39 @@ index 0000000..05bb47b
 +
 +    def get(self, request, pk):
 +        project = self.project(request, pk)
++        if request.query_params.get('prediction_options') or request.query_params.get('prediction_run'):
++            task = get_object_or_404(Task, pk=positive_id(request.query_params.get('task')), project=project)
++            if not allowed(task, request.user, queue_mode(project)) and not own_annotation(task, request.user) and not request.user.has_perm(all_permissions.projects_change):
++                raise PermissionDenied('This task is not assigned to you.')
++            from ml.workflow_models import AnnotationProvider, LearningRun
++            from ml.workflow import cloud_version, provider_public, fingerprint
++            if request.query_params.get('prediction_run'):
++                run = get_object_or_404(LearningRun, pk=positive_id(request.query_params['prediction_run']), project=project, kind='predict', report__sample_preannotation=True)
++                item = get_object_or_404(run.items.select_related('prediction'), task=task)
++                pred = item.prediction
++                if item.snapshot.get('data_hash') != fingerprint(task.data) or run.config.get('label_config') != project.label_config:
++                    return Response({'id':run.pk,'status':'failed','prediction':None,'error':'The task or labeling interface changed. Reload before submitting.'})
++                return Response({'id': run.pk, 'status': run.status, 'error': item.error or run.error,
++                                 'prediction': {'id': pred.pk, 'result': pred.result, 'score': pred.score, 'model_version': pred.model_version,
++                                                'model_name': run.provider.name, 'created_at': pred.created_at} if pred else None})
++            models = []
++            bound = set()
++            for p in AnnotationProvider.objects.filter(project=project).select_related('backend'):
++                if p.options.get('archived') or (p.backend_id and (p.backend.extra_params or {}).get('_workflow_archived')):
++                    continue
++                public = provider_public(p)
++                if p.backend_id:bound.add(p.backend_id)
++                version = p.backend.model_version if p.backend_id else cloud_version(p, project.label_config)
++                models.append({'id': f'provider:{p.pk}', 'name': p.name, 'ready': public['ready'] and not (public['connection'] or {}).get('requires_training'),
++                               'selected': project.model_version in [version, p.backend.title if p.backend_id else None]})
++            for b in project.get_ml_backends().exclude(pk__in=bound):
++                from ml.model_management import connection_public
++                models.append({'id': f'connection:{b.pk}', 'name': b.title, 'ready': not connection_public(b)['requires_training'],
++                               'selected': project.model_version in [b.title, b.model_version]})
++            active = LearningRun.objects.filter(project=project, kind='predict', report__sample_preannotation=True, items__task=task, status__in=['queued','running']).first()
++            return Response({'models': models, 'active_run': active.pk if active else None, 'input_hash': input_hash(task),
++                             'can_predict': request.user.has_perm(all_permissions.annotations_create),
++                             'can_configure': request.user.has_perm(all_permissions.projects_change)})
 +        if request.query_params.get('task'):
 +            task = get_object_or_404(Task.objects.select_related('project'), pk=positive_id(request.query_params['task']), project=project)
 +            if not allowed(task, request.user, queue_mode(project)) and not own_annotation(task, request.user) and not request.user.has_perm(all_permissions.projects_change):
@@ -3103,6 +3136,40 @@ index 0000000..05bb47b
 +                task = self.next_task(request.user, project, mode)
 +                return Response({'task': task_public(task, request.user) if task else None, 'queue': project.sampling})
 +            task = get_object_or_404(Task.objects.select_related('project'), pk=positive_id(request.data.get('task')), project=project)
++            if action == 'preannotate':
++                if not allowed(task, request.user, mode) and not own_annotation(task, request.user) and not request.user.has_perm(all_permissions.projects_change):
++                    raise PermissionDenied('This task is not assigned to you.')
++                if request.data.get('input_hash') and request.data['input_hash'] != input_hash(task):
++                    raise QueueConflict('The task or labeling interface changed. Reload before submitting.')
++                from ml.workflow import ProjectWorkflowAPI
++                from ml.workflow import controls
++                from ml.workflow_models import AnnotationProvider, LearningRun
++                from ml.model_management import adopt_connection, connection_public
++                if request.data.get('label_config') and request.data['label_config'] != project.label_config:
++                    raise QueueConflict('The task or labeling interface changed. Reload before submitting.')
++                if request.data.get('expected_data') is not None:
++                    expected = request.data['expected_data']
++                    try: bindings = controls(project.label_config)
++                    except ValueError as error: raise ValidationError(str(error)) from error
++                    if not isinstance(expected, dict) or any(expected.get(c['field']) != task.data.get(c['field']) for c in bindings.values()):
++                        raise QueueConflict('The task or labeling interface changed. Reload before submitting.')
++                model = str(request.data.get('model', '')).split(':')
++                if len(model) != 2 or model[0] not in ('provider','connection'):
++                    raise ValidationError('Choose a preannotation model.')
++                provider = adopt_connection(project, positive_id(model[1])) if model[0] == 'connection' else get_object_or_404(AnnotationProvider, pk=positive_id(model[1]), project=project)
++                if provider.options.get('archived') or (provider.backend_id and (provider.backend.extra_params or {}).get('_workflow_archived')):
++                    raise ValidationError('This model has been removed.')
++                if provider.backend_id and connection_public(provider.backend)['requires_training']:
++                    raise ValidationError('This model needs initial human annotations, training and publication before preannotation.')
++                active = LearningRun.objects.filter(project=project, provider=provider, kind='predict', report__sample_preannotation=True, items__task=task, status__in=['queued','running']).first()
++                if active:return Response({'id': active.pk, 'status': active.status, 'reused': True})
++                try:
++                    run = ProjectWorkflowAPI().start(project, request.user, {'kind':'predict','provider':provider.pk,'scope':'all','task_ids':[task.pk],'limit':1})
++                except (ValueError,TypeError,KeyError) as error:
++                    raise ValidationError(str(error)) from error
++                run.report = {**run.report, 'sample_preannotation': True}
++                run.save(update_fields=['report'])
++                return Response({'id': run.pk, 'status': run.status, 'reused': False}, status=201)
 +            if action == 'release':
 +                task.release_lock(request.user)
 +                return Response({'released': True})
@@ -6779,10 +6846,11 @@ index 0000000..9e3ce83
 +.labeling-source-card{height:auto!important;min-height:70px;padding:12px!important;white-space:normal}.labeling-source-card.selected{border-color:var(--color-primary-border,#617ada)!important;box-shadow:inset 3px 0 var(--color-primary-border,#617ada)!important}.labeling-workspace__sources>button:not(.labeling-source-card){width:100%;margin:8px 0}.labeling-submit-menu{display:flex;flex-direction:column;padding:6px;gap:4px;min-width:190px}.labeling-submit-menu>button{text-align:left}.labeling-submit-menu>button>span{justify-content:flex-start}.labeling-workspace__notice{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
 diff --git a/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.jsx b/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.jsx
 new file mode 100644
-index 0000000..de0c730
+index 0000000..c3350e0
 --- /dev/null
 +++ b/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.jsx
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,122 @@
++import {SamplePreannotation} from "@humansignal/app-common/components/SamplePreannotation/SamplePreannotation";
 +import {WorkflowButton as Button} from "../../components/Workflow/WorkflowButton";
 +import {ButtonGroup,Dropdown,useDropdown,buttonVariant} from "@humansignal/ui";
 +import {IconChevronDown} from "@humansignal/icons";
@@ -6829,7 +6897,8 @@ index 0000000..de0c730
 +  else if(mine)setSelection({mode:"human",id:mine.id,result:mine.result});
 +  else if(prediction)setSelection({mode:"prediction",id:prediction.id,result:prediction.result});
 +  else if(next.reserved_until)setSelection({mode:"edit",result:[],source:null,annotation:null,stamp:""});
-+  else setSelection({mode:"human",id:next.annotations[0]?.id,result:next.annotations[0]?.result||[]});
++  else if(next.annotations.length)setSelection({mode:"human",id:next.annotations[0].id,result:next.annotations[0].result});
++  else setSelection({mode:"empty",result:[]});
 + }
 + const hasUnsaved=()=>viewRef.current?.mode==="edit"&&Boolean(editorStore.current)&&JSON.stringify(editorStore.current.annotationStore.selected?.serializeAnnotation()||[])!==savedResult.current;
 + const unsavedRef=useRef(hasUnsaved);unsavedRef.current=hasUnsaved;
@@ -6886,11 +6955,12 @@ index 0000000..de0c730
 +  </section>}
 +  {!task?<section className="labeling-workspace__empty"><h2>{empty?t("Ready for your next task"):t("Start labeling")}</h2><p>{t("Tasks are allocated using the project distribution settings. Predictions do not count as completed human annotations.")}</p><Button className="labeling-workspace__primary" disabled={busy||draftBusy} onClick={next}>{t("Get next task")}</Button>{empty&&<p>{t("If no task is returned, your queue is complete, unassigned, or temporarily reserved by others.")}</p>}</section>:<>
 +   <div className="labeling-workspace__task-heading"><strong>{t("Task")} #{task.id}</strong><span>{task.reserved_until?`${t("Reserved until")}: ${new Date(task.reserved_until).toLocaleTimeString(currentLanguage(),{hour12:false})}`:t("Read-only preview — reserve before editing")}</span><div className="labeling-workspace__actions"><Button disabled={busy||draftBusy} onClick={next}>{t("Get next task")}</Button>{task.reserved_until&&<Button disabled={busy||draftBusy} onClick={async()=>{if(unsavedRef.current()){await saveDraft();if(unsavedRef.current())return;}if(await action({action:"release",task:task.id})){showTask((await request(null,`?task=${task.id}`)).task);}}}>{t("Save draft and release task")}</Button>}</div></div>
++   <SamplePreannotation projectId={routeId} taskId={task.id} inputHash={task.input_hash} labelConfig={project.label_config} disabled={busy||draftBusy} onBeforePredict={async()=>{if(unsavedRef.current()){await saveDraft();if(unsavedRef.current())return false;}return true;}} onPrediction={prediction=>{setTask(old=>old?.id===task.id?{...old,predictions:[prediction,...old.predictions.filter(p=>p.id!==prediction.id)]}:old);if(viewRef.current?.mode!=="edit"||(!unsavedRef.current()&&!(editorStore.current?.annotationStore.selected?.serializeAnnotation()||[]).length))setSelection({mode:"prediction",id:prediction.id,result:prediction.result});setNotice(t("Prediction ready. Review it before submitting a human annotation."));}} onManual={()=>edit(mine?.result||[],mine?.parent_prediction||null,mine)}/>
 +   <div className="labeling-workspace__layout"><aside className="labeling-workspace__sources"><h2>{t("Model suggestions")}</h2><p>{t("Predictions are source records. Accepted or corrected results appear under human annotations.")}</p>{!task.predictions.length&&<p>{t("No predictions for this task")}</p>}{task.predictions.map(p=><SourceButton key={p.id} data-testid={`suggestion-${p.id}`} className={view?.mode==="prediction"&&view.id===p.id?"selected":""} onClick={()=>{if(!unsavedRef.current()||window.confirm(t("Replace the current unsaved draft?")))setSelection({mode:"prediction",id:p.id,result:p.result});}}><strong>{p.model_name||t("Imported predictions")}</strong><small>{p.score==null?t("No probability score"):`${t("Confidence")}: ${(p.score*100).toFixed(1)}%`}</small><span>{describe(p.result)}</span>{task.annotations.some(a=>a.parent_prediction===p.id)&&<small>{t("Used in a submitted human annotation")}</small>}</SourceButton>)}
 +   <h2>{t("Submitted human annotations")}</h2>{!task.annotations.length&&<p>{t("No human annotation submitted yet")}</p>}{task.annotations.map(a=><SourceButton key={a.id} data-testid={`human-annotation-${a.id}`} className={view?.mode==="human"&&view.id===a.id?"selected":""} onClick={()=>{if(!unsavedRef.current()||window.confirm(t("Replace the current unsaved draft?")))setSelection({mode:"human",id:a.id,result:a.result});}}><strong>{a.mine?t("My annotation"):a.author}</strong><small>{a.parent_prediction?t("Human-confirmed model suggestion"):t("Human annotation")} · #{a.id}</small><span>{describe(a.result)}</span><small>{new Date(a.updated_at).toLocaleString(currentLanguage(),{hour12:false})}</small></SourceButton>)}
 +   {task.draft&&<Button disabled={busy||draftBusy||task.draft.stale} onClick={()=>edit(task.draft.result,task.draft.prediction,task.annotations.find(a=>a.id===task.draft.annotation))}>{task.draft.stale?t("Draft belongs to an older task version"):t("Resume my saved draft")}</Button>}
 +   <Button disabled={busy||draftBusy||!task.assigned_to_me} onClick={()=>edit(mine?.result||[],mine?.parent_prediction||null,mine)}>{mine?t("Edit my human annotation"):t("Annotate manually")}</Button></aside>
-+   <section className={`labeling-workspace__editor-area ${view?.mode}`}><div className="labeling-workspace__origin" data-testid="annotation-origin"><strong>{view?.mode==="prediction"?t("Model suggestion — awaiting human acceptance"):view?.mode==="edit"?t("Working draft — not submitted"):t("Submitted human annotation")}</strong><span>{view?.mode==="prediction"?(selectedPrediction?.model_name||t("Imported predictions")):view?.mode==="human"?selectedHuman?.author:dirty?t("Unsaved changes"):t("Submit to confirm this annotation")}</span></div>
++   <section className={`labeling-workspace__editor-area ${view?.mode}`}><div className="labeling-workspace__origin" data-testid="annotation-origin"><strong>{view?.mode==="prediction"?t("Model suggestion — awaiting human acceptance"):view?.mode==="edit"?t("Working draft — not submitted"):view?.mode==="empty"?t("Unannotated sample — choose preannotation or manual labeling"):t("Submitted human annotation")}</strong><span>{view?.mode==="prediction"?(selectedPrediction?.model_name||t("Imported predictions")):view?.mode==="human"?selectedHuman?.author:dirty?t("Unsaved changes"):t("Submit to confirm this annotation")}</span></div>
 +    <div className="labeling-workspace__editor" ref={root} data-testid="labeling-editor"/>{!editorReady&&<p role="status">{t("Loading labeling interface...")}</p>}
 +    <footer className="labeling-workspace__footer">{view?.mode==="prediction"&&<><SubmitActions prediction disabled={busy||draftBusy||!editorReady||Boolean(mine)||!task.assigned_to_me} onSubmit={accept}/><Button disabled={busy||draftBusy||!editorReady||!task.assigned_to_me} onClick={()=>edit(view.result,view.id,mine)}>{t("Edit prediction before submitting")}</Button>{mine&&<span>{t("You already have a human annotation. Edit it to make a correction.")}</span>}</>}{view?.mode==="edit"&&<><SubmitActions disabled={busy||draftBusy||!editorReady} onSubmit={submit}/><Button disabled={busy||draftBusy||!editorReady} onClick={saveDraft}>{t("Save draft")}</Button></>}{view?.mode==="human"&&selectedHuman?.mine&&<Button disabled={busy||draftBusy||!task.assigned_to_me} onClick={()=>edit(selectedHuman.result,selectedHuman.parent_prediction,selectedHuman)}>{t("Edit my human annotation")}</Button>}{!mine&&<Button disabled={busy||draftBusy||!task.assigned_to_me} onClick={async()=>{if(unsavedRef.current()){await saveDraft();if(unsavedRef.current())return;}const r=await action({action:"reserve",task:task.id});if(r&&await action({action:"skip",task:task.id,input_hash:task.input_hash}))next();}}>{t("Skip this task")}</Button>}</footer>
 +   </section></div>
@@ -10835,6 +10905,46 @@ index 3b0359e..911201d 100644
        </Form.Actions>
      </Form>
    );
+diff --git a/web/libs/app-common/src/components/SamplePreannotation/SamplePreannotation.css b/web/libs/app-common/src/components/SamplePreannotation/SamplePreannotation.css
+new file mode 100644
+index 0000000..46136d8
+--- /dev/null
++++ b/web/libs/app-common/src/components/SamplePreannotation/SamplePreannotation.css
+@@ -0,0 +1 @@
++.sample-preannotation{padding:10px 12px;border-bottom:1px solid var(--color-neutral-border);background:var(--color-neutral-background);color:var(--color-neutral-content);font-size:13px;flex-shrink:0}.sample-preannotation__controls{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}.sample-preannotation label{display:flex;flex-direction:row;align-items:center;gap:6px;margin:0;min-width:170px;max-width:360px}.sample-preannotation select{font:inherit;min-height:32px;padding:4px 10px;border:1px solid var(--color-neutral-border);border-radius:4px;background:var(--color-neutral-background);color:inherit}.sample-preannotation__status{margin-top:6px;color:var(--color-neutral-content-subtler);line-height:1.5}.sample-preannotation [role=alert]{color:var(--color-negative-content)}
+diff --git a/web/libs/app-common/src/components/SamplePreannotation/SamplePreannotation.tsx b/web/libs/app-common/src/components/SamplePreannotation/SamplePreannotation.tsx
+new file mode 100644
+index 0000000..46a794c
+--- /dev/null
++++ b/web/libs/app-common/src/components/SamplePreannotation/SamplePreannotation.tsx
+@@ -0,0 +1,27 @@
++import {useEffect,useRef,useState} from "react";
++import {Button,buttonVariant} from "@humansignal/ui";
++import {uiT as t} from "../../i18n/ui";
++import "./SamplePreannotation.css";
++
++type Props={projectId:number;taskId:number;inputHash?:string;taskData?:any;labelConfig?:string;disabled?:boolean;onBeforePredict?:()=>Promise<boolean>;onPrediction:(prediction:any)=>void|Promise<void>;onManual?:()=>void;};
++const csrf=()=>decodeURIComponent(document.cookie.split("; ").find(v=>v.startsWith("csrftoken="))?.slice(10)||"");
++const message=(v:any):string=>typeof v==="string"?t(v):Array.isArray(v)?v.map(message).join(" · "):v&&typeof v==="object"?Object.values(v).map(message).join(" · "):t("Request failed");
++export function SamplePreannotation({projectId,taskId,inputHash,taskData,labelConfig,disabled,onBeforePredict,onPrediction,onManual}:Props){
++ const [options,setOptions]=useState<any>(null),[model,setModel]=useState(""),[run,setRun]=useState<number|null>(null),[status,setStatus]=useState(""),[error,setError]=useState(""),[starting,setStarting]=useState(false);
++ const owner=useRef(`${projectId}:${taskId}`);owner.current=`${projectId}:${taskId}`;
++ const deliver=useRef(onPrediction);deliver.current=onPrediction;const delivered=useRef<number|null>(null);
++ const url=`/api/projects/${projectId}/labeling-workspace/`;
++ async function request(query:string,body?:any){const r=await fetch(url+query,{method:body?"POST":"GET",credentials:"same-origin",headers:{"Content-Type":"application/json","X-CSRFToken":csrf()},...(body?{body:JSON.stringify(body)}:{})});const v=await r.json();if(!r.ok)throw Error(message(v.validation_errors||v.detail||v));return v;}
++ useEffect(()=>{let active=true;setOptions(null);setRun(null);setError("");setStatus("");setStarting(false);delivered.current=null;
++  if(projectId&&taskId)request(`?prediction_options=1&task=${taskId}`).then(v=>{if(!active)return;setOptions(v);setModel(v.models.find((m:any)=>m.selected&&m.ready)?.id||(v.models.filter((m:any)=>m.ready).length===1?v.models.find((m:any)=>m.ready).id:""));setRun(v.active_run);}).catch(e=>active&&setError(e.message));return()=>{active=false;};
++ },[projectId,taskId]);
++ useEffect(()=>{if(!run)return;let active=true,timer:ReturnType<typeof setTimeout>;const identity=`${projectId}:${taskId}`;const poll=async()=>{try{const v=await request(`?prediction_run=${run}&task=${taskId}`);if(!active||owner.current!==identity)return;setStatus(v.status);if(v.prediction){if(delivered.current!==run){delivered.current=run;await deliver.current(v.prediction);}if(!active||owner.current!==identity)return;setRun(null);setStatus("completed");}else if(["failed","cancelled","completed"].includes(v.status)){setError(message(v.error||"The model returned no prediction. Check the job details and retry."));setRun(null);}else timer=setTimeout(poll,1200);}catch(e:any){if(active){setError(e.message);timer=setTimeout(poll,5000);}}};poll();return()=>{active=false;clearTimeout(timer);};},[run,projectId,taskId]);
++ async function start(){const current=owner.current;setStarting(true);setError("");try{if(onBeforePredict&&!await onBeforePredict())return;if(owner.current!==current)return;const v=await request("",{action:"preannotate",task:taskId,model,input_hash:inputHash||options?.input_hash,expected_data:taskData,label_config:labelConfig});if(owner.current===current){setRun(v.id);setStatus(v.status);}}catch(e:any){if(owner.current===current)setError(e.message);}finally{if(owner.current===current)setStarting(false);}}
++ if(!projectId||!taskId)return null;
++ return <div className="sample-preannotation" data-testid="sample-preannotation"><div className="sample-preannotation__controls">
++  <label>{t("Preannotation model")}<select aria-label={t("Preannotation model")} value={model} disabled={disabled||starting||Boolean(run)||!options} onChange={e=>setModel(e.target.value)}><option value="">{t("Choose a model")}</option>{options?.models.map((m:any)=><option key={m.id} value={m.id} disabled={!m.ready}>{m.name}{m.ready?"":` · ${t("Needs configuration or training")}`}</option>)}</select></label>
++  <Button size="small" disabled={disabled||starting||Boolean(run)||!options?.can_predict||!model} waiting={starting||Boolean(run)} onClick={start}>{run?t("Preannotating this sample..."):t("Preannotate this sample")}</Button>
++  {onManual&&<Button size="small" variant="neutral" look="outlined" disabled={disabled||starting||!options?.can_predict} onClick={onManual}>{t("Annotate this sample manually")}</Button>}
++  {options?.can_configure&&<a className={buttonVariant({variant:"neutral",look:"string",size:"small"})} href={`/projects/${projectId}/settings/learning?tab=models`}>{t("Model settings")}</a>}
++ </div><div className="sample-preannotation__status">{error?<span role="alert">{error}</span>:status==="completed"?<span role="status">{t("Prediction ready. Review it before submitting a human annotation.")}</span>:<span>{t("Only this sample is sent to the selected model. Human annotations and drafts are preserved.")}</span>}</div></div>;
++}
 diff --git a/web/libs/app-common/src/components/state-chips/StateHistoryTimeline.tsx b/web/libs/app-common/src/components/state-chips/StateHistoryTimeline.tsx
 index 5f21a3c..2daf581 100644
 --- a/web/libs/app-common/src/components/state-chips/StateHistoryTimeline.tsx
@@ -13601,8 +13711,23 @@ index 0000000..f9ab58d
 +export function translationCsrf() {
 +  return decodeURIComponent(document.cookie.split("; ").find(value => value.startsWith("csrftoken="))?.split("=").slice(1).join("=") || "");
 +}
+diff --git a/web/libs/core/src/lib/topbar/AnnotationButton.prefix.css b/web/libs/core/src/lib/topbar/AnnotationButton.prefix.css
+index e4771b6..507e277 100644
+--- a/web/libs/core/src/lib/topbar/AnnotationButton.prefix.css
++++ b/web/libs/core/src/lib/topbar/AnnotationButton.prefix.css
+@@ -511,3 +511,10 @@
+     }
+   }
+ }
++
++.annotation-button_closable { padding-right: 64px; }
++.annotation-button_closable .annotation-button__mainSection,
++.annotation-button_closable .annotation-button__main { flex: 1 1 auto; min-width: 0; }
++.annotation-button_closable .annotation-button__user { display: flex; align-items: center; }
++.annotation-button_closable .annotation-button__name { flex: 1; min-width: 0; display: block; max-width: 100%; }
++.annotation-button__close { position: absolute; right: 36px; top: 50%; transform: translateY(-50%); width: 22px; height: 24px; padding: 0; z-index: 2; }
 diff --git a/web/libs/core/src/lib/topbar/AnnotationButton.tsx b/web/libs/core/src/lib/topbar/AnnotationButton.tsx
-index 13d83a9..2b03cf1 100644
+index 13d83a9..276bffc 100644
 --- a/web/libs/core/src/lib/topbar/AnnotationButton.tsx
 +++ b/web/libs/core/src/lib/topbar/AnnotationButton.tsx
 @@ -1,3 +1,4 @@
@@ -13610,6 +13735,15 @@ index 13d83a9..2b03cf1 100644
  /**
   * Shared, presentational AnnotationButton.
   *
+@@ -44,7 +45,7 @@ import {
+   TrashIcon,
+   IntersectSquareIcon,
+ } from "@humansignal/icons";
+-import { Badge, DropdownTrigger, Tooltip, ToastContext, ToastType, Userpic, useDropdown } from "@humansignal/ui";
++import { Button, Badge, DropdownTrigger, Tooltip, ToastContext, ToastType, Userpic, useDropdown } from "@humansignal/ui";
+ import { cnb as cn } from "../utils/bem";
+ import { useCopyText } from "../hooks/useCopyText";
+ import { isDefined, userDisplayName } from "../utils/helpers";
 @@ -143,10 +144,10 @@ function formatAnnotationDate(dateStr: string | null | undefined): string {
  
  function getCommentIconAndTooltip(annotation: SharedAnnotation) {
@@ -13777,7 +13911,15 @@ index 13d83a9..2b03cf1 100644
          icon: <TrashIcon size="20" />,
          onClick: () => {
            handlers.onDelete(annotation);
-@@ -746,6 +747,7 @@ function AnnotationButtonImpl(
+@@ -713,6 +714,7 @@ function AnnotationButtonImpl(
+       className={cn("annotation-button")
+         .mod({
+           selected: annotation.selected,
++          closable: Boolean(capabilities.enableClose && handlers.onClose),
+           groundTruth: isGroundTruth,
+           draft: isDraft && !isDraftSaved,
+           draftSaved: isDraftSaved,
+@@ -746,6 +748,7 @@ function AnnotationButtonImpl(
          </div>
          <div className={cn("annotation-button").elem("main").toClassName()}>
            <div className={cn("annotation-button").elem("user").toClassName()}>
@@ -13785,7 +13927,7 @@ index 13d83a9..2b03cf1 100644
              <span className={cn("annotation-button").elem("name").toClassName()}>{displayNameTruncated}</span>
            </div>
            {capabilities.showUserInfo && (
-@@ -754,7 +756,7 @@ function AnnotationButtonImpl(
+@@ -754,7 +757,7 @@ function AnnotationButtonImpl(
                  {formatAnnotationDate(lastUpdatedDate)}
                </span>
                {isPrediction && isDefined(annotation.score) && (
@@ -13794,7 +13936,7 @@ index 13d83a9..2b03cf1 100644
                    {" · "}
                    {(annotation.score * 100).toFixed(2)}%
                  </span>
-@@ -765,21 +767,21 @@ function AnnotationButtonImpl(
+@@ -765,21 +768,21 @@ function AnnotationButtonImpl(
          {!isPrediction && (
            <div className={cn("annotation-button").elem("icons").toClassName()}>
              {(isDraftSaved || isDraft) && (
@@ -13819,6 +13961,14 @@ index 13d83a9..2b03cf1 100644
                  <div className={cn("annotation-button").elem("icon").mod({ groundTruth: true }).toClassName()}>
                    <IconAnnotationGroundTruth />
                  </div>
+@@ -817,6 +820,7 @@ function AnnotationButtonImpl(
+           position={tooltipPosition}
+         />
+       </div>
++      {capabilities.enableClose && handlers.onClose && <Button className={cn("annotation-button").elem("close").toClassName()} size="smaller" variant="neutral" look="string" aria-label={__uiT("Close result tab")} title={__uiT("Close this tab without deleting its result")} data-testid="annotation-tab-close" onMouseEnter={handleTriggerEnter} onClick={(event)=>{event.preventDefault();event.stopPropagation();void handlers.onClose?.(annotation);}}>×</Button>}
+       <DropdownTrigger
+         content={<AnnotationContextMenu annotation={annotation} capabilities={capabilities} handlers={handlers} />}
+         onToggle={(isOpen) => {
 diff --git a/web/libs/core/src/lib/topbar/AnnotationsCarousel.tsx b/web/libs/core/src/lib/topbar/AnnotationsCarousel.tsx
 index 13a37e3..49f254f 100644
 --- a/web/libs/core/src/lib/topbar/AnnotationsCarousel.tsx
@@ -14145,6 +14295,27 @@ index 594df11..b726a91 100644
  
  export interface ViewAllToggleProps {
    isActive: boolean;
+diff --git a/web/libs/core/src/lib/topbar/types.ts b/web/libs/core/src/lib/topbar/types.ts
+index e41dbb5..30169c4 100644
+--- a/web/libs/core/src/lib/topbar/types.ts
++++ b/web/libs/core/src/lib/topbar/types.ts
+@@ -72,6 +72,7 @@ export interface AnnotationCapabilities {
+   enableCreateAnnotation: boolean;
+   enableAnnotationDelete: boolean;
+   enablePredictionDelete?: boolean;
++  enableClose?: boolean;
+   enableAnnotations: boolean;
+   enablePredictions: boolean;
+   enableCopyLink: boolean;
+@@ -114,6 +115,8 @@ export interface AnnotationActionHandlers {
+   onDuplicate: (annotation: SharedAnnotation) => void;
+   /** Wrapper is responsible for confirmation modal (classic) before invoking. */
+   onDelete: (annotation: SharedAnnotation) => void;
++  /** Close a result view without deleting its annotation or prediction. */
++  onClose?: (annotation: SharedAnnotation) => void | Promise<void>;
+   /**
+    * Toggle the "compare all annotations" / view-all state. The action is global
+    * (no per-annotation argument) — both wrappers map this onto a store-level
 diff --git a/web/libs/core/src/lib/utils/dom.ts b/web/libs/core/src/lib/utils/dom.ts
 index 3333952..9ae9dec 100644
 --- a/web/libs/core/src/lib/utils/dom.ts
@@ -16618,7 +16789,7 @@ index 2a2cdc7..0257af7 100644
              )}
  
 diff --git a/web/libs/editor/src/components/AnnotationsCarousel/AnnotationButton.tsx b/web/libs/editor/src/components/AnnotationsCarousel/AnnotationButton.tsx
-index 56a557d..11faba4 100644
+index 56a557d..0c27c46 100644
 --- a/web/libs/editor/src/components/AnnotationsCarousel/AnnotationButton.tsx
 +++ b/web/libs/editor/src/components/AnnotationsCarousel/AnnotationButton.tsx
 @@ -1,3 +1,4 @@
@@ -16626,7 +16797,31 @@ index 56a557d..11faba4 100644
  /**
   * Classic editor (MST) AnnotationButton wrapper.
   *
-@@ -190,7 +191,7 @@ const AnnotationButtonInner = injector(
+@@ -141,12 +142,14 @@ const AnnotationButtonInner = injector(
+       const isLSE = (window as any).APP_SETTINGS?.version?.edition === "Enterprise";
+       const hasProjectId = !!window.location.pathname.match(/\/projects\/(\d+)/);
+
++      const canClose=entityIsAlive && Boolean(annotationStore?.closeTab) && !entity.isDraftSaving && !store.isSubmitting;
+       const sharedCapabilities: AnnotationCapabilities = useMemo(
+         () => ({
+           groundTruthEnabled: Boolean(capabilities.groundTruthEnabled),
+           enableCreateAnnotation: Boolean(capabilities.enableCreateAnnotation),
+           enableAnnotationDelete: Boolean(capabilities.enableAnnotationDelete),
+           enablePredictionDelete: Boolean(capabilities.enablePredictionDelete),
++          enableClose: canClose,
+           enableAnnotations: capabilities.enableAnnotations !== false,
+           enablePredictions: capabilities.enablePredictions !== false,
+           enableCopyLink: Boolean(store?.hasInterface?.("annotations:copy-link")),
+@@ -159,7 +162,7 @@ const AnnotationButtonInner = injector(
+           enablePerformanceDashboard: isLSE && hasProjectId,
+           showUserInfo: !infoIsHidden,
+         }),
+-        [capabilities, store, isLSE, hasProjectId, infoIsHidden],
++        [capabilities, store, isLSE, hasProjectId, infoIsHidden, canClose],
+       );
+
+       const handlers: AnnotationActionHandlers = useMemo(
+@@ -190,7 +193,7 @@ const AnnotationButtonInner = injector(
                  const data = await fetchAnnotationCached(entity.pk);
                  if (!data || (data as { error?: unknown }).error) {
                    toast?.show({
@@ -16635,7 +16830,7 @@ index 56a557d..11faba4 100644
                      type: ToastType.error,
                    });
                    return;
-@@ -204,23 +205,19 @@ const AnnotationButtonInner = injector(
+@@ -204,23 +207,29 @@ const AnnotationButtonInner = injector(
                  annotationStore.selectAnnotation(c.id, { exitViewAll: true });
                });
              } catch {
@@ -16643,6 +16838,16 @@ index 56a557d..11faba4 100644
 +              toast?.show({ message: __uiT("Could not duplicate annotation."), type: ToastType.error });
              }
            },
++          onClose: async () => {
++            if (!entityIsAlive) return;
++            try {
++              if (entity.needsDraftSave()) {
++                await entity.saveDraftImmediatelyWithResults();
++                if (entity.needsDraftSave()) throw Error(__uiT("Draft could not be saved. The tab remains open."));
++              }
++              annotationStore.closeTab(entity.id);
++            } catch { toast?.show({message:__uiT("Draft could not be saved. The tab remains open."),type:ToastType.error}); }
++          },
            onDelete: () => {
              if (!entityIsAlive) return;
              const isPredictionLocal = entity.type === "prediction";
@@ -16663,8 +16868,21 @@ index 56a557d..11faba4 100644
                onOk: () => {
                  emitAnnotationMenuAction(store, entity, "delete");
                  if (isPredictionLocal) {
+diff --git a/web/libs/editor/src/components/AnnotationsCarousel/AnnotationsCarousel.tsx b/web/libs/editor/src/components/AnnotationsCarousel/AnnotationsCarousel.tsx
+index 74d947a..bc142f9 100644
+--- a/web/libs/editor/src/components/AnnotationsCarousel/AnnotationsCarousel.tsx
++++ b/web/libs/editor/src/components/AnnotationsCarousel/AnnotationsCarousel.tsx
+@@ -87,7 +87,7 @@ export const AnnotationsCarousel = observer(
+     }
+
+     const internalEntities = liveEntities.map((entity) => entityToSummary(entity, store));
+-    const sharedEntities = entitiesOverride ?? internalEntities;
++    const sharedEntities = (entitiesOverride ?? internalEntities).filter(entity => !annotationStore.isTabClosed(entity.id));
+     const entityById = new Map<string, any>(liveEntities.map((e) => [String(e.id), e]));
+     const selectedId = annotationStore.selected ? String(annotationStore.selected.id) : null;
+
 diff --git a/web/libs/editor/src/components/App/App.jsx b/web/libs/editor/src/components/App/App.jsx
-index 356b87e..7ebc0f6 100644
+index 356b87e..8f80369 100644
 --- a/web/libs/editor/src/components/App/App.jsx
 +++ b/web/libs/editor/src/components/App/App.jsx
 @@ -1,3 +1,4 @@
@@ -16672,7 +16890,15 @@ index 356b87e..7ebc0f6 100644
  /**
   * Libraries
   */
-@@ -90,7 +91,7 @@ class App extends Component {
+@@ -48,6 +49,7 @@ import { SideTabsPanels } from "../SidePanels/TabPanels/SideTabsPanels";
+ import { TopBar } from "../TopBar/TopBar";
+ import { CompareAllHeader } from "../TopBar/CompareAllHeader";
+ import { ClassicAnnotationsSidebar } from "./ClassicAnnotationsSidebar";
++import { SampleActions } from "./SampleActions";
+ import { ViewAll } from "./ViewAll";
+
+ /**
+@@ -90,7 +92,7 @@ class App extends Component {
            variant="positive"
            icon={<IconCheck />}
            title={messages.DONE}
@@ -16681,16 +16907,25 @@ index 356b87e..7ebc0f6 100644
          />
        </div>
      );
-@@ -104,7 +105,7 @@ class App extends Component {
+@@ -98,13 +100,15 @@ class App extends Component {
+
+   renderNoAnnotation() {
+     const messages = getEnv(this.props.store).messages;
++    const closed = this.props.store.annotationStore.closedTabIds.length > 0;
+     return (
+       <div className={cn("editor").toClassName()}>
++        <SampleActions store={this.props.store} />
+         <EmptyState
            variant="positive"
            icon={<IconCheck />}
-           title={messages.NO_COMP_LEFT}
+-          title={messages.NO_COMP_LEFT}
 -          description="You've viewed all annotations for this task."
-+          description={__uiT("You've viewed all annotations for this task.")}
++          title={closed ? __uiT("All result tabs are closed") : messages.NO_COMP_LEFT}
++          description={closed ? __uiT("Results are preserved. Restore tabs, preannotate this sample, or annotate manually.") : __uiT("You've viewed all annotations for this task.")}
          />
        </div>
      );
-@@ -127,17 +128,15 @@ class App extends Component {
+@@ -127,17 +131,15 @@ class App extends Component {
            variant="positive"
            icon={<IconCheck />}
            title={messages.NO_NEXT_TASK}
@@ -16711,7 +16946,7 @@ index 356b87e..7ebc0f6 100644
              ) : undefined
            }
            data-testid="editor-empty-queue"
-@@ -193,7 +192,7 @@ class App extends Component {
+@@ -193,7 +195,7 @@ class App extends Component {
  
      return (
        <Space className={cn("main-view").elem("infobar").toClassName()} size="small">
@@ -16720,7 +16955,7 @@ index 356b87e..7ebc0f6 100644
  
          {queue && <span>{queue}</span>}
        </Space>
-@@ -305,7 +304,7 @@ class App extends Component {
+@@ -305,7 +307,7 @@ class App extends Component {
                <InstructionsModal
                  visible={store.showingDescription}
                  onCancel={() => store.toggleDescription()}
@@ -16729,6 +16964,27 @@ index 356b87e..7ebc0f6 100644
                >
                  {store.description}
                </InstructionsModal>
+@@ -317,6 +319,7 @@ class App extends Component {
+                 ) : !showVerticalSidebar ? (
+                   <TopBar store={store} />
+                 ) : null)}
++              <SampleActions store={store} />
+               <div
+                 className={cn("wrapper")
+                   .mod({
+diff --git a/web/libs/editor/src/components/App/ClassicAnnotationsSidebar.jsx b/web/libs/editor/src/components/App/ClassicAnnotationsSidebar.jsx
+index 34a9355..c53d8b8 100644
+--- a/web/libs/editor/src/components/App/ClassicAnnotationsSidebar.jsx
++++ b/web/libs/editor/src/components/App/ClassicAnnotationsSidebar.jsx
+@@ -52,7 +52,7 @@ export const ClassicAnnotationsSidebar = observer(({ store }) => {
+     }
+   }
+
+-  const sharedEntities = liveEntities.map((entity) => entityToSummary(entity, store));
++  const sharedEntities = liveEntities.filter(entity => !annotationStore.isTabClosed(entity.id)).map((entity) => entityToSummary(entity, store));
+   const selectedId = annotationStore.selected ? String(annotationStore.selected.id) : null;
+
+   const capabilities = useMemo(
 diff --git a/web/libs/editor/src/components/App/Grid.jsx b/web/libs/editor/src/components/App/Grid.jsx
 index 0c60bc3..65e6022 100644
 --- a/web/libs/editor/src/components/App/Grid.jsx
@@ -16765,6 +17021,39 @@ index 0c60bc3..65e6022 100644
              disabled={isRightDisabled}
            >
              <RightCircleOutlined />
+diff --git a/web/libs/editor/src/components/App/SampleActions.jsx b/web/libs/editor/src/components/App/SampleActions.jsx
+new file mode 100644
+index 0000000..5b950e1
+--- /dev/null
++++ b/web/libs/editor/src/components/App/SampleActions.jsx
+@@ -0,0 +1,27 @@
++import {useRef,useState} from "react";
++import {observer} from "mobx-react";
++import {Button} from "@humansignal/ui";
++import {isAlive} from "mobx-state-tree";
++import {annotationNeedsHydration,applyAnnotationHydrationFromApi} from "@humansignal/core/lib/utils/annotationLazyHydration";
++import {uiT as t} from "@humansignal/app-common/i18n/ui";
++import {SamplePreannotation} from "@humansignal/app-common/components/SamplePreannotation/SamplePreannotation";
++
++export const SampleActions=observer(({store})=>{
++ const taskId=Number(store.task?.id),projectId=Number(window.location.pathname.match(/\/projects\/(\d+)/)?.[1]||store.project?.id);
++ const as=store.annotationStore,selected=as.selected;const [error,setError]=useState("");const before=useRef(null);
++ if(!store.hasInterface("topbar")||!projectId||!taskId)return null;
++ async function preserve(){setError("");const a=as.selected;if(a?.needsDraftSave?.()){await a.saveDraftImmediatelyWithResults();if(a.needsDraftSave())throw Error(t("Draft could not be saved. The tab remains open."));}before.current=a?{id:a.id,result:JSON.stringify(a.serializeAnnotation())}:null;return true;}
++ function manual(){void(async()=>{try{await preserve();const own=as.annotations.find(a=>a.pk&&store.user?.id!=null&&String(a.user?.id??a.completed_by?.id??a.completed_by)===String(store.user.id));if(own){if(annotationNeedsHydration(own)){const response=await fetch(`/api/annotations/${own.pk}/`,{credentials:"same-origin"});if(!response.ok)throw Error(t("Could not load annotation to duplicate. Try selecting it first."));const data=await response.json();if(Number(store.task?.id)!==taskId||!isAlive(own))return;applyAnnotationHydrationFromApi(as.annotations,own.pk,data);}as.selectAnnotation(own.id,{exitViewAll:true});return;}let a=as.annotations.find(a=>!a.pk&&!a.draftId&&!a.needsDraftSave()&&a.serializeAnnotation().length===0);if(!a){a=as.addAnnotation({userGenerate:true,result:[]});a.deserializeResults([],{hidden:true});a.setDefaultValues();}as.selectAnnotation(a.id,{exitViewAll:true});}catch(e){setError(e.message);}})();}
++ function ready(prediction){if(Number(store.task?.id)!==taskId)return;const current=as.selected;let p=as.predictions.find(p=>String(p.pk)===String(prediction.id));if(!p){p=as.addPrediction({...prediction,pk:String(prediction.id),id:undefined,createdDate:prediction.created_at});p.deserializeResults(prediction.result.map(r=>({...r,origin:"prediction"})),{hidden:true});}
++  if(!current||current.type==="prediction"||(before.current?.id===current.id&&before.current.result===JSON.stringify(current.serializeAnnotation())&&!current.needsDraftSave()))as.selectPrediction(p.id,{exitViewAll:true});
++ }
++ function usePrediction(submit){const prediction=as.selected;if(prediction?.type!=="prediction")return;const a=as.addAnnotationFromPrediction(prediction);as.selectAnnotation(a.id,{exitViewAll:true});if(submit)store.submitAnnotation();}
++ const mySubmitted=as.annotations.some(a=>a.pk&&store.user?.id!=null&&String(a.user?.id??a.completed_by?.id??a.completed_by)===String(store.user.id));
++ return <div data-testid="legacy-sample-actions"><SamplePreannotation projectId={projectId} taskId={taskId} taskData={store.task?.dataObj} labelConfig={store.config} disabled={store.isSubmitting||selected?.isDraftSaving} onBeforePredict={preserve} onPrediction={ready} onManual={manual}/>
++  {(selected?.type==="prediction"||as.closedTabIds.length>0||error)&&<div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",padding:"6px 12px"}}>
++   {selected?.type==="prediction"&&<><Button size="small" disabled={store.isSubmitting||mySubmitted||!store.hasInterface("submit")} onClick={()=>usePrediction(true)}>{t("Accept prediction and submit")}</Button><Button size="small" variant="neutral" look="outlined" disabled={store.isSubmitting} onClick={()=>usePrediction(false)}>{t("Edit prediction before submitting")}</Button>{mySubmitted&&<span>{t("You already submitted a human annotation. Edit that result to avoid duplicates.")}</span>}</>}
++   {as.closedTabIds.length>0&&<Button size="small" variant="neutral" look="outlined" onClick={()=>as.restoreClosedTabs()}>{t("Restore closed tabs")} ({as.closedTabIds.length})</Button>}
++   {error&&<span role="alert">{error}</span>}
++  </div>}
++ </div>;
++});
 diff --git a/web/libs/editor/src/components/App/ViewAll.tsx b/web/libs/editor/src/components/App/ViewAll.tsx
 index 644b6d4..9503c82 100644
 --- a/web/libs/editor/src/components/App/ViewAll.tsx
@@ -20823,6 +21112,123 @@ index fe26285..6445892 100644
      ],
    }))
    .views((self) => ({
+diff --git a/web/libs/editor/src/stores/Annotation/Annotation.js b/web/libs/editor/src/stores/Annotation/Annotation.js
+index 920fe1c..95b8c93 100644
+--- a/web/libs/editor/src/stores/Annotation/Annotation.js
++++ b/web/libs/editor/src/stores/Annotation/Annotation.js
+@@ -255,7 +255,7 @@ const _Annotation = types
+     const getCreatedBy = (snapshot) => {
+       if (snapshot.type === "prediction") {
+         const modelVersion = snapshot.model_version?.trim() ?? "";
+-        return modelVersion || "Admin";
++        return snapshot.model_name || modelVersion || "Admin";
+       }
+
+       return snapshot.createdBy ?? "Admin";
+diff --git a/web/libs/editor/src/stores/Annotation/store.js b/web/libs/editor/src/stores/Annotation/store.js
+index 7f32127..3f5b574 100644
+--- a/web/libs/editor/src/stores/Annotation/store.js
++++ b/web/libs/editor/src/stores/Annotation/store.js
+@@ -16,6 +16,7 @@ import { Annotation } from "./Annotation";
+ import { HistoryItem } from "./HistoryItem";
+
+ const SelectedItem = types.union(Annotation, HistoryItem);
++const resultTabKey = entity => entity.pk ? `${entity.type}:${entity.pk}` : entity.draftId ? `draft:${entity.draftId}` : `draft:${entity.id}`;
+
+ const localStorageKeys = {
+   viewingAll: "annotation-store-viewing-all",
+@@ -46,6 +47,8 @@ const AnnotationStoreModel = types
+   })
+   .volatile(() => ({
+     initialized: false,
++    closedTabIds: [],
++    closedTaskId: null,
+   }))
+   .views((self) => ({
+     get store() {
+@@ -199,6 +202,7 @@ const AnnotationStoreModel = types
+
+       const { selected } = self;
+       const c = selectItem(id, self.annotations, !options.retainHistory, options);
++      self.closedTabIds = self.closedTabIds.filter((value) => value !== resultTabKey(c));
+
+       // Set editable based on view-all mode
+       // Use self.viewingAll as the primary source of truth, which checks:
+@@ -227,7 +231,9 @@ const AnnotationStoreModel = types
+         unselectViewingAll();
+       }
+
+-      return selectItem(id, self.predictions, true, options);
++      const selected = selectItem(id, self.predictions, true, options);
++      if (selected) self.closedTabIds = self.closedTabIds.filter((value) => value !== resultTabKey(selected));
++      return selected;
+     }
+
+     function clearDeletedParents(annotation) {
+@@ -636,6 +642,40 @@ const AnnotationStoreModel = types
+       self.history = [];
+     };
+
++    function closeTab(id) {
++      const entities = [...self.predictions, ...self.annotations];
++      const target=entities.find(entity=>entity.id===id);
++      if(!target)return;
++      self.closedTabIds = Array.from(new Set([...self.closedTabIds, resultTabKey(target)]));
++      unselectViewingAll();
++      if (self.selected?.id === id) {
++        const next = entities.find((entity) => !self.closedTabIds.includes(resultTabKey(entity)));
++        if (next) {
++          if (next.type === "prediction") selectPrediction(next.id, { exitViewAll: true });
++          else selectAnnotation(next.id, { exitViewAll: true });
++        } else {
++          self._unselectAll();self.selected = null;self.selectedHistory = null;
++        }
++      }
++    }
++
++    function isTabClosed(id) {
++      const entity=[...self.predictions,...self.annotations].find(entity=>entity.id===id);
++      return entity ? self.closedTabIds.includes(resultTabKey(entity)) : false;
++    }
++    function prepareTaskTabs(taskId) {
++      if(self.closedTaskId!==String(taskId)){self.closedTabIds=[];self.closedTaskId=String(taskId);}
++    }
++
++    function restoreClosedTabs() {
++      self.closedTabIds = [];
++      if (!self.selected) {
++        const first = self.annotations[0] || self.predictions[0];
++        if (first?.type === "prediction") selectPrediction(first.id, { exitViewAll: true });
++        else if (first) selectAnnotation(first.id, { exitViewAll: true });
++      }
++    }
++
+     return {
+       afterCreate,
+       beforeDestroy,
+@@ -668,6 +708,10 @@ const AnnotationStoreModel = types
+       deletePrediction,
+       clearDeletedParents,
+       resetAnnotations,
++      closeTab,
++      restoreClosedTabs,
++      isTabClosed,
++      prepareTaskTabs,
+     };
+   });
+
+diff --git a/web/libs/editor/src/stores/AppStore.js b/web/libs/editor/src/stores/AppStore.js
+index 89c1677..ab755a3 100644
+--- a/web/libs/editor/src/stores/AppStore.js
++++ b/web/libs/editor/src/stores/AppStore.js
+@@ -964,6 +964,7 @@ export default types
+      */
+     function initializeStore({ annotations = [], completions = [], predictions = [], annotationHistory }) {
+       const as = self.annotationStore;
++      as.prepareTaskTabs(self.task?.id);
+
+       // some hacks to properly clear react and mobx structures
+       as.afterReset?.();
 diff --git a/web/libs/editor/src/tags/Custom.jsx b/web/libs/editor/src/tags/Custom.jsx
 index 010f822..723e090 100644
 --- a/web/libs/editor/src/tags/Custom.jsx

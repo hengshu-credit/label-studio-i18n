@@ -1,5 +1,6 @@
 """Real database checks for explicit human confirmation and reserved allocation."""
-import os,sys,unittest,datetime
+import os,sys,unittest,datetime,json
+from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 sys.path.insert(0,'/label-studio/label_studio')
@@ -28,7 +29,40 @@ class LabelingTests(unittest.TestCase):
   self.project.model_version='synthetic-model';self.project.save(update_fields=['model_version'])
   self.addCleanup(self.cleanup)
  def cleanup(self):
+  from ml.workflow_models import LearningRun,AnnotationProvider
+  LearningRun.objects.filter(project=self.project).delete();AnnotationProvider.objects.filter(project=self.project).delete()
   self.project.tasks.all().delete();self.project.delete();self.other.delete()
+ def sample_provider(self):
+  from ml.workflow_models import AnnotationProvider
+  return AnnotationProvider.objects.create(project=self.project,name='Sample model',kind='openai',model='synthetic',endpoint='https://api.openai.com/v1/chat/completions',encrypted_key='synthetic-encrypted-secret')
+ def test_single_sample_prediction_is_deduplicated_and_requires_human_acceptance(self):
+  from ml.workflow import process_workflow_jobs
+  from ml.workflow_models import LearningRun
+  provider=self.sample_provider();task=self.tasks[0]
+  options=self.call({'prediction_options':1,'task':task.pk},method='get');self.assertEqual(options.status_code,200);self.assertNotIn('synthetic-encrypted-secret',json.dumps(options.data))
+  body={'action':'preannotate','task':task.pk,'model':f'provider:{provider.pk}','input_hash':input_hash(task)}
+  created=self.call(body);self.assertEqual(created.status_code,201,created.data);duplicate=self.call(body);self.assertEqual(duplicate.status_code,200);self.assertEqual(created.data['id'],duplicate.data['id'])
+  self.assertEqual(LearningRun.objects.filter(project=self.project).count(),1)
+  with patch('ml.workflow.cloud_predict',return_value={'result':result('no'),'score':None,'model_version':'synthetic-sample','uncertain':False}) as predict:process_workflow_jobs();self.assertEqual(predict.call_count,1)
+  ready=self.call({'prediction_run':created.data['id'],'task':task.pk},method='get');self.assertEqual(ready.data['status'],'completed');self.assertEqual(ready.data['prediction']['result'],result('no'))
+  self.assertFalse(Annotation.objects.filter(project=self.project).exists());self.call({'action':'reserve','task':task.pk})
+  accepted=self.call({'action':'accept','task':task.pk,'prediction':ready.data['prediction']['id'],'input_hash':input_hash(task)});self.assertEqual(accepted.status_code,200,accepted.data)
+  self.assertEqual(Annotation.objects.get(pk=accepted.data['annotation']['id']).parent_prediction_id,ready.data['prediction']['id'])
+ def test_sample_prediction_rejects_wrong_project_stale_input_and_unassigned_annotator(self):
+  provider=self.sample_provider();task=self.tasks[0];body={'action':'preannotate','task':task.pk,'model':f'provider:{provider.pk}'}
+  self.assertEqual(self.call({**body,'expected_data':{'content':'wrong'}}).status_code,409)
+  self.assertEqual(self.call({**body,'label_config':'<View/>'}).status_code,409)
+  self.assertEqual(self.call({**body,'model':'provider:9999999'}).status_code,404)
+  LabelingQueueSettings.objects.create(project=self.project,mode='manual')
+  with patch.object(self.other,'has_perm',side_effect=lambda p:p!='projects.change'):
+   self.assertEqual(self.call(body,user=self.other).status_code,403)
+ def test_stale_sample_prediction_is_not_delivered_after_text_changes(self):
+  from ml.workflow import process_workflow_jobs
+  provider=self.sample_provider();task=self.tasks[0]
+  run=self.call({'action':'preannotate','task':task.pk,'model':f'provider:{provider.pk}'})
+  with patch('ml.workflow.cloud_predict',return_value={'result':result('yes'),'score':None,'model_version':'synthetic-sample','uncertain':False}):process_workflow_jobs()
+  Task.objects.filter(pk=task.pk).update(data={'content':'Edited while model was running'})
+  response=self.call({'prediction_run':run.data['id'],'task':task.pk},method='get');self.assertEqual(response.data['status'],'failed');self.assertIsNone(response.data['prediction'])
  def call(self,body=None,user=None,method='post',project=None):
   r=getattr(APIRequestFactory(),method)('/synthetic',body or {},format='json');force_authenticate(r,user=user or self.user)
   return LabelingWorkspaceAPI.as_view()(r,pk=(project or self.project).pk)
