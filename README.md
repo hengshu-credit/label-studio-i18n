@@ -48,6 +48,10 @@ docker compose up -d --wait --wait-timeout 300
 
 官方套餐说明：[Azure](https://azure.microsoft.com/en-us/pricing/details/translator/)、[Google](https://cloud.google.com/products/translate/pricing)、[百度](https://fanyi-api.baidu.com/product/112)。必须先开通相应官方 API，界面不提供共享密钥。
 
+### 独立标注工作台
+
+项目数据页可进入“标注工作台”：分开显示模型预标注、个人草稿和已提交人工标注，接受预测或修改后提交才产生正式标注。支持按项目采样配置领取、指定成员、任务占用和草稿恢复。详见[操作与分配说明](docs/labeling-workspace.md)。
+
 ### 本地 Transformers 主动学习
 
 新增「项目设置 → 模型与预标注」工作台，支持 OpenAI / DeepSeek / 本地模型的持久批量预标注、独立训练候选与发布、难样本队列和人工复核回流。详见[完整工作流说明](docs/learning-workflow.md)。

@@ -2863,8 +2863,432 @@ index 040a8a0..9ef61c0 100644
      if task_with_current_predictions.exists():
          logger.debug('Use uncertainty sampling')
          # collect all clusters already solved by user, count number of solved task in them
+diff --git a/label_studio/projects/labeling.py b/label_studio/projects/labeling.py
+new file mode 100644
+index 0000000..dbf0d00
+--- /dev/null
++++ b/label_studio/projects/labeling.py
+@@ -0,0 +1,343 @@
++"""Explicit human confirmation and a reserved, project-scoped labeling queue."""
++import copy
++import datetime
++import hashlib
++import json
++import math
++
++from core.permissions import all_permissions
++from django.conf import settings
++from django.db import connection, transaction
++from django.db.models import F, Count
++from django.shortcuts import get_object_or_404
++from django.utils import timezone
++from django.utils.dateparse import parse_datetime
++from label_studio_sdk.label_interface import LabelInterface
++from defusedxml.ElementTree import fromstring
++from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
++from rest_framework.permissions import IsAuthenticated
++from rest_framework.response import Response
++from rest_framework.views import APIView
++from projects.functions.next_task import get_next_task
++from projects.functions.stream_history import add_stream_history, fill_history_annotation
++from projects.labeling_models import LabelingAssignment, LabelingQueueSettings, LabelingWorkspaceDraft
++from projects.models import Project
++from tasks.models import Annotation, Prediction, Task, TaskLock
++from tasks.serializers import AnnotationSerializer
++from users.models import User
++from webhooks.models import WebhookAction
++from webhooks.utils import emit_webhooks_for_instance
++
++
++class QueueConflict(APIException):
++    status_code = 409
++    default_detail = 'This task is no longer reserved for you. Reload or request another task.'
++
++
++def input_hash(task):
++    return hashlib.sha256(json.dumps([task.data, task.project.label_config], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
++
++
++def positive_id(value):
++    if isinstance(value, bool) or not str(value).isdigit() or int(value) <= 0:
++        raise ValidationError('Invalid task or annotation ID.')
++    return int(value)
++
++
++def validate_required_controls(xml, result):
++    present = {r.get('from_name') for r in result}
++    def walk(node, conditional=False):
++        conditional = conditional or bool(node.get('visibleWhen'))
++        if not conditional and node.get('required') == 'true' and node.get('perRegion') != 'true' and node.get('name') not in present:
++            raise ValidationError('Complete all required annotation fields before submitting.')
++        for child in node:
++            walk(child, conditional)
++    walk(fromstring(xml))
++
++
++def queue_mode(project):
++    return LabelingQueueSettings.objects.filter(project=project).values_list('mode', flat=True).first() or 'automatic'
++
++
++def lock_project(project):
++    # SQLite ignores SELECT FOR UPDATE. Acquire its write lock before reading
++    # capacity, so simultaneous claims/submissions cannot both consume a slot.
++    if connection.vendor == 'sqlite':
++        Project.objects.filter(pk=project.pk).update(sampling=F('sampling'))
++    else:
++        Project.objects.select_for_update().get(pk=project.pk)
++
++
++def own_annotation(task, user):
++    return task.annotations.filter(completed_by=user, was_cancelled=False).order_by('-updated_at', '-id').first()
++
++
++def sync_assignment_completion(project, tasks, mode='manual'):
++    ids = [task.pk for task in tasks]
++    quotas = dict(LabelingAssignment.objects.filter(task_id__in=ids).values('task_id').annotate(n=Count('user', distinct=True)).values_list('task_id', 'n'))
++    annotations = Annotation.objects.filter(task_id__in=ids)
++    if project.skip_queue != Project.SkipQueue.IGNORE_SKIPPED:
++        annotations = annotations.filter(was_cancelled=False)
++    if mode == 'manual':
++        annotations = annotations.filter(task__labeling_assignments__user_id=F('completed_by_id'))
++    completed = dict(annotations.values('task_id').annotate(n=Count('completed_by', distinct=True)).values_list('task_id', 'n'))
++    for task in tasks:
++        required = quotas.get(task.pk, 0) if mode == 'manual' else project.maximum_annotations
++        task.overlap = max(1, required)
++        task.is_labeled = required > 0 and completed.get(task.pk, 0) >= required
++    Task.objects.bulk_update(tasks, ['overlap', 'is_labeled'])
++
++
++def allowed(task, user, mode):
++    return mode != 'manual' or LabelingAssignment.objects.filter(task=task, user=user).exists()
++
++
++def reserve(task, user, mode):
++    if not allowed(task, user, mode):
++        raise PermissionDenied('This task is not assigned to you.')
++    own = own_annotation(task, user)
++    if not own and mode == 'automatic' and task.has_lock(user):
++        raise QueueConflict()
++    ttl = task.project.custom_task_lock_ttl or settings.TASK_LOCK_TTL
++    expires = timezone.now() + datetime.timedelta(seconds=ttl)
++    task.locks.filter(user=user).delete()
++    TaskLock.objects.create(task=task, user=user, expire_at=expires)
++    return expires
++
++
++def annotation_public(a, user):
++    return {'id': a.pk, 'result': a.result, 'author': a.completed_by.get_full_name() or a.completed_by.username if a.completed_by else '',
++            'completed_by': a.completed_by_id, 'mine': a.completed_by_id == user.pk, 'updated_at': a.updated_at.isoformat(),
++            'parent_prediction': a.parent_prediction_id, 'origin': 'human_confirmed_prediction' if a.parent_prediction_id else 'human'}
++
++
++def task_public(task, user):
++    project = task.project
++    from ml.workflow_models import LearningRun
++    names = dict(project.ml_backends.values_list('model_version', 'title'))
++    for r in LearningRun.objects.filter(project=project, kind='predict', provider__isnull=False).select_related('provider').order_by('id'):
++        if r.report.get('prediction_version'):
++            names[r.report['prediction_version']] = r.provider.name
++    predictions = [{'id': p.pk, 'result': p.result, 'score': p.score, 'model_version': p.model_version,
++                    'model_name': names.get(p.model_version, ''), 'created_at': p.created_at} for p in task.predictions.order_by('-id')[:30]]
++    backend = project.get_ml_backends().filter(title=project.model_version).first()
++    preferred = backend.model_version if backend else project.model_version
++    draft = LabelingWorkspaceDraft.objects.filter(task=task, user=user).first()
++    lock = task.locks.filter(user=user, expire_at__gt=timezone.now()).first()
++    return {'id': task.pk, 'data': task.resolve_uris(copy.deepcopy(task.data), project), 'input_hash': input_hash(task),
++            'predictions': predictions, 'selected_prediction_version': preferred,
++            'annotations': [annotation_public(a, user) for a in task.annotations.filter(was_cancelled=False).select_related('completed_by').order_by('-updated_at', '-id')],
++            'reserved_until': lock.expire_at if lock else None, 'assigned_to_me': allowed(task, user, queue_mode(project)),
++            'draft': {'result': draft.result, 'prediction': draft.source_prediction_id, 'annotation': draft.annotation_id,
++                      'annotation_updated_at': draft.annotation_updated_at, 'updated_at': draft.updated_at,
++                      'stale': draft.input_hash != input_hash(task)} if draft else None}
++
++
++class LabelingWorkspaceAPI(APIView):
++    permission_classes = [IsAuthenticated]
++
++    def project(self, request, pk, manage=False):
++        project = get_object_or_404(Project, pk=pk)
++        if not project.has_permission(request.user) or not request.user.has_perm(all_permissions.tasks_view):
++            raise PermissionDenied()
++        if manage and not request.user.has_perm(all_permissions.projects_change):
++            raise PermissionDenied()
++        return project
++
++    def get(self, request, pk):
++        project = self.project(request, pk)
++        if request.query_params.get('task'):
++            task = get_object_or_404(Task.objects.select_related('project'), pk=positive_id(request.query_params['task']), project=project)
++            if not allowed(task, request.user, queue_mode(project)) and not request.user.has_perm(all_permissions.projects_change):
++                raise PermissionDenied()
++            return Response({'task': task_public(task, request.user)})
++        can_manage = request.user.has_perm(all_permissions.projects_change)
++        return Response({'mode': queue_mode(project), 'sampling': project.sampling, 'overlap': project.maximum_annotations,
++                         'reservation_minutes': (project.custom_task_lock_ttl or settings.TASK_LOCK_TTL) // 60,
++                         'skip_queue': project.skip_queue, 'can_manage': can_manage,
++                         'task_count': project.tasks.count(), 'completed_tasks': project.tasks.filter(is_labeled=True).count(),
++                         'my_completed': Annotation.objects.filter(project=project, completed_by=request.user, was_cancelled=False).values('task').distinct().count(),
++                         'my_assigned': LabelingAssignment.objects.filter(task__project=project, user=request.user).count(),
++                         'users': [{'id': u.pk, 'name': u.get_full_name() or u.username} for u in User.objects.filter(organizations=project.organization, is_active=True) if project.has_permission(u)] if can_manage else [],
++                         'assignments': list(LabelingAssignment.objects.filter(task__project=project).order_by('-id').values('task_id', 'user_id')[:100]) if can_manage else []})
++
++    def post(self, request, pk):
++        action = request.data.get('action')
++        project = self.project(request, pk, action in ('configure', 'assign', 'unassign'))
++        if action in ('configure', 'assign', 'unassign'):
++            return self.configure(request, project, action)
++        if not request.user.has_perm(all_permissions.annotations_create):
++            raise PermissionDenied()
++        with transaction.atomic():
++            lock_project(project)
++            mode = queue_mode(project)
++            if action == 'next':
++                task = self.next_task(request.user, project, mode)
++                return Response({'task': task_public(task, request.user) if task else None, 'queue': project.sampling})
++            task = get_object_or_404(Task.objects.select_related('project'), pk=positive_id(request.data.get('task')), project=project)
++            if action == 'release':
++                task.release_lock(request.user)
++                return Response({'released': True})
++            if action == 'discard_draft':
++                LabelingWorkspaceDraft.objects.filter(task=task, user=request.user).delete()
++                return Response({'discarded': True})
++            if action == 'reserve':
++                reserve(task, request.user, mode)
++                return Response({'task': task_public(task, request.user)})
++            if action in ('accept', 'submit', 'draft', 'skip', 'heartbeat'):
++                if not allowed(task, request.user, mode):
++                    raise PermissionDenied('This task is not assigned to you.')
++                return self.write_task(request, task, action)
++            raise ValidationError('Unknown labeling action.')
++
++    def next_task(self, user, project, mode):
++        # Resume the same live reservation after a refresh; never reserve a second
++        # task behind a hidden browser tab.
++        solved = Annotation.objects.filter(project=project, completed_by=user, was_cancelled=False).values('task_id')
++        candidates = project.tasks.exclude(pk__in=solved)
++        if mode == 'manual':
++            candidates = candidates.filter(labeling_assignments__user=user)
++        current = candidates.filter(locks__user=user, locks__expire_at__gt=timezone.now()).first()
++        if current:
++            reserve(current, user, mode)
++            return current
++        if mode == 'manual':
++            skipped = Annotation.objects.filter(project=project, completed_by=user, was_cancelled=True).values('task_id')
++            task = candidates.exclude(pk__in=skipped).order_by('id').first()
++            if task is None and project.skip_queue == Project.SkipQueue.REQUEUE_FOR_ME:
++                task = candidates.order_by('id').first()
++        else:
++            task, _ = get_next_task(user, project.tasks.all(), project, False)
++        if task:
++            reserve(task, user, mode)
++            add_stream_history(task, user, project)
++        return task
++
++    def write_task(self, request, task, action):
++        body = request.data
++        user = request.user
++        existing = own_annotation(task, user)
++        prediction = get_object_or_404(Prediction, pk=positive_id(body['prediction']), task=task) if body.get('prediction') else None
++        result = copy.deepcopy(prediction.result) if action == 'accept' and prediction else body.get('result')
++        if action == 'accept' and not prediction:
++            raise ValidationError('Select a prediction to accept.')
++        # Safe retry after a successful response was lost. Never create another
++        # human annotation from a double click, and never overwrite a different one.
++        if action in ('accept', 'submit') and existing and not body.get('annotation'):
++            if existing.result == result and existing.parent_prediction_id == (prediction.pk if prediction else None):
++                return Response({'annotation': annotation_public(existing, user), 'reused': True})
++            raise QueueConflict('You already submitted an annotation. Open your human annotation to edit it.')
++        # A private draft can be saved after a lease expires; it must not be
++        # promoted to a human annotation without a valid reservation.
++        if action != 'draft' and not task.locks.filter(user=user, expire_at__gt=timezone.now()).exists():
++            raise QueueConflict()
++        if action != 'draft' and not existing and queue_mode(task.project) == 'automatic' and task.has_lock(user):
++            raise QueueConflict('The required number of annotations has already been submitted.')
++        if action == 'heartbeat':
++            return Response({'reserved_until': reserve(task, user, queue_mode(task.project))})
++        if body.get('input_hash') != input_hash(task):
++            raise QueueConflict('The task or labeling interface changed. Reload before submitting.')
++        if action == 'skip':
++            if existing or not task.can_be_skipped():
++                raise ValidationError('This task cannot be skipped.')
++            skipped = task.annotations.filter(completed_by=user, was_cancelled=True).first()
++            if not skipped:
++                skipped = Annotation.objects.create(task=task, project=task.project, completed_by=user, updated_by=user, result=[], was_cancelled=True)
++            if queue_mode(task.project) == 'manual':
++                sync_assignment_completion(task.project, [task])
++            task.release_lock(user)
++            return Response({'skipped': True})
++        if not isinstance(result, list) or len(result) > 10000 or any(not isinstance(region, dict) for region in result):
++            raise ValidationError('Annotation result must be an array.')
++        if action != 'draft':
++            validate_required_controls(task.project.label_config, result)
++            try:
++                errors = LabelInterface(task.project.label_config).validate_prediction({'result': result}, return_errors=True)
++            except (ValueError, TypeError, KeyError, AttributeError):
++                raise ValidationError('Invalid annotation result.') from None
++            if errors:
++                raise ValidationError({'result': errors})
++        annotation = None
++        if body.get('annotation'):
++            annotation = get_object_or_404(Annotation, pk=positive_id(body['annotation']), task=task, completed_by=user, was_cancelled=False)
++            if body.get('annotation_updated_at') != annotation.updated_at.isoformat():
++                raise QueueConflict('This annotation was updated elsewhere. Reload before saving.')
++        if action == 'draft':
++            previous = LabelingWorkspaceDraft.objects.filter(task=task, user=user).first()
++            stamp = parse_datetime(str(body.get('draft_updated_at') or ''))
++            if previous and stamp != previous.updated_at:
++                raise QueueConflict('This draft was saved in another window. Reload before editing.')
++            draft, _ = LabelingWorkspaceDraft.objects.update_or_create(task=task, user=user, defaults={
++                'result': result, 'source_prediction': prediction, 'annotation': annotation,
++                'annotation_updated_at': annotation.updated_at.isoformat() if annotation else '', 'input_hash': input_hash(task)})
++            return Response({'saved_at': draft.updated_at})
++        if annotation and not user.has_perm(all_permissions.annotations_change):
++            raise PermissionDenied()
++        lead_time = body.get('lead_time', 0)
++        if not isinstance(lead_time, (float, int)) or not math.isfinite(lead_time) or not 0 <= lead_time <= 86400:
++            raise ValidationError('Invalid labeling duration.')
++        ser = AnnotationSerializer(annotation, data={'result': result, 'lead_time': lead_time}, partial=bool(annotation), context={'request': request, 'task': task, 'project': task.project})
++        ser.is_valid(raise_exception=True)
++        record = ser.save(task=task, project=task.project, completed_by=user, updated_by=user, parent_prediction=prediction)
++        if queue_mode(task.project) == 'manual':
++            sync_assignment_completion(task.project, [task])
++        task.release_lock(user)
++        LabelingWorkspaceDraft.objects.filter(task=task, user=user).delete()
++        fill_history_annotation(user, task, record)
++        action_type = WebhookAction.ANNOTATION_UPDATED if annotation else WebhookAction.ANNOTATION_CREATED
++        transaction.on_commit(lambda: emit_webhooks_for_instance(task.project.organization, task.project, action_type, record))
++        return Response({'annotation': annotation_public(record, user), 'reused': False})
++
++    @transaction.atomic
++    def configure(self, request, project, action):
++        lock_project(project)
++        body = request.data
++        if action == 'configure':
++            mode = body.get('mode', 'automatic')
++            sampling = body.get('sampling', project.sampling)
++            overlap = body.get('overlap', project.maximum_annotations) if mode == 'automatic' else project.maximum_annotations
++            minutes = body.get('reservation_minutes', 60)
++            skip = body.get('skip_queue', project.skip_queue)
++            if mode not in ('automatic', 'manual') or sampling not in (Project.SEQUENCE, Project.UNIFORM, Project.UNCERTAINTY) or skip not in Project.SkipQueue.values:
++                raise ValidationError('Invalid task distribution settings.')
++            if type(overlap) is not int or not 1 <= overlap <= 20 or type(minutes) is not int or not 1 <= minutes <= 1440:
++                raise ValidationError('Overlap must be 1–20 and reservation time 1–1440 minutes.')
++            if TaskLock.objects.filter(task__project=project, expire_at__gt=timezone.now()).exists():
++                raise QueueConflict('Finish or release active labeling reservations before changing distribution settings.')
++            previous_mode = queue_mode(project)
++            LabelingQueueSettings.objects.update_or_create(project=project, defaults={'mode': mode})
++            project.sampling = sampling
++            project.maximum_annotations = overlap
++            project.custom_task_lock_ttl = minutes * 60
++            project.skip_queue = skip
++            project.save(update_fields=['sampling', 'maximum_annotations', 'custom_task_lock_ttl', 'skip_queue'])
++            if previous_mode != mode:
++                batch = []
++                for task in project.tasks.filter(labeling_assignments__isnull=False).distinct().iterator(chunk_size=500):
++                    batch.append(task)
++                    if len(batch) == 500:
++                        sync_assignment_completion(project, batch, mode)
++                        batch = []
++                if batch:
++                    sync_assignment_completion(project, batch, mode)
++            return Response({'saved': True})
++        task_ids, user_ids = body.get('tasks'), body.get('users')
++        if not isinstance(task_ids, list) or not 1 <= len(task_ids) <= 5000 or not isinstance(user_ids, list) or not 1 <= len(user_ids) <= 100 or any(type(i) is not int for i in task_ids + user_ids):
++            raise ValidationError('Select task IDs and project members.')
++        if len(set(task_ids)) * len(set(user_ids)) > 10000:
++            raise ValidationError('Assign at most 10000 task-member pairs at once.')
++        tasks = list(project.tasks.filter(pk__in=set(task_ids)))
++        users = list(User.objects.filter(pk__in=set(user_ids), organizations=project.organization, is_active=True))
++        if len(tasks) != len(set(task_ids)) or len(users) != len(set(user_ids)) or any(not project.has_permission(u) for u in users):
++            raise ValidationError('All tasks and members must belong to this project.')
++        if action == 'unassign':
++            if TaskLock.objects.filter(task_id__in=task_ids, user_id__in=user_ids, expire_at__gt=timezone.now()).exists():
++                raise QueueConflict('Release active reservations before removing assignments.')
++            deleted, _ = LabelingAssignment.objects.filter(task_id__in=task_ids, user_id__in=user_ids).delete()
++            if queue_mode(project) == 'manual':
++                sync_assignment_completion(project, tasks)
++            return Response({'removed': deleted})
++        LabelingAssignment.objects.bulk_create([LabelingAssignment(task=t, user=u, assigned_by=request.user) for t in tasks for u in users], ignore_conflicts=True)
++        if queue_mode(project) == 'manual':
++            sync_assignment_completion(project, tasks)
++        return Response({'assigned': len(tasks) * len(users)})
+diff --git a/label_studio/projects/labeling_models.py b/label_studio/projects/labeling_models.py
+new file mode 100644
+index 0000000..dd3dfec
+--- /dev/null
++++ b/label_studio/projects/labeling_models.py
+@@ -0,0 +1,31 @@
++from django.conf import settings
++from django.db import models
++
++
++class LabelingQueueSettings(models.Model):
++    project = models.OneToOneField('projects.Project', on_delete=models.CASCADE, related_name='labeling_queue_settings')
++    mode = models.CharField(max_length=16, default='automatic', choices=[('automatic', 'Automatic'), ('manual', 'Manual')])
++
++
++class LabelingAssignment(models.Model):
++    task = models.ForeignKey('tasks.Task', on_delete=models.CASCADE, related_name='labeling_assignments')
++    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='labeling_assignments')
++    assigned_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='+')
++    created_at = models.DateTimeField(auto_now_add=True)
++
++    class Meta:
++        constraints = [models.UniqueConstraint(fields=['task', 'user'], name='unique_labeling_assignment')]
++
++
++class LabelingWorkspaceDraft(models.Model):
++    task = models.ForeignKey('tasks.Task', on_delete=models.CASCADE, related_name='workspace_drafts')
++    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='+')
++    result = models.JSONField(default=list)
++    source_prediction = models.ForeignKey('tasks.Prediction', on_delete=models.SET_NULL, null=True, related_name='+')
++    annotation = models.ForeignKey('tasks.Annotation', on_delete=models.SET_NULL, null=True, related_name='+')
++    annotation_updated_at = models.CharField(max_length=64, blank=True)
++    input_hash = models.CharField(max_length=64)
++    updated_at = models.DateTimeField(auto_now=True)
++
++    class Meta:
++        constraints = [models.UniqueConstraint(fields=['task', 'user'], name='unique_labeling_workspace_draft')]
+diff --git a/label_studio/projects/migrations/0039_labeling_workspace.py b/label_studio/projects/migrations/0039_labeling_workspace.py
+new file mode 100644
+index 0000000..6760fba
+--- /dev/null
++++ b/label_studio/projects/migrations/0039_labeling_workspace.py
+@@ -0,0 +1,32 @@
++from django.conf import settings
++from django.db import migrations, models
++import django.db.models.deletion
++
++
++class Migration(migrations.Migration):
++    dependencies = [('projects', '0038_projectimport_list_indexes_async'), ('tasks', '0062_task_data_trgm_idx_async'), migrations.swappable_dependency(settings.AUTH_USER_MODEL)]
++    operations = [
++        migrations.CreateModel(name='LabelingQueueSettings', fields=[
++            ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
++            ('mode', models.CharField(choices=[('automatic', 'Automatic'), ('manual', 'Manual')], default='automatic', max_length=16)),
++            ('project', models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, related_name='labeling_queue_settings', to='projects.project')),
++        ]),
++        migrations.CreateModel(name='LabelingAssignment', fields=[
++            ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
++            ('created_at', models.DateTimeField(auto_now_add=True)),
++            ('assigned_by', models.ForeignKey(null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='+', to=settings.AUTH_USER_MODEL)),
++            ('task', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='labeling_assignments', to='tasks.task')),
++            ('user', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='labeling_assignments', to=settings.AUTH_USER_MODEL)),
++        ], options={'constraints': [models.UniqueConstraint(fields=('task', 'user'), name='unique_labeling_assignment')]}),
++        migrations.CreateModel(name='LabelingWorkspaceDraft', fields=[
++            ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
++            ('result', models.JSONField(default=list)),
++            ('annotation_updated_at', models.CharField(blank=True, max_length=64)),
++            ('input_hash', models.CharField(max_length=64)),
++            ('updated_at', models.DateTimeField(auto_now=True)),
++            ('annotation', models.ForeignKey(null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='+', to='tasks.annotation')),
++            ('source_prediction', models.ForeignKey(null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='+', to='tasks.prediction')),
++            ('task', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='workspace_drafts', to='tasks.task')),
++            ('user', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='+', to=settings.AUTH_USER_MODEL)),
++        ], options={'constraints': [models.UniqueConstraint(fields=('task', 'user'), name='unique_labeling_workspace_draft')]}),
++    ]
 diff --git a/label_studio/projects/models.py b/label_studio/projects/models.py
-index d19ece5..9ed88b4 100644
+index d19ece5..0fcdd05 100644
 --- a/label_studio/projects/models.py
 +++ b/label_studio/projects/models.py
 @@ -391,7 +391,11 @@ class Project(ProjectMixin, FsmHistoryStateModel):
@@ -2889,6 +3313,41 @@ index d19ece5..9ed88b4 100644
  
      def has_ml_backend(self, *args, **kwargs):
          return self.get_ml_backends(**kwargs).exists()
+@@ -1987,3 +1991,6 @@ class ProjectReimport(models.Model):
+ 
+     def has_permission(self, user):
+         return self.project.has_permission(user)
++
++# Project-scoped workbench configuration; no rewrite of existing task/annotation tables.
++from projects.labeling_models import LabelingQueueSettings, LabelingAssignment, LabelingWorkspaceDraft  # noqa: E402,F401
+diff --git a/label_studio/projects/urls.py b/label_studio/projects/urls.py
+index e70d92e..ad8bc82 100644
+--- a/label_studio/projects/urls.py
++++ b/label_studio/projects/urls.py
+@@ -3,12 +3,15 @@
+ from django.urls import include, path
+ 
+ from . import api, views
++from .labeling import LabelingWorkspaceAPI
+ 
+ app_name = 'projects'
+ 
+ # reverse for projects:name
+ _urlpatterns = [
+     path('', views.project_list, name='project-index'),
++    path('<int:pk>/label', views.project_settings, name='labeling-workspace', kwargs={'sub_path':'label'}),
++    path('<int:pk>/label/', views.project_settings, name='labeling-workspace-slash', kwargs={'sub_path':'label'}),
+     path('<int:pk>/settings/', views.project_settings, name='project-settings', kwargs={'sub_path': ''}),
+     path('<int:pk>/settings/<sub_path>', views.project_settings, name='project-settings-anything'),
+ ]
+@@ -19,6 +22,7 @@ _api_urlpatterns = [
+     path('', api.ProjectListAPI.as_view(), name='project-list'),
+     path('<int:pk>/', api.ProjectAPI.as_view(), name='project-detail'),
+     path('counts/', api.ProjectCountsListAPI.as_view(), name='project-counts-list'),
++    path('<int:pk>/labeling-workspace/', LabelingWorkspaceAPI.as_view(), name='labeling-workspace'),
+     # Get next task
+     path('<int:pk>/next/', api.ProjectNextTaskAPI.as_view(), name='project-next'),
+     # Label stream history
 diff --git a/label_studio/tasks/api.py b/label_studio/tasks/api.py
 index d3cd3f2..e1fa054 100644
 --- a/label_studio/tasks/api.py
@@ -5696,7 +6155,7 @@ index d5c43aa..1af3513 100644
        </Modal.Header>
        <ImportPage
 diff --git a/web/apps/labelstudio/src/pages/DataManager/DataManager.jsx b/web/apps/labelstudio/src/pages/DataManager/DataManager.jsx
-index 9c51e5d..76187ca 100644
+index 9c51e5d..33c9bea 100644
 --- a/web/apps/labelstudio/src/pages/DataManager/DataManager.jsx
 +++ b/web/apps/labelstudio/src/pages/DataManager/DataManager.jsx
 @@ -1,3 +1,4 @@
@@ -5704,6 +6163,15 @@ index 9c51e5d..76187ca 100644
  import { Button, buttonVariant, ToastContext, ToastType } from "@humansignal/ui";
  import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
  import { generatePath, useHistory } from "react-router";
+@@ -47,7 +48,7 @@ export const DataManagerPage = ({ ...props }) => {
+     if (!window.LabelStudio) return;
+     if (!window.DataManager) return;
+     if (!root.current) return;
+-    if (!project?.id) return;
++    if (!project?.id || String(project.id)!==window.location.pathname.match(/\/projects\/(\d+)/)?.[1]) return;
+     if (dataManagerRef.current) return;
+ 
+     const generation = initGenerationRef.current;
 @@ -213,11 +214,9 @@ export const DataManagerPage = ({ ...props }) => {
  
    return crashed ? (
@@ -5718,16 +6186,17 @@ index 9c51e5d..76187ca 100644
      </div>
    ) : (
      <>
-@@ -242,7 +241,7 @@ DataManagerPage.context = ({ dmRef }) => {
+@@ -242,7 +241,8 @@ DataManagerPage.context = ({ dmRef }) => {
    const [mode, setMode] = useState(dmRef?.mode ?? "explorer");
  
    const links = {
 -    "/settings": "Settings",
++    "/label": __uiT("Labeling workspace"),
 +    "/settings": __uiT("Settings"),
    };
  
    const updateCrumbs = (currentMode) => {
-@@ -253,7 +252,7 @@ DataManagerPage.context = ({ dmRef }) => {
+@@ -253,7 +253,7 @@ DataManagerPage.context = ({ dmRef }) => {
      } else {
        addCrumb({
          key: "dm-crumb",
@@ -5736,7 +6205,7 @@ index 9c51e5d..76187ca 100644
        });
      }
    };
-@@ -264,7 +263,7 @@ DataManagerPage.context = ({ dmRef }) => {
+@@ -264,7 +264,7 @@ DataManagerPage.context = ({ dmRef }) => {
  
      if (isLabelStream && show_instruction && expert_instruction) {
        modal({
@@ -5745,7 +6214,7 @@ index 9c51e5d..76187ca 100644
          body: <div dangerouslySetInnerHTML={{ __html: expert_instruction }} />,
          style: { width: 680 },
        });
-@@ -295,7 +294,7 @@ DataManagerPage.context = ({ dmRef }) => {
+@@ -295,7 +295,7 @@ DataManagerPage.context = ({ dmRef }) => {
            look="outlined"
            onClick={() => {
              modal({
@@ -5754,7 +6223,7 @@ index 9c51e5d..76187ca 100644
                body: () => (
                  <div
                    dangerouslySetInnerHTML={{
-@@ -305,9 +304,7 @@ DataManagerPage.context = ({ dmRef }) => {
+@@ -305,9 +305,7 @@ DataManagerPage.context = ({ dmRef }) => {
                ),
              });
            }}
@@ -6116,6 +6585,127 @@ index 7cb984a..ed05ef5 100644
            </div>
          </div>
          <div className="bg-neutral-surface rounded-full overflow-hidden w-full h-2 shadow-neutral-border-subtle shadow-border-1">
+diff --git a/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.css b/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.css
+new file mode 100644
+index 0000000..6e52a95
+--- /dev/null
++++ b/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.css
+@@ -0,0 +1,11 @@
++.labeling-workspace{flex:1;min-width:0;padding:24px 32px;color:var(--color-neutral-content);background:var(--color-neutral-background);line-height:1.5;overflow:auto}
++.labeling-workspace h1{font-size:25px;font-weight:650;margin:0}.labeling-workspace h2{font-size:17px;font-weight:600;margin:12px 0}.labeling-workspace p{margin:10px 0}.labeling-workspace__header,.labeling-workspace__actions,.labeling-workspace__task-heading,.labeling-workspace__stats,.labeling-workspace__footer{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.labeling-workspace__header,.labeling-workspace__task-heading{justify-content:space-between}.labeling-workspace__header p,.labeling-workspace small{color:var(--color-neutral-content-subtler)}
++.labeling-workspace button,.labeling-workspace__actions a{border:1px solid var(--color-neutral-border);border-radius:6px;padding:9px 14px;background:var(--color-neutral-background);color:inherit;cursor:pointer;text-decoration:none}.labeling-workspace button:disabled{opacity:.45;cursor:not-allowed}.labeling-workspace button:hover:not(:disabled){border-color:#5676d8}.labeling-workspace__primary{background:#385dc8!important;border-color:#385dc8!important;color:white!important}.labeling-workspace__stats{padding:14px 18px;margin:20px 0;background:#6382d810;border:1px solid var(--color-neutral-border);border-radius:8px;justify-content:space-between}.labeling-workspace__error,.labeling-workspace__notice{padding:12px 16px;margin:12px 0;border-radius:6px;overflow-wrap:anywhere}.labeling-workspace__error{background:#d62c2c14;color:#b52e2e}.labeling-workspace__notice{background:#23966512;color:var(--color-neutral-content)}
++.labeling-workspace__layout{display:grid;grid-template-columns:290px minmax(0,1fr);gap:20px;margin-top:16px}.labeling-workspace__sources{max-height:75vh;overflow:auto;padding-right:8px}.labeling-workspace__sources>button{display:flex;flex-direction:column;gap:6px;width:100%;text-align:left;margin:10px 0;overflow-wrap:anywhere}.labeling-workspace__sources>button.selected{border-color:#385dc8;background:#385dc80c;box-shadow:inset 3px 0 #385dc8}.labeling-workspace__sources p,.labeling-workspace__sources span{font-size:13px}.labeling-workspace__editor-area{border:1px solid var(--color-neutral-border);border-radius:10px;min-width:0;overflow:hidden;display:flex;flex-direction:column;align-self:start}.labeling-workspace__origin{padding:14px 18px;display:flex;gap:10px;flex-wrap:wrap;justify-content:space-between;border-bottom:1px solid var(--color-neutral-border)}.labeling-workspace__editor-area.prediction .labeling-workspace__origin{background:#5479e51a}.labeling-workspace__editor-area.human .labeling-workspace__origin{background:#3c9e651a}.labeling-workspace__editor-area.edit .labeling-workspace__origin{background:#dfab371a}.labeling-workspace__editor{min-height:430px;position:relative;isolation:isolate}.labeling-workspace__editor .lsf-main-content{min-height:400px}.labeling-workspace__editor .lsf-side-column{max-width:300px}.labeling-workspace__footer{padding:16px;border-top:1px solid var(--color-neutral-border);position:sticky;bottom:0;background:var(--color-neutral-background)}.labeling-workspace__footer span{font-size:13px}.labeling-workspace__empty{border:1px dashed var(--color-neutral-border);border-radius:10px;text-align:center;padding:50px;margin:24px auto;max-width:900px}.labeling-workspace__settings{padding:20px;border:1px solid var(--color-neutral-border);border-radius:8px;margin:20px 0}.labeling-workspace__fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px}.labeling-workspace__settings label{display:flex;flex-direction:column;gap:7px;margin:12px 0}.labeling-workspace__settings input,.labeling-workspace__settings select,.labeling-workspace__settings textarea{font:inherit;padding:8px;border:1px solid var(--color-neutral-border);border-radius:5px;background:var(--color-neutral-background);color:inherit}.labeling-workspace__settings .labeling-workspace__check{display:inline-flex;flex-direction:row;margin-right:18px}.labeling-workspace details>summary{cursor:pointer;margin-top:16px}
++@media(max-width:1000px){.labeling-workspace{padding:16px}.labeling-workspace__layout{grid-template-columns:220px minmax(0,1fr)}.labeling-workspace__editor .lsf-side-column{display:none}}@media(max-width:760px){.labeling-workspace__layout{grid-template-columns:1fr}.labeling-workspace__sources{max-height:280px}.labeling-workspace__editor{min-height:350px}.labeling-workspace__fields{grid-template-columns:1fr}}
++
++/* Keep submit/accept visible while the labeling canvas and sources scroll. */
++.labeling-workspace{height:calc(100dvh - 48px);box-sizing:border-box;display:flex;flex-direction:column;min-height:0}
++.labeling-workspace__header,.labeling-workspace__stats,.labeling-workspace__notice,.labeling-workspace__error,.labeling-workspace__task-heading{flex-shrink:0}
++.labeling-workspace__layout{flex:1;min-height:280px}.labeling-workspace__sources{max-height:none;min-height:0;height:100%;box-sizing:border-box}.labeling-workspace__editor-area{height:100%;align-self:stretch;box-sizing:border-box;min-height:0}.labeling-workspace__editor{flex:1;min-height:0;overflow:auto}.labeling-workspace__origin,.labeling-workspace__footer{flex-shrink:0}.labeling-workspace__footer{position:static}.labeling-workspace__editor .lsf-main-content{min-height:250px}.labeling-workspace__editor .lsf-sidepanels_collapsed .lsf-sidepanels__wrapper{max-height:180px;overflow:auto;flex-shrink:0}
++@media(max-width:760px){.labeling-workspace{height:auto;max-height:none}.labeling-workspace__layout{display:flex;flex-direction:column;flex:none}.labeling-workspace__sources{max-height:240px;height:auto}.labeling-workspace__editor-area{height:520px}.labeling-workspace__editor{min-height:0}.labeling-workspace__footer{padding:10px;gap:6px}}
+diff --git a/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.jsx b/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.jsx
+new file mode 100644
+index 0000000..8b0b22e
+--- /dev/null
++++ b/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.jsx
+@@ -0,0 +1,98 @@
++import {useCallback,useEffect,useRef,useState} from "react";
++import {useHistory,useLocation} from "react-router-dom";
++import {useAuth} from "@humansignal/core/providers/AuthProvider";
++import {uiT as t,currentLanguage} from "@humansignal/app-common/i18n/ui";
++import {useProject} from "../../providers/ProjectProvider";
++import {useAPI} from "../../providers/ApiProvider";
++import {API_CONFIG} from "../../config/ApiConfig";
++import "./LabelingWorkspace.css";
++
++const csrf=()=>decodeURIComponent(document.cookie.split("; ").find(v=>v.startsWith("csrftoken="))?.slice(10)||"");
++const flatten=x=>typeof x==="string"?t(x):Array.isArray(x)?x.map(flatten).join(" · "):x&&typeof x==="object"?Object.values(x).map(flatten).join(" · "):"";
++const parseIds=s=>s.trim().split(/[,，\s]+/).filter(Boolean).map(Number);
++const clone=x=>JSON.parse(JSON.stringify(x));
++const describe=result=>(result||[]).map(r=>r.type==="choices"?r.value.choices?.join(", "):r.value?.text?`${r.value.text} → ${(r.value.labels||[]).join(", ")}`:r.type).join(" · ")||t("No labeled regions");
++const samplingName=value=>t({"Sequential sampling":"Sequential sampling","Uniform sampling":"Uniform sampling","Uncertainty sampling":"Uncertainty sampling"}[value]||value||"");
++
++export const LabelingWorkspace=()=>{
++ const {project}=useProject(),{user}=useAuth(),api=useAPI(),history=useHistory(),location=useLocation();
++ const routeId=Number(location.pathname.match(/\/projects\/(\d+)/)?.[1]);
++ const ready=project.id===routeId;
++ const url=`/api/projects/${routeId}/labeling-workspace/`;
++ const [config,setConfig]=useState(null),[task,setTask]=useState(null),[view,setView]=useState(null);
++ const [error,setError]=useState(""),[notice,setNotice]=useState(""),[busy,setBusy]=useState(false),[editorReady,setEditorReady]=useState(false),[dirty,setDirty]=useState(false),[empty,setEmpty]=useState(false);
++ const [showSettings,setShowSettings]=useState(false),[taskIds,setTaskIds]=useState(""),[members,setMembers]=useState([]);
++ const root=useRef(null),editor=useRef(null),editorStore=useRef(null),generation=useRef(0),owner=useRef(routeId),started=useRef(Date.now());owner.current=routeId;
++ const dirtyRef=useRef(false),savedResult=useRef("[]"),draftStamp=useRef(null),savingDraft=useRef(false);
++ const taskRef=useRef(task),viewRef=useRef(view);taskRef.current=task;viewRef.current=view;
++ const request=useCallback(async(body,query="")=>{const r=await fetch(url+query,{method:body?"POST":"GET",credentials:"same-origin",headers:{"Content-Type":"application/json","X-CSRFToken":csrf()},...(body?{body:JSON.stringify(body)}:{})});const v=await r.json();if(!r.ok)throw Error(flatten(v.validation_errors||v.detail||v));return v;},[url]);
++ async function action(body){const p=routeId;setBusy(true);setError("");try{const r=await request(body);return owner.current===p?r:null;}catch(e){if(owner.current===p)setError(e.message);return null;}finally{if(owner.current===p)setBusy(false);}}
++ function setSelection(v){savedResult.current=JSON.stringify(v.result||[]);dirtyRef.current=false;setDirty(false);setView(v);}
++ function showTask(next){setTask(next);setEmpty(!next);setNotice("");started.current=Date.now();draftStamp.current=next?.draft?.updated_at||null;
++  if(!next){setView(null);return;}
++  const mine=next.annotations.find(a=>a.mine),prediction=next.predictions.find(p=>p.model_version===next.selected_prediction_version)||next.predictions[0];
++  if(next.draft&&!next.draft.stale&&next.reserved_until)setSelection({mode:"edit",result:next.draft.result,source:next.draft.prediction,annotation:next.draft.annotation,stamp:next.draft.annotation_updated_at});
++  else if(mine)setSelection({mode:"human",id:mine.id,result:mine.result});
++  else if(prediction)setSelection({mode:"prediction",id:prediction.id,result:prediction.result});
++  else if(next.reserved_until)setSelection({mode:"edit",result:[],source:null,annotation:null,stamp:""});
++  else setSelection({mode:"human",id:next.annotations[0]?.id,result:next.annotations[0]?.result||[]});
++ }
++ const hasUnsaved=()=>viewRef.current?.mode==="edit"&&Boolean(editorStore.current)&&JSON.stringify(editorStore.current.annotationStore.selected?.serializeAnnotation()||[])!==savedResult.current;
++ const unsavedRef=useRef(hasUnsaved);unsavedRef.current=hasUnsaved;
++ const loadSettings=useCallback(async()=>{const p=routeId;const r=await request();if(owner.current===p)setConfig(r);},[request,routeId]);
++ useEffect(()=>{if(!ready)return;let active=true;loadSettings().catch(e=>active&&setError(e.message));const id=new URLSearchParams(location.search).get("task");if(id)request(null,`?task=${encodeURIComponent(id)}`).then(r=>active&&showTask(r.task)).catch(e=>active&&setError(e.message));else showTask(null);return()=>{active=false;};},[ready,routeId,location.search]);
++ useEffect(()=>{setTask(null);setView(null);setConfig(null);setError("");setShowSettings(false);dirtyRef.current=false;},[routeId]);
++ useEffect(()=>{const before=e=>{if(unsavedRef.current()){e.preventDefault();e.returnValue="";}};window.addEventListener("beforeunload",before);const unblock=history.block(()=>!unsavedRef.current()||window.confirm(t("Unsaved changes will be lost. Leave this task?")));return()=>{window.removeEventListener("beforeunload",before);unblock();};},[history]);
++ useEffect(()=>{if(!task?.id)return;const id=task.id;return()=>{fetch(url,{method:"POST",credentials:"same-origin",keepalive:true,headers:{"Content-Type":"application/json","X-CSRFToken":csrf()},body:JSON.stringify({action:"release",task:id})}).catch(()=>{});};},[task?.id,url]);
++
++ useEffect(()=>{if(!ready||!task||!view||!root.current)return;const serial=++generation.current;let instance;setEditorReady(false);editorStore.current=null;
++  import("@humansignal/editor").then(()=>{if(generation.current!==serial||!root.current)return;instance=new window.LabelStudio(root.current,{
++   config:project.label_config,task:{id:task.id,data:task.data,annotations:[],predictions:[]},user:{id:user?.id,firstName:user?.first_name||"",lastName:user?.last_name||"",email:user?.email||""},
++   interfaces:["controls","side-column"],
++   onStorageInitialized(LS){setTimeout(()=>{if(generation.current!==serial)return;try{const store=LS.annotationStore;const a=view.mode==="prediction"?store.addPrediction({pk:String(view.id),result:clone(view.result)}):store.addAnnotation({pk:view.mode==="human"&&view.id?String(view.id):undefined,result:clone(view.result),userGenerate:view.mode==="edit",createdBy:view.mode==="human"?task.annotations.find(a=>a.id===view.id)?.author:undefined,editable:view.mode==="edit"});if(view.mode==="prediction")store.selectPrediction(a.id,{exitViewAll:true});else store.selectAnnotation(a.id,{exitViewAll:true});a.deserializeResults(clone(view.result));a.setEditable(view.mode==="edit");a.setReadonly(view.mode!=="edit");editorStore.current=LS;savedResult.current=JSON.stringify(a.serializeAnnotation());setEditorReady(true);}catch(e){setError(e.message);}},0);},
++   onPresignUrlForProject(url){try{const value=new URL(url);if(["http:","https:"].includes(value.protocol))return url;}catch{}return api.api.createUrl(API_CONFIG.endpoints.presignUrlForProject,{projectId:routeId,fileuri:btoa(url)}).url;}
++  });editor.current=instance;}).catch(e=>setError(e.message));
++  return()=>{generation.current++;editorStore.current=null;instance?.destroy?.();if(editor.current===instance)editor.current=null;};
++ },[task?.id,view,project.label_config,ready]);
++
++ const payload=()=>{const current=taskRef.current,v=viewRef.current;return {task:current.id,input_hash:current.input_hash,result:editorStore.current?.annotationStore.selected?.serializeAnnotation()||[],prediction:v.source||null,annotation:v.annotation||null,annotation_updated_at:v.stamp||"",lead_time:Math.min((Date.now()-started.current)/1000,86400)};};
++ async function saveDraft(){if(!editorStore.current||viewRef.current?.mode!=="edit"||savingDraft.current)return;const p=owner.current,body=payload();savingDraft.current=true;try{const r=await request({action:"draft",...body,draft_updated_at:draftStamp.current});if(owner.current===p&&taskRef.current?.id===body.task){draftStamp.current=r.saved_at;savedResult.current=JSON.stringify(body.result);dirtyRef.current=false;setDirty(false);setNotice(t("Draft saved — not a submitted annotation"));}}catch(e){if(owner.current===p)setError(e.message);}finally{savingDraft.current=false;}}
++ const saveDraftRef=useRef(saveDraft);saveDraftRef.current=saveDraft;
++ useEffect(()=>{if(!editorReady||view?.mode!=="edit")return;const timer=setInterval(()=>{const result=editorStore.current?.annotationStore.selected?.serializeAnnotation();if(!result)return;const changed=JSON.stringify(result)!==savedResult.current;dirtyRef.current=changed;setDirty(changed);if(changed)saveDraftRef.current();},3000);return()=>clearInterval(timer);},[editorReady,view]);
++ useEffect(()=>{if(!task?.reserved_until)return;const timer=setInterval(()=>{if(document.hidden)return;request({action:"heartbeat",task:task.id}).then(r=>setTask(old=>old?.id===task.id?{...old,reserved_until:r.reserved_until}:old)).catch(e=>setError(e.message));},Math.min(30000,(config?.reservation_minutes||60)*20000));return()=>clearInterval(timer);},[task?.id,Boolean(task?.reserved_until),request]);
++
++ async function next(){if(unsavedRef.current()){await saveDraft();if(unsavedRef.current())return;}if(task){const r=await action({action:"release",task:task.id});if(!r)return;}const r=await action({action:"next"});if(r){showTask(r.task);history.replace({pathname:location.pathname,search:r.task?`?task=${r.task.id}`:""});await loadSettings();}}
++ async function edit(result=[],source=null,annotation=null){if(unsavedRef.current()&&!window.confirm(t("Replace the current unsaved draft?")))return;const r=await action({action:"reserve",task:task.id});if(!r)return;setTask(r.task);setSelection({mode:"edit",result:clone(result),source,annotation:annotation?.id||null,stamp:annotation?.updated_at||""});setNotice(t("Editing a draft. Submit it to create a human annotation."));}
++ async function submit(){const a=editorStore.current?.annotationStore.selected;if(!a||a.validate()===false)return;if(savingDraft.current)return;const r=await action({action:"submit",...payload()});if(r){dirtyRef.current=false;setDirty(false);const latest=await request(null,`?task=${task.id}`);showTask(latest.task);setNotice(t("Human annotation submitted. You can request the next task."));await loadSettings();}}
++ async function accept(){const a=editorStore.current?.annotationStore.selected;if(!a||a.validate()===false)return;const reserved=await action({action:"reserve",task:task.id});if(!reserved)return;setTask(reserved.task);const r=await action({action:"accept",task:task.id,prediction:view.id,input_hash:task.input_hash,lead_time:Math.min((Date.now()-started.current)/1000,86400)});if(r){showTask((await request(null,`?task=${task.id}`)).task);setNotice(t("Prediction accepted and saved as a human annotation."));await loadSettings();}}
++ const mine=task?.annotations.find(a=>a.mine),selectedHuman=task?.annotations.find(a=>a.id===view?.id),selectedPrediction=task?.predictions.find(p=>p.id===view?.id);
++ if(!ready)return <div role="status">{t("Loading project...")}</div>;
++ return <main className="labeling-workspace" data-testid="labeling-workspace">
++  <header className="labeling-workspace__header"><div><h1>{t("Labeling workspace")}</h1><p>{t("Model suggestions become human annotations only after you accept or submit them.")}</p></div><div className="labeling-workspace__actions"><a href={`/projects/${routeId}/data`}>{t("Data management")}</a><a href={`/projects/${routeId}/settings/learning`}>{t("Models and preannotation")}</a>{config?.can_manage&&<button onClick={()=>setShowSettings(!showSettings)}>{t("Task distribution settings")}</button>}</div></header>
++  {config&&<div className="labeling-workspace__stats"><span>{t("Task assignment mode")}: {config.mode==="manual"?t("Manual assignment"):t("Automatic assignment")} · {samplingName(config.mode==="manual"?"Sequential sampling":config.sampling)}</span><span>{t("Completed tasks")}: {config.completed_tasks} / {config.task_count}</span><span>{t("My submitted tasks")}: {config.my_completed}</span><span>{t("Reservation")}: {config.reservation_minutes} {t("minutes")}</span></div>}
++  {error&&<div role="alert" className="labeling-workspace__error">{error}</div>}{notice&&<div role="status" className="labeling-workspace__notice">{notice}</div>}
++  {showSettings&&config&&<section className="labeling-workspace__settings"><h2>{t("Task distribution settings")}</h2><form onSubmit={async e=>{e.preventDefault();if(await action({action:"configure",...config}))loadSettings();}}><div className="labeling-workspace__fields">
++   <label>{t("Task assignment mode")}<select aria-label={t("Task assignment mode")} value={config.mode} onChange={e=>setConfig({...config,mode:e.target.value})}><option value="automatic">{t("Automatic assignment")}</option><option value="manual">{t("Manual assignment")}</option></select></label>
++   <label>{t("Task Sampling")}<select aria-label={t("Task Sampling")} disabled={config.mode==="manual"} value={config.sampling} onChange={e=>setConfig({...config,sampling:e.target.value})}>{["Sequential sampling","Uniform sampling","Uncertainty sampling"].map(x=><option key={x} value={x}>{samplingName(x)}</option>)}</select></label>
++   <label>{t("Annotations per task")}<input aria-label={t("Annotations per task")} type="number" min="1" max="20" disabled={config.mode==="manual"} value={config.overlap} onChange={e=>setConfig({...config,overlap:Number(e.target.value)})}/></label>
++   <label>{t("Reservation time (minutes)")}<input aria-label={t("Reservation time (minutes)")} type="number" min="1" max="1440" value={config.reservation_minutes} onChange={e=>setConfig({...config,reservation_minutes:Number(e.target.value)})}/></label>
++   <label>{t("Skipped tasks")}<select aria-label={t("Skipped tasks")} value={config.skip_queue} onChange={e=>setConfig({...config,skip_queue:e.target.value})}><option value="REQUEUE_FOR_OTHERS">{t("Requeue for other annotators")}</option><option value="REQUEUE_FOR_ME">{t("Return at the end of my queue")}</option><option value="IGNORE_SKIPPED">{t("Count skipped tasks as complete")}</option></select></label>
++  </div><p>{t("Release active tasks before changing settings. Sampling matches the project general settings. Manual mode serves only assigned tasks.")}</p><button type="submit" disabled={busy}>{t("Save distribution settings")}</button></form>
++   <details><summary>{t("Assign tasks to members")}</summary><label>{t("Task IDs (comma separated)")}<textarea aria-label={t("Task IDs (comma separated)")} value={taskIds} onChange={e=>setTaskIds(e.target.value)}/></label><fieldset><legend>{t("Members")}</legend>{config.users.map(u=><label key={u.id} className="labeling-workspace__check"><input type="checkbox" checked={members.includes(u.id)} onChange={e=>setMembers(e.target.checked?[...members,u.id]:members.filter(x=>x!==u.id))}/>{u.name}</label>)}</fieldset><div className="labeling-workspace__actions"><button disabled={busy||!taskIds.trim()||!members.length} onClick={async()=>{if(await action({action:"assign",tasks:parseIds(taskIds),users:members})){setNotice(t("Tasks assigned"));loadSettings();}}}>{t("Assign selected tasks")}</button><button disabled={busy||!taskIds.trim()||!members.length} onClick={async()=>{if(await action({action:"unassign",tasks:parseIds(taskIds),users:members})){setNotice(t("Assignments removed"));loadSettings();}}}>{t("Remove assignments")}</button></div><p>{t("Latest assignments")}: {config.assignments.map(a=>`#${a.task_id} → ${config.users.find(u=>u.id===a.user_id)?.name||a.user_id}`).join(" · ")||"—"}</p></details>
++  </section>}
++  {!task?<section className="labeling-workspace__empty"><h2>{empty?t("Ready for your next task"):t("Start labeling")}</h2><p>{t("Tasks are allocated using the project distribution settings. Predictions do not count as completed human annotations.")}</p><button className="labeling-workspace__primary" disabled={busy} onClick={next}>{t("Get next task")}</button>{empty&&<p>{t("If no task is returned, your queue is complete, unassigned, or temporarily reserved by others.")}</p>}</section>:<>
++   <div className="labeling-workspace__task-heading"><strong>{t("Task")} #{task.id}</strong><span>{task.reserved_until?`${t("Reserved until")}: ${new Date(task.reserved_until).toLocaleTimeString(currentLanguage(),{hour12:false})}`:t("Read-only preview — reserve before editing")}</span><div className="labeling-workspace__actions"><button disabled={busy} onClick={next}>{t("Get next task")}</button>{task.reserved_until&&<button disabled={busy} onClick={async()=>{if(unsavedRef.current()){await saveDraft();if(unsavedRef.current())return;}if(await action({action:"release",task:task.id})){showTask((await request(null,`?task=${task.id}`)).task);}}}>{t("Save draft and release task")}</button>}</div></div>
++   <div className="labeling-workspace__layout"><aside className="labeling-workspace__sources"><h2>{t("Model suggestions")}</h2><p>{t("Predictions are source records. Accepted or corrected results appear under human annotations.")}</p>{!task.predictions.length&&<p>{t("No predictions for this task")}</p>}{task.predictions.map(p=><button key={p.id} data-testid={`suggestion-${p.id}`} className={view?.mode==="prediction"&&view.id===p.id?"selected":""} onClick={()=>{if(!unsavedRef.current()||window.confirm(t("Replace the current unsaved draft?")))setSelection({mode:"prediction",id:p.id,result:p.result});}}><strong>{p.model_name||t("Imported predictions")}</strong><small>{p.score==null?t("No probability score"):`${t("Confidence")}: ${(p.score*100).toFixed(1)}%`}</small><span>{describe(p.result)}</span>{task.annotations.some(a=>a.parent_prediction===p.id)&&<small>{t("Used in a submitted human annotation")}</small>}</button>)}
++   <h2>{t("Submitted human annotations")}</h2>{!task.annotations.length&&<p>{t("No human annotation submitted yet")}</p>}{task.annotations.map(a=><button key={a.id} data-testid={`human-annotation-${a.id}`} className={view?.mode==="human"&&view.id===a.id?"selected":""} onClick={()=>{if(!unsavedRef.current()||window.confirm(t("Replace the current unsaved draft?")))setSelection({mode:"human",id:a.id,result:a.result});}}><strong>{a.mine?t("My annotation"):a.author}</strong><small>{a.parent_prediction?t("Human-confirmed model suggestion"):t("Human annotation")} · #{a.id}</small><span>{describe(a.result)}</span><small>{new Date(a.updated_at).toLocaleString(currentLanguage(),{hour12:false})}</small></button>)}
++   {task.draft&&<button disabled={busy||task.draft.stale} onClick={()=>edit(task.draft.result,task.draft.prediction,task.annotations.find(a=>a.id===task.draft.annotation))}>{task.draft.stale?t("Draft belongs to an older task version"):t("Resume my saved draft")}</button>}
++   <button disabled={busy||!task.assigned_to_me} onClick={()=>edit(mine?.result||[],mine?.parent_prediction||null,mine)}>{mine?t("Edit my human annotation"):t("Annotate manually")}</button></aside>
++   <section className={`labeling-workspace__editor-area ${view?.mode}`}><div className="labeling-workspace__origin" data-testid="annotation-origin"><strong>{view?.mode==="prediction"?t("Model suggestion — awaiting human acceptance"):view?.mode==="edit"?t("Working draft — not submitted"):t("Submitted human annotation")}</strong><span>{view?.mode==="prediction"?(selectedPrediction?.model_name||t("Imported predictions")):view?.mode==="human"?selectedHuman?.author:dirty?t("Unsaved changes"):t("Submit to confirm this annotation")}</span></div>
++    <div className="labeling-workspace__editor" ref={root} data-testid="labeling-editor"/>{!editorReady&&<p role="status">{t("Loading labeling interface...")}</p>}
++    <footer className="labeling-workspace__footer">{view?.mode==="prediction"&&<><button className="labeling-workspace__primary" disabled={busy||!editorReady||Boolean(mine)||!task.assigned_to_me} onClick={accept}>{t("Accept prediction as human annotation")}</button><button disabled={busy||!editorReady||!task.assigned_to_me} onClick={()=>edit(view.result,view.id,mine)}>{t("Edit prediction before submitting")}</button>{mine&&<span>{t("You already have a human annotation. Edit it to make a correction.")}</span>}</>}{view?.mode==="edit"&&<><button className="labeling-workspace__primary" disabled={busy||!editorReady} onClick={submit}>{t("Submit human annotation")}</button><button disabled={busy||!editorReady} onClick={saveDraft}>{t("Save draft")}</button></>}{view?.mode==="human"&&selectedHuman?.mine&&<button disabled={busy} onClick={()=>edit(selectedHuman.result,selectedHuman.parent_prediction,selectedHuman)}>{t("Edit my human annotation")}</button>}{!mine&&<button disabled={busy||!task.assigned_to_me} onClick={async()=>{if(unsavedRef.current()){await saveDraft();if(unsavedRef.current())return;}const r=await action({action:"reserve",task:task.id});if(r&&await action({action:"skip",task:task.id,input_hash:task.input_hash}))next();}}>{t("Skip this task")}</button>}</footer>
++   </section></div>
++  </>}
++ </main>;
++};
++LabelingWorkspace.path="/label";
++LabelingWorkspace.title=t("Labeling workspace");
++LabelingWorkspace.exact=true;
 diff --git a/web/apps/labelstudio/src/pages/Organization/Models/@components/EmptyList.tsx b/web/apps/labelstudio/src/pages/Organization/Models/@components/EmptyList.tsx
 index 5c61ab8..48037b8 100644
 --- a/web/apps/labelstudio/src/pages/Organization/Models/@components/EmptyList.tsx
@@ -6396,7 +6986,7 @@ index f398c54..dfa6b4d 100644
    exact: true,
    layout: MenuLayout,
 diff --git a/web/apps/labelstudio/src/pages/Projects/Projects.jsx b/web/apps/labelstudio/src/pages/Projects/Projects.jsx
-index 593bb40..c85ba53 100644
+index 593bb40..00b9aaf 100644
 --- a/web/apps/labelstudio/src/pages/Projects/Projects.jsx
 +++ b/web/apps/labelstudio/src/pages/Projects/Projects.jsx
 @@ -1,3 +1,4 @@
@@ -6404,7 +6994,15 @@ index 593bb40..c85ba53 100644
  import React, { useState } from "react";
  import { useParams as useRouterParams } from "react-router";
  import { Redirect } from "react-router-dom";
-@@ -29,7 +30,7 @@ export const ProjectsPage = () => {
+@@ -9,6 +10,7 @@ import { useContextProps } from "../../providers/RoutesProvider";
+ import { cn } from "../../utils/bem";
+ import { CreateProject } from "../CreateProject/CreateProject";
+ import { DataManagerPage } from "../DataManager/DataManager";
++import { LabelingWorkspace } from "../LabelingWorkspace/LabelingWorkspace";
+ import { SettingsPage } from "../Settings";
+ import { EmptyProjectsList, ProjectsList } from "./ProjectsList";
+ import { useAbortController, useUpdatePageTitle } from "@humansignal/core";
+@@ -29,7 +31,7 @@ export const ProjectsPage = () => {
    const [totalItems, setTotalItems] = useState(1);
    const setContextProps = useContextProps();
  
@@ -6413,7 +7011,7 @@ index 593bb40..c85ba53 100644
    const defaultPageSize = Number.parseInt(localStorage.getItem("pages:projects-list") ?? 30);
  
    const [modal, setModal] = React.useState(false);
-@@ -141,7 +142,7 @@ export const ProjectsPage = () => {
+@@ -141,7 +143,7 @@ export const ProjectsPage = () => {
    );
  };
  
@@ -6422,7 +7020,15 @@ index 593bb40..c85ba53 100644
  ProjectsPage.path = "/projects";
  ProjectsPage.exact = true;
  ProjectsPage.routes = ({ store }) => [
-@@ -163,8 +164,6 @@ ProjectsPage.routes = ({ store }) => [
+@@ -156,6 +158,7 @@ ProjectsPage.routes = ({ store }) => [
+     },
+     pages: {
+       DataManagerPage,
++      LabelingWorkspace,
+       SettingsPage,
+     },
+   },
+@@ -163,8 +166,6 @@ ProjectsPage.routes = ({ store }) => [
  ProjectsPage.context = ({ openModal, showButton }) => {
    if (!showButton) return null;
    return (
@@ -7075,7 +7681,7 @@ index 0000000..621ab10
 +@media(max-width:900px){.learning-flow{grid-template-columns:repeat(2,1fr)}.model-reuse-row,.prediction-version-row{align-items:flex-start;flex-direction:column}.learning-workspace{padding:8px}}
 diff --git a/web/apps/labelstudio/src/pages/Settings/LearningWorkspace.jsx b/web/apps/labelstudio/src/pages/Settings/LearningWorkspace.jsx
 new file mode 100644
-index 0000000..f114007
+index 0000000..8a30107
 --- /dev/null
 +++ b/web/apps/labelstudio/src/pages/Settings/LearningWorkspace.jsx
 @@ -0,0 +1,105 @@
@@ -7134,7 +7740,7 @@ index 0000000..f114007
 + useEffect(()=>{if(previewId&&projectReady)previewRun(previewId);},[data.runs,previewId,projectReady]);
 + function chooseModel(p,navigate){setJob(old=>({...old,kind:"predict",provider:String(p.id),scope:data.task_count>0&&data.completed_tasks===data.task_count?"all":"missing"}));if(navigate)setTab("jobs");}
 + function chooseTraining(id){setJob(old=>({...old,kind:"train",backend:String(id),scope:"all"}));setTab("training");}
-+ async function beginAnnotation(runId){const r=await action({action:"use_predictions",run:runId});if(r?.first_task)window.location.assign(`/projects/${project.id}/data?task=${r.first_task}`);}
++ async function beginAnnotation(runId){const r=await action({action:"use_predictions",run:runId});if(r?.first_task)window.location.assign(`/projects/${project.id}/label?task=${r.first_task}`);}
 + const selectedProvider=data.providers.find(p=>String(p.id)===String(job.provider));
 + const selectedName=data.versions?.find(v=>v.model_version===data.selected_prediction_version)?.name||data.backends.find(b=>b.title===data.selected_prediction_version||b.model_version===data.selected_prediction_version)?.title;
 + const date=value=>value?new Date(value).toLocaleString(undefined,{hour12:false}):"";
@@ -7158,7 +7764,7 @@ index 0000000..f114007
 +    <button className="learning-primary" disabled={busy||(tab==="jobs"&&(!selectedProvider?.ready||selectedProvider?.connection?.requires_training))} type="submit">{tab==="training"?t("Start training"):t("Generate batch predictions")}</button>
 +   </form></section>}
 +   {preview&&tab==="jobs"&&<section className="learning-box learning-preview" ref={previewRef} data-testid="prediction-preview"><header><h2>{t("Prediction preview")} · {preview.run.model_name}</h2><button onClick={()=>{setPreview(null);setPreviewId(null);}}>{t("Close")}</button></header><p>{title(preview.run.status)} · {t("Showing up to five examples")}</p>{preview.items.map(item=><article key={item.task}><h3>#{item.task}</h3>{Object.entries(item.text).map(([field,text])=><p className="learning-text" key={field}>{text}</p>)}{item.result?<div className="learning-compare"><section><h4>{t("Model suggestion")}</h4><pre>{summary(item.result)}</pre></section><section><h4>{t("Human annotation")}</h4><pre>{summary(item.human_result)}</pre></section></div>:<p className={item.error?"learning-error":""}>{item.error?t(item.error):t("Waiting for the model; results appear automatically.")}</p>}</article>)}{preview.run.status==="completed"&&<button className="learning-primary" disabled={busy} onClick={()=>beginAnnotation(preview.run.id)}>{t("Use results and start labeling")}</button>}<details><summary>{t("Annotation JSON (advanced)")}</summary><pre>{JSON.stringify(preview.items.map(i=>i.result),null,2)}</pre></details></section>}
-+   {tab==="jobs"&&data.versions?.length>0&&<section className="learning-box"><h2>{t("Available prediction results")}</h2>{data.versions.map(v=><div className="prediction-version-row" key={v.model_version}><div><strong>{v.name||t("Imported predictions")}</strong><p>{t("Task coverage")}: {v.task_count} · {date(v.latest)}</p><details><summary>{t("Technical version details")}</summary><code>{v.model_version}</code><p>{t("Prediction records")}: {v.record_count}</p></details></div><button className={data.selected_prediction_version===v.model_version?"":"learning-primary"} disabled={busy||data.selected_prediction_version===v.model_version} onClick={async()=>{const r=await action({action:"use_version",version:v.model_version});if(r?.first_task)window.location.assign(`/projects/${project.id}/data?task=${r.first_task}`);}}>{data.selected_prediction_version===v.model_version?t("Currently used"):t("Use and open labeling")}</button></div>)}</section>}
++   {tab==="jobs"&&data.versions?.length>0&&<section className="learning-box"><h2>{t("Available prediction results")}</h2>{data.versions.map(v=><div className="prediction-version-row" key={v.model_version}><div><strong>{v.name||t("Imported predictions")}</strong><p>{t("Task coverage")}: {v.task_count} · {date(v.latest)}</p><details><summary>{t("Technical version details")}</summary><code>{v.model_version}</code><p>{t("Prediction records")}: {v.record_count}</p></details></div><button className={data.selected_prediction_version===v.model_version?"":"learning-primary"} disabled={busy||data.selected_prediction_version===v.model_version} onClick={async()=>{const r=await action({action:"use_version",version:v.model_version});if(r?.first_task)window.location.assign(`/projects/${project.id}/label?task=${r.first_task}`);}}>{data.selected_prediction_version===v.model_version?t("Currently used"):t("Use and open labeling")}</button></div>)}</section>}
 +   <section><h2>{t("Recent jobs")}</h2>{!data.runs.some(r=>tab==="training"?r.kind==="train":r.kind==="predict")&&<p>{t("No jobs yet")}</p>}{data.runs.filter(r=>tab==="training"?r.kind==="train":r.kind==="predict").map(r=><article className="learning-box" key={r.id} data-testid={`learning-run-${r.id}`}>
 +    <header><div><h3>{r.model_name||title(r.kind)}</h3><small>#{r.id} · {r.total===1&&r.kind==="predict"?t("One-example trial"):title(r.kind)} · {date(r.created_at)}</small></div><span className={`learning-state ${r.status}`}>{title(r.status)}</span></header>
 +    <progress value={(r.counts.succeeded||0)+(r.counts.failed||0)} max={r.total||1}/><p>{t("Succeeded")}: {r.counts.succeeded||0} / {r.total} · {t("Failed")}: {r.counts.failed||0} · {t("Excluded")}: {r.report.excluded||0}</p>
@@ -7177,7 +7783,7 @@ index 0000000..f114007
 +   {data.cases.map(c=><article className="learning-box" key={c.id} data-testid={`review-case-${c.task_id}`}><header><h3>#{c.task_id}</h3><span>{title(c.status)}</span></header><div className="learning-reasons">{c.reasons.map(r=><span key={r}>{title(r)}</span>)}</div>
 +    <p className="learning-text">{c.data.content||c.data.text||Object.values(c.data).find(v=>typeof v==="string")}</p><div className="learning-compare"><section><h4>{t("Latest predictions")}</h4>{c.predictions.map(p=><div key={p.id}><small>{data.runs.find(r=>r.report.prediction_version===p.model_version||r.report.model_version===p.model_version)?.model_name||data.backends.find(b=>b.model_version===p.model_version)?.title||t("Imported predictions")} · {p.score===null?t("No probability score"):p.score?.toFixed(3)}</small><pre>{summary(p.result)}</pre></div>)}</section><section><h4>{t("Human annotation")}</h4><pre>{summary(c.annotation?.result)}</pre></section></div>
 +    <label>{t("Review note")}<textarea aria-label={t("Review note")}  value={notes[c.task_id]??c.note} onChange={e=>setNotes({...notes,[c.task_id]:e.target.value})}/></label>
-+    <div className="learning-actions"><a href={`/projects/${project.id}/data?task=${c.task_id}`} target="_blank" rel="noreferrer" onClick={()=>action({action:"review",task:c.task_id,status:"in_review",note:notes[c.task_id]??c.note})}>{t("Open annotation editor")}</a><button disabled={busy||!c.annotation} onClick={()=>action({action:"review",task:c.task_id,status:"resolved",note:notes[c.task_id]??c.note})}>{t("Accept review")}</button><button disabled={busy} onClick={()=>action({action:"review",task:c.task_id,status:"excluded",note:notes[c.task_id]??c.note})}>{t("Exclude from training")}</button><button disabled={busy} onClick={()=>action({action:"review",task:c.task_id,status:"open",note:notes[c.task_id]??c.note})}>{t("Reopen")}</button></div>
++    <div className="learning-actions"><a href={`/projects/${project.id}/label?task=${c.task_id}`} target="_blank" rel="noreferrer" onClick={()=>action({action:"review",task:c.task_id,status:"in_review",note:notes[c.task_id]??c.note})}>{t("Open annotation editor")}</a><button disabled={busy||!c.annotation} onClick={()=>action({action:"review",task:c.task_id,status:"resolved",note:notes[c.task_id]??c.note})}>{t("Accept review")}</button><button disabled={busy} onClick={()=>action({action:"review",task:c.task_id,status:"excluded",note:notes[c.task_id]??c.note})}>{t("Exclude from training")}</button><button disabled={busy} onClick={()=>action({action:"review",task:c.task_id,status:"open",note:notes[c.task_id]??c.note})}>{t("Reopen")}</button></div>
 +   </article>)}<footer><button disabled={page===1} onClick={()=>setPage(page-1)}>{t("Previous")}</button><span>{page} / {Math.max(1,Math.ceil(data.case_total/20))}</span><button disabled={page*20>=data.case_total} onClick={()=>setPage(page+1)}>{t("Next")}</button></footer>
 +  </>}
 +  <details className="learning-advanced-links"><summary>{t("Advanced tools")}</summary><a href={`/projects/${project.id}/settings/ml-advanced`}>{t("Advanced ML connections")}</a> · <a href={`/projects/${project.id}/settings/predictions-advanced`}>{t("Prediction import and raw versions")}</a></details>
@@ -8738,16 +9344,17 @@ index 3a15dbc..ba46de3 100644
        ),
      },
 diff --git a/web/apps/labelstudio/src/pages/Settings/index.jsx b/web/apps/labelstudio/src/pages/Settings/index.jsx
-index 8eee120..92dd2b8 100644
+index 8eee120..49c927b 100644
 --- a/web/apps/labelstudio/src/pages/Settings/index.jsx
 +++ b/web/apps/labelstudio/src/pages/Settings/index.jsx
-@@ -1,3 +1,5 @@
+@@ -1,3 +1,6 @@
 +import { uiT as __uiT } from "@humansignal/app-common/i18n/ui";
++import { useProject } from "../../providers/ProjectProvider";
 +import { Redirect } from "react-router-dom";
  import { SidebarMenu } from "../../components/SidebarMenu/SidebarMenu";
  import { WebhookPage } from "../WebhookPage/WebhookPage";
  import { DangerZone } from "./DangerZone";
-@@ -5,10 +7,20 @@ import { GeneralSettings } from "./GeneralSettings";
+@@ -5,19 +8,31 @@ import { GeneralSettings } from "./GeneralSettings";
  import { AnnotationSettings } from "./AnnotationSettings";
  import { LabelingSettings } from "./LabelingSettings";
  import { MachineLearningSettings } from "./MachineLearningSettings/MachineLearningSettings";
@@ -8766,9 +9373,12 @@ index 8eee120..92dd2b8 100644
 +LegacyPredictions.path="/predictions";LegacyPredictions.exact=true;
 +
  export const MenuLayout = ({ children, ...routeProps }) => {
++  const {project}=useProject();
++  const routeId=Number(window.location.pathname.match(/\/projects\/(\d+)/)?.[1]);
++  if(!project?.id||project.id!==routeId)return <div role="status">{__uiT("Loading project...")}</div>;
    return (
      <SidebarMenu
-@@ -16,8 +28,7 @@ export const MenuLayout = ({ children, ...routeProps }) => {
+       menuItems={[
          GeneralSettings,
          LabelingSettings,
          AnnotationSettings,
@@ -8778,7 +9388,7 @@ index 8eee120..92dd2b8 100644
          StorageSettings,
          WebhookPage,
          DangerZone,
-@@ -29,6 +40,9 @@ export const MenuLayout = ({ children, ...routeProps }) => {
+@@ -29,6 +44,9 @@ export const MenuLayout = ({ children, ...routeProps }) => {
  };
  
  const pages = {
@@ -8788,7 +9398,7 @@ index 8eee120..92dd2b8 100644
    AnnotationSettings,
    LabelingSettings,
    MachineLearningSettings,
-@@ -39,7 +53,7 @@ const pages = {
+@@ -39,7 +57,7 @@ const pages = {
  };
  
  export const SettingsPage = {
@@ -9132,6 +9742,116 @@ index 39dd165..afc03aa 100644
        />
      ) : (
        <ErrorWrapper {...formattedError} title={title} message={message} />
+diff --git a/web/apps/labelstudio/src/providers/ProjectProvider.tsx b/web/apps/labelstudio/src/providers/ProjectProvider.tsx
+index 88554df..a0b0642 100644
+--- a/web/apps/labelstudio/src/providers/ProjectProvider.tsx
++++ b/web/apps/labelstudio/src/providers/ProjectProvider.tsx
+@@ -1,5 +1,5 @@
+ import type React from "react";
+-import { createContext, useCallback, useContext, useEffect, useState } from "react";
++import { createContext, useCallback, useContext, useEffect, useState, useRef } from "react";
+ import { shallowEqualObjects } from "shallow-equal";
+ import { addVisitedProject } from "@humansignal/core";
+ import { useAuth } from "@humansignal/core/providers/AuthProvider";
+@@ -32,6 +32,9 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
+   const api = useAPI();
+   const params = useParams();
+   const { user } = useAuth();
++  const routeId = Number(params.id);
++  const routeRef = useRef(routeId);routeRef.current = routeId;
++  const requestGeneration = useRef(0);
+   const { update: updateStore } = useAppStore();
+   // @todo use null for missed project data
+   const [projectData, _setProjectData] = useState<APIProject | Empty>(projectCache.get(+params.id) ?? {});
+@@ -46,7 +49,8 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
+     async (id, force = false) => {
+       const finalProjectId = +(id ?? params.id);
+ 
+-      if (isNaN(finalProjectId)) return;
++      if (!Number.isSafeInteger(finalProjectId) || finalProjectId <= 0) return;
++      const generation = ++requestGeneration.current;
+ 
+       if (!force && projectCache.has(finalProjectId) && projectCache.get(finalProjectId) !== undefined) {
+         setProjectData({ ...projectCache.get(finalProjectId)! });
+@@ -58,6 +62,7 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
+       });
+ 
+       const projectInfo = result as unknown as APIProject;
++      if (!projectInfo?.id || generation !== requestGeneration.current || (Number.isFinite(routeRef.current) && routeRef.current !== finalProjectId)) return;
+ 
+       if (shallowEqualObjects(projectData, projectInfo) === false) {
+         setProjectData(projectInfo);
+@@ -71,11 +76,13 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
+ 
+       return projectInfo;
+     },
+-    [params],
++    [routeId, user?.id],
+   );
+ 
+   const updateProject: Context["updateProject"] = useCallback(
+     async (fields: APIProject, options?: UpdateProjectOptions) => {
++      const projectId = projectData.id;
++      if (!projectId || (Number.isFinite(routeRef.current) && routeRef.current !== projectId)) throw new Error("Project is still loading. Please try again.");
+       const result = await api.callApi<APIProject>("updateProject", {
+         params: {
+           pk: projectData.id,
+@@ -84,7 +91,7 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
+         errorFilter: options?.returnErrors ? undefined : () => true,
+       });
+ 
+-      if (result?.$meta?.ok) {
++      if (result?.$meta?.ok && (!Number.isFinite(routeRef.current) || routeRef.current === projectId)) {
+         setProjectData(result as unknown as APIProject);
+         updateStore({ project: result });
+         projectCache.set(result.id, result);
+@@ -96,11 +103,12 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
+   );
+ 
+   useEffect(() => {
++    requestGeneration.current++;
+     if (+params.id !== projectData?.id) {
+       setProjectData({});
+     }
+     fetchProject();
+-  }, [params]);
++  }, [routeId, user?.id]);
+ 
+   useEffect(() => {
+     return () => projectCache.clear();
+@@ -115,6 +123,7 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
+         invalidateCache() {
+           projectCache.clear();
+           setProjectData({});
++          fetchProject(undefined, true);
+         },
+       }}
+     >
+diff --git a/web/apps/labelstudio/src/providers/RoutesProvider.jsx b/web/apps/labelstudio/src/providers/RoutesProvider.jsx
+index 4721141..13548ae 100644
+--- a/web/apps/labelstudio/src/providers/RoutesProvider.jsx
++++ b/web/apps/labelstudio/src/providers/RoutesProvider.jsx
+@@ -123,14 +123,15 @@ export const useCurrentPath = () => {
+ 
+ export const useParams = () => {
+   const location = useFixedLocation();
+-  const currentPath = useCurrentPath();
+-
++  const context = useContext(RoutesContext);
+   const match = useMemo(() => {
+     const search = parseLocationSearch(location.search);
+-    const urlParams = matchPath(location.pathname, currentPath ?? "");
+-
++    // Route state is updated in an effect and can belong to the previous page.
++    // Derive path parameters synchronously from the URL being rendered.
++    const route = findMacthingComponents(location.pathname, context?.routesMap ?? []).at(-1);
++    const urlParams = route ? matchPath(location.pathname, route.path) : null;
+     return { ...search, ...(urlParams?.params ?? {}) };
+-  }, [location, currentPath]);
++  }, [location, context?.routesMap]);
+ 
+   return match ?? {};
+ };
 diff --git a/web/apps/labelstudio/src/utils/state-registry-lso.ts b/web/apps/labelstudio/src/utils/state-registry-lso.ts
 index aed0c8f..5b09c11 100644
 --- a/web/apps/labelstudio/src/utils/state-registry-lso.ts
@@ -12485,7 +13205,7 @@ index 1ee210c..0c203b3 100644
          component: PersonalAccessToken,
          description: PersonalAccessTokenDescription,
 diff --git a/web/libs/core/src/lib/topbar/AnnotationButton.tsx b/web/libs/core/src/lib/topbar/AnnotationButton.tsx
-index 13d83a9..de6eb9a 100644
+index 13d83a9..2b03cf1 100644
 --- a/web/libs/core/src/lib/topbar/AnnotationButton.tsx
 +++ b/web/libs/core/src/lib/topbar/AnnotationButton.tsx
 @@ -1,3 +1,4 @@
@@ -12660,7 +13380,15 @@ index 13d83a9..de6eb9a 100644
          icon: <TrashIcon size="20" />,
          onClick: () => {
            handlers.onDelete(annotation);
-@@ -754,7 +755,7 @@ function AnnotationButtonImpl(
+@@ -746,6 +747,7 @@ function AnnotationButtonImpl(
+         </div>
+         <div className={cn("annotation-button").elem("main").toClassName()}>
+           <div className={cn("annotation-button").elem("user").toClassName()}>
++            <span data-testid="annotation-origin-badge" style={{fontSize:11,padding:"1px 5px",borderRadius:4,background:isPrediction?"#617ada22":isDraft||isDraftSaved?"#dbab3322":"#26936b22",marginRight:6,whiteSpace:"nowrap"}}>{isPrediction?__uiT("Preannotation"):isDraft||isDraftSaved?__uiT("Draft"):__uiT("Human annotation")}</span>
+             <span className={cn("annotation-button").elem("name").toClassName()}>{displayNameTruncated}</span>
+           </div>
+           {capabilities.showUserInfo && (
+@@ -754,7 +756,7 @@ function AnnotationButtonImpl(
                  {formatAnnotationDate(lastUpdatedDate)}
                </span>
                {isPrediction && isDefined(annotation.score) && (
@@ -12669,7 +13397,7 @@ index 13d83a9..de6eb9a 100644
                    {" · "}
                    {(annotation.score * 100).toFixed(2)}%
                  </span>
-@@ -765,21 +766,21 @@ function AnnotationButtonImpl(
+@@ -765,21 +767,21 @@ function AnnotationButtonImpl(
          {!isPrediction && (
            <div className={cn("annotation-button").elem("icons").toClassName()}>
              {(isDraftSaved || isDraft) && (
@@ -13948,7 +14676,7 @@ index 0936fb2..48457be 100644
          data-testid="dm-grid-width-button"
        />
 diff --git a/web/libs/datamanager/src/components/DataManager/Toolbar/LabelButton.jsx b/web/libs/datamanager/src/components/DataManager/Toolbar/LabelButton.jsx
-index 61e6260..7003d5b 100644
+index 61e6260..de13a71 100644
 --- a/web/libs/datamanager/src/components/DataManager/Toolbar/LabelButton.jsx
 +++ b/web/libs/datamanager/src/components/DataManager/Toolbar/LabelButton.jsx
 @@ -1,3 +1,4 @@
@@ -13956,7 +14684,17 @@ index 61e6260..7003d5b 100644
  import { inject } from "mobx-react";
  import { Button, ButtonGroup } from "@humansignal/ui";
  import { Interface } from "../../Common/Interface";
-@@ -93,19 +94,17 @@ export const LabelButton = injector(({ store, canLabel, size, target, selectedCo
+@@ -82,6 +83,9 @@ export const LabelButton = injector(({ store, canLabel, size, target, selectedCo
+ 
+   selectedCount;
+ 
++  const projectRoute=window.location.pathname.match(/^\/projects\/(\d+)\/data/);
++  if(projectRoute)return <Interface name="labelButton"><Button variant="primary" size={size??"small"} onClick={()=>window.location.assign(`/projects/${projectRoute[1]}/label`)}>{__uiT("Labeling workspace")}</Button></Interface>;
++
+   return canLabel ? (
+     <Interface name="labelButton">
+       <div>
+@@ -93,19 +97,17 @@ export const LabelButton = injector(({ store, canLabel, size, target, selectedCo
              disabled={disabled}
              style={primaryStyle}
              onClick={onLabelAll}

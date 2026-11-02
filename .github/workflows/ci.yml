@@ -76,6 +76,9 @@ jobs:
       - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/test_workflow.py
       - run: docker compose -f ci/compose.yaml cp ci/test_model_management.py label-studio:/tmp/test_model_management.py
       - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/test_model_management.py
+      - run: docker compose -f ci/compose.yaml cp ci/test_labeling_workspace.py label-studio:/tmp/test_labeling_workspace.py
+      - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/test_labeling_workspace.py
+      - run: docker compose -f ci/compose.yaml exec -T label-studio python /label-studio/label_studio/manage.py makemigrations projects --check --dry-run
       - run: npx playwright install --with-deps chromium
       - run: npx playwright test
       - if: always()
