@@ -4495,10 +4495,10 @@ index 7f55bfb..4e246f8 100644
 
 diff --git a/label_studio/tasks/translation.py b/label_studio/tasks/translation.py
 new file mode 100644
-index 0000000..ddb1b78
+index 0000000..37e3c31
 --- /dev/null
 +++ b/label_studio/tasks/translation.py
-@@ -0,0 +1,608 @@
+@@ -0,0 +1,617 @@
 +"""Authenticated, on-demand text translation with explicit engine selection and local limits."""
 +
 +import hashlib
@@ -4897,7 +4897,11 @@ index 0000000..ddb1b78
 +                raise TranslationFailure("Translation provider quota has been reached. Check your API account.", 429)
 +            if code in ("411", "412"):
 +                raise TranslationFailure("Translation provider rate limit reached. Try again later.", 429)
-+            if code in ("108", "110", "111", "202", "203", "205"):
++            if code == "202":
++                raise TranslationFailure("Youdao signature verification failed (202). Re-enter the application ID and secret from the same Youdao application, then save and test the connection.", 503)
++            if code == "110":
++                raise TranslationFailure("Youdao Text Translation is not enabled for this application (110). Enable and bind the service in the Youdao console.", 503)
++            if code in ("108", "111", "203", "205"):
 +                raise TranslationFailure("Translation credentials or API permissions are invalid.", 503)
 +            if code in ("206", "207"):
 +                raise TranslationFailure("Youdao rejected the request timestamp or nonce. Check the server clock and try again.", 503)
@@ -4947,7 +4951,7 @@ index 0000000..ddb1b78
 +        session.close()
 +
 +
-+def translate_text(text, engine, source, target, organization_id):
++def translate_text(text, engine, source, target, organization_id, *, use_cache=True):
 +    if engine not in ENGINES:
 +        raise TranslationFailure("Unsupported translation engine.")
 +    allowed = BAIDU_CODES if engine == "baidu" else LANGUAGES
@@ -4993,7 +4997,7 @@ index 0000000..ddb1b78
 +    try:
 +        con.execute("BEGIN IMMEDIATE")
 +        hit = con.execute("SELECT result FROM results WHERE key=?", (key,)).fetchone()
-+        if hit:
++        if hit and use_cache:
 +            con.rollback()
 +            return {**json.loads(hit[0]), "cached": True}
 +        pending = con.execute(
@@ -5065,6 +5069,11 @@ index 0000000..ddb1b78
 +                    "Only the organization owner can configure translation API keys.",
 +                    403,
 +                )
++            if request.data.get("test") is True:
++                # Test saved credentials with the provider, never a previous cache hit.
++                # The fixed sample uses the normal monthly limit and reservation logic.
++                translate_text("Hello", request.data.get("engine"), "en", "zh", org.id, use_cache=False)
++                return Response({"detail": "Translation connection succeeded.", "engine": request.data.get("engine")})
 +            save_config(org.id, request.data.get("engine"), request.data)
 +            return Response(self._response(request, org))
 +        except TranslationFailure as exc:
@@ -10892,8 +10901,30 @@ index 3a15dbc..ba46de3 100644
          </Message>
        ),
      },
+diff --git a/web/apps/labelstudio/src/pages/Settings/TranslationSettings.jsx b/web/apps/labelstudio/src/pages/Settings/TranslationSettings.jsx
+new file mode 100644
+index 0000000..d3c94c6
+--- /dev/null
++++ b/web/apps/labelstudio/src/pages/Settings/TranslationSettings.jsx
+@@ -0,0 +1,16 @@
++import { TranslationSettings } from "@humansignal/app-common/pages/AccountSettings/sections/Translation/TranslationSettings";
++import { uiT as t } from "@humansignal/app-common/i18n/ui";
++import { cn } from "../../utils/bem";
++
++export const ProjectTranslationSettings = () => (
++  <div className={cn("general-settings").toClassName()}>
++    <div className={cn("general-settings").elem("wrapper").toClassName()}>
++      <h1>{t("Translation settings")}</h1>
++      <div className={cn("settings-wrapper").toClassName()}><TranslationSettings /></div>
++    </div>
++  </div>
++);
++
++ProjectTranslationSettings.title = t("Translation settings");
++ProjectTranslationSettings.path = "/translation";
++ProjectTranslationSettings.exact = true;
 diff --git a/web/apps/labelstudio/src/pages/Settings/index.jsx b/web/apps/labelstudio/src/pages/Settings/index.jsx
-index 8eee120..49c927b 100644
+index 8eee120..eaabf00 100644
 --- a/web/apps/labelstudio/src/pages/Settings/index.jsx
 +++ b/web/apps/labelstudio/src/pages/Settings/index.jsx
 @@ -1,3 +1,6 @@
@@ -10903,15 +10934,16 @@ index 8eee120..49c927b 100644
  import { SidebarMenu } from "../../components/SidebarMenu/SidebarMenu";
  import { WebhookPage } from "../WebhookPage/WebhookPage";
  import { DangerZone } from "./DangerZone";
-@@ -5,19 +8,31 @@ import { GeneralSettings } from "./GeneralSettings";
+@@ -5,19 +8,33 @@ import { GeneralSettings } from "./GeneralSettings";
  import { AnnotationSettings } from "./AnnotationSettings";
  import { LabelingSettings } from "./LabelingSettings";
  import { MachineLearningSettings } from "./MachineLearningSettings/MachineLearningSettings";
 +import { LearningWorkspace } from "./LearningWorkspace";
++import { ProjectTranslationSettings } from "./TranslationSettings";
  import { PredictionsSettings } from "./PredictionsSettings/PredictionsSettings";
  import { StorageSettings } from "./StorageSettings/StorageSettings";
  import "./settings.prefix.css";
- 
+
 +MachineLearningSettings.path="/ml-advanced";
 +MachineLearningSettings.title=__uiT("Advanced ML connections");
 +PredictionsSettings.path="/predictions-advanced";
@@ -10934,22 +10966,24 @@ index 8eee120..49c927b 100644
 -        MachineLearningSettings,
 -        PredictionsSettings,
 +        LearningWorkspace,
++        ProjectTranslationSettings,
          StorageSettings,
          WebhookPage,
          DangerZone,
-@@ -29,6 +44,9 @@ export const MenuLayout = ({ children, ...routeProps }) => {
+@@ -29,6 +46,10 @@ export const MenuLayout = ({ children, ...routeProps }) => {
  };
- 
+
  const pages = {
++  ProjectTranslationSettings,
 +  LegacyModels,
 +  LegacyPredictions,
 +  LearningWorkspace,
    AnnotationSettings,
    LabelingSettings,
    MachineLearningSettings,
-@@ -39,7 +57,7 @@ const pages = {
+@@ -39,7 +60,7 @@ const pages = {
  };
- 
+
  export const SettingsPage = {
 -  title: "Settings",
 +  title: __uiT("Settings"),
@@ -14801,10 +14835,10 @@ index 0000000..1371d00
 +.settings .error { color: var(--color-negative-content); }
 diff --git a/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.tsx b/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.tsx
 new file mode 100644
-index 0000000..85e16c0
+index 0000000..ef9052d
 --- /dev/null
 +++ b/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.tsx
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,135 @@
 +import { useEffect, useState } from "react";
 +import { uiT as t } from "../../../../i18n/ui";
 +import {
@@ -14825,7 +14859,10 @@ index 0000000..85e16c0
 +  const [saving, setSaving] = useState(false);
 +  const [saved, setSaved] = useState(false);
 +  const [error, setError] = useState("");
++  const [testing, setTesting] = useState(false);
++  const [tested, setTested] = useState(false);
 +  const provider = providers.find(item => item.id === engine);
++  const unsaved = Object.values(credentials).some(Boolean) || monthlyLimit !== provider?.monthly_limit || (engine === "deepl" && apiServer !== (provider?.api_server || "auto"));
 +
 +  useEffect(() => {
 +    const controller = new AbortController();
@@ -14849,12 +14886,14 @@ index 0000000..85e16c0
 +  function changeEngine(value: string) {
 +    setEngine(value);
 +    setSaved(false);
++    setTested(false);
 +    setError("");
 +    writeTranslationPreferences({ engine: value });
 +    notifyTranslationSettings();
 +  }
 +
 +  async function saveCredentials(clear = false) {
++    setTested(false);
 +    setSaving(true); setSaved(false); setError("");
 +    try {
 +      const response = await fetch("/api/tasks/translation-options/", {
@@ -14873,17 +14912,32 @@ index 0000000..85e16c0
 +    finally { setSaving(false); }
 +  }
 +
++  async function testConnection() {
++    setTesting(true); setTested(false); setSaved(false); setError("");
++    try {
++      const response = await fetch("/api/tasks/translation-options/", {
++        method: "POST", credentials: "same-origin",
++        headers: { "Content-Type": "application/json", "X-CSRFToken": translationCsrf() },
++        body: JSON.stringify({ engine, test: true }),
++      });
++      const data = await response.json();
++      if (!response.ok) throw Error(data.detail || "Translation request failed.");
++      setTested(true);
++    } catch (error: any) { setError(error.message); }
++    finally { setTesting(false); }
++  }
++
 +  return <div className={styles.settings} data-testid="translation-settings">
 +    <p>{t("Choose the translation engine for this browser. API settings are shared by your organization.")}</p>
 +    <label>{t("Translation engine")}
-+      <select aria-label={t("Translation engine")} value={engine} disabled={saving || !providers.length} onChange={event => changeEngine(event.target.value)}>
++      <select aria-label={t("Translation engine")} value={engine} disabled={saving || testing || !providers.length} onChange={event => changeEngine(event.target.value)}>
 +        {!providers.length && <option value="">{t("Loading...")}</option>}
 +        {providers.map(item => <option key={item.id} value={item.id}>{t(item.label)}{item.configured ? "" : ` (${t("Not configured")})`}</option>)}
 +      </select>
 +    </label>
 +    {provider && !canConfigure && <p role="status">{t("Ask the organization owner to configure this translation engine.")}</p>}
-+    {provider && canConfigure && <form onSubmit={event => { event.preventDefault(); void saveCredentials(); }}>
-+      <fieldset disabled={saving}>
++    {provider && canConfigure && <form onChange={() => { setTested(false); setSaved(false); setError(""); }} onSubmit={event => { event.preventDefault(); void saveCredentials(); }}>
++      <fieldset disabled={saving || testing}>
 +        <legend>{t("API settings")}</legend>
 +        <p>{t("Keys are encrypted on the server and are never returned to the browser. Leave a field blank to keep its saved value.")}</p>
 +        {engine === "aliyun" ? <>
@@ -14908,11 +14962,15 @@ index 0000000..85e16c0
 +        <p>{t("Calls stop at this local limit. Provider billing and usage outside this application are separate.")}</p>
 +        <div className={styles.actions}>
 +          <button type="submit">{t(saving ? "Saving..." : "Save API settings")}</button>
++          <button type="button" disabled={!provider.configured || unsaved} onClick={testConnection}>{t(testing ? "Testing connection..." : "Test saved configuration")}</button>
 +          {provider.configured && <button type="button" onClick={() => saveCredentials(true)}>{t("Remove saved key")}</button>}
 +        </div>
++        <p>{t("Save changes before testing. The test translates only the fixed text Hello using your saved configuration and local character limit.")}</p>
 +      </fieldset>
 +    </form>}
 +    {saved && <p role="status">{t("API settings saved. Existing keys are not displayed.")}</p>}
++    {saved && <p>{t("Saved does not mean verified. Use Test saved configuration to check the provider connection.")}</p>}
++    {tested && <p role="status">{t("Translation connection succeeded.")}</p>}
 +    {error && <p role="alert" className={styles.error}>{t(error)}</p>}
 +  </div>;
 +};
@@ -20322,7 +20380,7 @@ index 0000000..538a7f3
 +.translation-panel__error { margin:0; color:var(--color-negative-content,#b91c1c); line-height:1.5; }
 diff --git a/web/libs/editor/src/components/SidePanels/TranslationPanel/TranslationPanel.tsx b/web/libs/editor/src/components/SidePanels/TranslationPanel/TranslationPanel.tsx
 new file mode 100644
-index 0000000..a845232
+index 0000000..95dee16
 --- /dev/null
 +++ b/web/libs/editor/src/components/SidePanels/TranslationPanel/TranslationPanel.tsx
 @@ -0,0 +1,113 @@
@@ -20434,7 +20492,7 @@ index 0000000..a845232
 +    <button type="button" className={cn("translation-panel").elem("button").toClassName()} disabled={loading || busy || !taskId || !original.trim() || !provider?.configured} onClick={translate}>
 +      {t(busy ? "Translating..." : "Translate current text")}
 +    </button>
-+    {!loading && provider && !provider.configured && <a className={cn("translation-panel").elem("hint").toClassName()} href="/user/account/translation" target="_blank" rel="noopener noreferrer">{t("Configure translation in settings")}</a>}
++    {!loading && provider && (!provider.configured || error) && <a className={cn("translation-panel").elem("hint").toClassName()} href="/user/account/translation" target="_blank" rel="noopener noreferrer">{t("Configure translation in settings")}</a>}
 +    {error && <p role="alert" className={cn("translation-panel").elem("error").toClassName()}>{t(error)}</p>}
 +    <label>{t("Translated text")}<textarea aria-label={t("Translation result")} readOnly rows={4} value={result} aria-busy={busy} placeholder={t(busy ? "Translating..." : "Translation will appear here")} /></label>
 +  </section>;

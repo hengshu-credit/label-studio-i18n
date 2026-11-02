@@ -536,5 +536,66 @@ class SelectedModelTests(unittest.TestCase):
             evaluate.assert_not_called()
 
 
+class TranslationConnectionTests(unittest.TestCase):
+    """Provider tests use an isolated encrypted store and never write the business database."""
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.settings = override_settings(BASE_DATA_DIR=self.directory.name, SECRET_KEY="connection-tests-only")
+        self.settings.enable()
+        self.addCleanup(self.directory.cleanup)
+        self.addCleanup(self.settings.disable)
+        self.org = SimpleNamespace(id=999999, created_by_id=1)
+        self.user = SimpleNamespace(id=1, is_authenticated=True, is_superuser=False, active_organization=self.org)
+        self.factory = APIRequestFactory()
+        tr.save_config(self.org.id, "youdao", {"app_id": "test-app", "secret": "test-secret", "monthly_limit": 100})
+
+    def request(self, user=None, **body):
+        request = self.factory.post("/test/", {"engine": "youdao", "test": True, **body}, format="json")
+        force_authenticate(request, user=user or self.user)
+        return tr.TranslationOptionsAPI.as_view()(request)
+
+    def test_connection_bypasses_cache_and_never_saves_submitted_credentials(self):
+        before = tr.read_config(self.org.id)
+        with patch.object(tr, "call_provider", return_value={"translation": "你好", "detected_source": "en"}) as call:
+            self.assertEqual(self.request().status_code, 200)
+            self.assertEqual(self.request(secret="must-not-save", clear=True).status_code, 200)
+            self.assertEqual(call.call_count, 2)
+            self.assertEqual(call.call_args.args[2:], ("Hello", "en", "zh"))
+        self.assertEqual(tr.read_config(self.org.id), before)
+
+    def test_connection_respects_local_limit_even_with_cached_result(self):
+        tr.save_config(self.org.id, "youdao", {"monthly_limit": 5})
+        with patch.object(tr, "call_provider", return_value={"translation": "你好", "detected_source": "en"}) as call:
+            self.assertEqual(self.request().status_code, 200)
+            self.assertEqual(self.request().status_code, 429)
+            self.assertEqual(call.call_count, 1)
+
+    def test_connection_is_owner_only(self):
+        member = SimpleNamespace(id=2, is_authenticated=True, is_superuser=False, active_organization=self.org)
+        with patch.object(tr, "call_provider") as call:
+            self.assertEqual(self.request(user=member).status_code, 403)
+            call.assert_not_called()
+
+    def test_connection_reports_saved_credential_failure_instead_of_cached_success(self):
+        with patch.object(tr.requests, "Session") as factory:
+            response = factory.return_value.post.return_value
+            response.status_code = 200
+            response.json.return_value = {"errorCode": "0", "translation": ["你好"], "l": "en2zh-CHS"}
+            self.assertEqual(self.request().status_code, 200)
+            for code, message in [("202", "signature verification failed (202)"), ("110", "not enabled for this application (110)")]:
+                response.json.return_value = {"errorCode": code, "errorMessage": "test-secret"}
+                result = self.request()
+                self.assertEqual(result.status_code, 503)
+                self.assertIn(message, result.data['detail'])
+                self.assertNotIn("test-secret", str(result.data))
+
+    def test_connection_requires_saved_configuration(self):
+        tr.save_config(self.org.id, "youdao", {"clear": True})
+        with patch.object(tr, "call_provider") as call:
+            self.assertEqual(self.request().status_code, 503)
+            self.assertEqual(self.request(engine="invalid").status_code, 400)
+            call.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

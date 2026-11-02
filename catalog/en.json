@@ -2230,5 +2230,12 @@
   "Create a Youdao application with Text Translation enabled and enter its application ID and secret. The local limit is not a free monthly allowance.": "Create a Youdao application with Text Translation enabled and enter its application ID and secret. The local limit is not a free monthly allowance.",
   "Youdao rejected the request timestamp or nonce. Check the server clock and try again.": "Youdao rejected the request timestamp or nonce. Check the server clock and try again.",
   "Loading project and samples...": "Loading project and samples...",
-  "Could not load the project. Please retry.": "Could not load the project. Please retry."
+  "Could not load the project. Please retry.": "Could not load the project. Please retry.",
+  "Youdao signature verification failed (202). Re-enter the application ID and secret from the same Youdao application, then save and test the connection.": "Youdao signature verification failed (202). Re-enter the application ID and secret from the same Youdao application, then save and test the connection.",
+  "Youdao Text Translation is not enabled for this application (110). Enable and bind the service in the Youdao console.": "Youdao Text Translation is not enabled for this application (110). Enable and bind the service in the Youdao console.",
+  "Test saved configuration": "Test saved configuration",
+  "Testing connection...": "Testing connection...",
+  "Translation connection succeeded.": "Translation connection succeeded.",
+  "Save changes before testing. The test translates only the fixed text Hello using your saved configuration and local character limit.": "Save changes before testing. The test translates only the fixed text Hello using your saved configuration and local character limit.",
+  "Saved does not mean verified. Use Test saved configuration to check the provider connection.": "Saved does not mean verified. Use Test saved configuration to check the provider connection."
 }

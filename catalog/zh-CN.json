@@ -2230,5 +2230,12 @@
   "Create a Youdao application with Text Translation enabled and enter its application ID and secret. The local limit is not a free monthly allowance.": "创建已开通文本翻译服务的有道应用，填写应用 ID 和应用密钥。本地限额不代表每月免费额度。",
   "Youdao rejected the request timestamp or nonce. Check the server clock and try again.": "有道拒绝了请求的时间戳或随机值，请检查服务器时间后重试。",
   "Loading project and samples...": "正在加载项目与样本…",
-  "Could not load the project. Please retry.": "项目加载失败，请重试。"
+  "Could not load the project. Please retry.": "项目加载失败，请重试。",
+  "Youdao signature verification failed (202). Re-enter the application ID and secret from the same Youdao application, then save and test the connection.": "有道签名校验失败（202）。请重新填写同一个有道应用的应用 ID 和应用密钥，保存后测试连接。",
+  "Youdao Text Translation is not enabled for this application (110). Enable and bind the service in the Youdao console.": "该有道应用未开通文本翻译服务（110）。请在有道控制台开通并绑定服务。",
+  "Test saved configuration": "测试已保存配置",
+  "Testing connection...": "正在测试连接…",
+  "Translation connection succeeded.": "翻译连接测试成功。",
+  "Save changes before testing. The test translates only the fixed text Hello using your saved configuration and local character limit.": "修改后请先保存再测试。测试仅翻译固定文本 Hello，使用已保存配置并计入本地字符限额。",
+  "Saved does not mean verified. Use Test saved configuration to check the provider connection.": "保存成功不代表连接可用，请点击「测试已保存配置」验证服务连接。"
 }

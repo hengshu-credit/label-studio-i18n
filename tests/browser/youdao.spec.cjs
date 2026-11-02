@@ -1,5 +1,47 @@
 const {test,expect}=require('@playwright/test');
 
+test('project settings expose translation and distinguish saved credentials from a working connection',async({page,context})=>{
+  await context.addCookies([{name:'django_language',value:'zh-hans',url:process.env.LABEL_STUDIO_URL||'http://127.0.0.1:8080'}]);
+  await page.addInitScript(()=>localStorage.setItem('label-studio.language','zh-CN'));
+  await page.goto('/user/login/');
+  await page.locator('#email').fill('ci@example.invalid');
+  await page.locator('#password').fill('ci-only-synthetic-password');
+  await page.locator('#login-form button[type=submit]').click();
+  await expect(page).not.toHaveURL(/user\/login/);
+  const signatureError='Youdao signature verification failed (202). Re-enter the application ID and secret from the same Youdao application, then save and test the connection.';
+  let succeeds=false;
+  await page.route('**/api/tasks/translation-options/',async route=>{
+    if(route.request().method()==='GET'){
+      const response=await route.fetch(), data=await response.json();
+      data.providers.find(p=>p.id==='youdao').configured=true;
+      return route.fulfill({json:data});
+    }
+    expect(route.request().postDataJSON()).toEqual({engine:'youdao',test:true});
+    return route.fulfill({status:succeeds?200:503,json:{detail:succeeds?'Translation connection succeeded.':signatureError}});
+  });
+  await page.goto('/projects/1/settings/');
+  await page.getByRole('link',{name:'翻译设置',exact:true}).click();
+  await expect(page).toHaveURL(/\/projects\/1\/settings\/translation/);
+  const settings=page.getByTestId('translation-settings');
+  await settings.getByLabel('翻译引擎').selectOption('youdao');
+  const testButton=settings.getByRole('button',{name:'测试已保存配置',exact:true});
+  await testButton.click();
+  await expect(settings.getByRole('alert')).toContainText('有道签名校验失败（202）');
+  await expect(settings).not.toContainText('翻译连接测试成功。');
+  succeeds=true;
+  await testButton.click();
+  await expect(settings.getByRole('status')).toHaveText('翻译连接测试成功。');
+  await settings.getByLabel('应用密钥',{exact:true}).fill('unsaved-value');
+  await expect(testButton).toBeDisabled();
+  await expect(settings).not.toContainText('翻译连接测试成功。');
+  await page.reload();
+  await expect(settings.getByLabel('应用密钥',{exact:true})).toHaveValue('');
+  await expect(settings).not.toContainText('翻译连接测试成功。');
+  await page.goto('/user/account/translation');
+  await expect(settings.getByLabel('翻译引擎')).toHaveValue('youdao');
+  await expect(testButton).toBeEnabled();
+});
+
 test('Youdao credentials stay in settings and translate through the minimal panel',async({page,context})=>{
   await context.addCookies([{name:'django_language',value:'zh-hans',url:process.env.LABEL_STUDIO_URL||'http://127.0.0.1:8080'}]);
   await page.addInitScript(()=>localStorage.setItem('label-studio.language','zh-CN'));
