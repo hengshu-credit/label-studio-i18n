@@ -2223,5 +2223,10 @@
   "Submitted result. Start editing to save a correction.": "Submitted result. Start editing to save a correction.",
   "Edit this annotation": "Edit this annotation",
   "Editing enabled: choose labels, select text to add entities, or select an existing entity to change or delete it. Submit to save the human annotation.": "Editing enabled: choose labels, select text to add entities, or select an existing entity to change or delete it. Submit to save the human annotation.",
-  "Labeling help": "Labeling help"
+  "Labeling help": "Labeling help",
+  "Youdao Text Translation": "Youdao Text Translation",
+  "Application ID (appKey)": "Application ID (appKey)",
+  "Application secret": "Application secret",
+  "Create a Youdao application with Text Translation enabled and enter its application ID and secret. The local limit is not a free monthly allowance.": "Create a Youdao application with Text Translation enabled and enter its application ID and secret. The local limit is not a free monthly allowance.",
+  "Youdao rejected the request timestamp or nonce. Check the server clock and try again.": "Youdao rejected the request timestamp or nonce. Check the server clock and try again."
 }

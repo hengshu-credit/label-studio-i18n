@@ -1820,5 +1820,10 @@
   "Submitted result. Start editing to save a correction.": "当前为已提交结果，点击修改后可保存更正。",
   "Edit this annotation": "修改当前标注",
   "Editing enabled: choose labels, select text to add entities, or select an existing entity to change or delete it. Submit to save the human annotation.": "已进入编辑：选择标签后拖选原文可新增实体；点击已有实体可修改标签或删除。提交后保存为人工标注。",
-  "Labeling help": "标注帮助"
+  "Labeling help": "标注帮助",
+  "Youdao Text Translation": "有道文本翻译",
+  "Application ID (appKey)": "应用 ID（appKey）",
+  "Application secret": "应用密钥",
+  "Create a Youdao application with Text Translation enabled and enter its application ID and secret. The local limit is not a free monthly allowance.": "创建已开通文本翻译服务的有道应用，填写应用 ID 和应用密钥。本地限额不代表每月免费额度。",
+  "Youdao rejected the request timestamp or nonce. Check the server clock and try again.": "有道拒绝了请求的时间戳或随机值，请检查服务器时间后重试。"
 }

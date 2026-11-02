@@ -3614,10 +3614,10 @@ index 9785528..2bbc111 100644
  def bulk_update_stats_project_tasks(tasks, project=None):
 diff --git a/label_studio/tasks/translation.py b/label_studio/tasks/translation.py
 new file mode 100644
-index 0000000..3fabd5f
+index 0000000..ddb1b78
 --- /dev/null
 +++ b/label_studio/tasks/translation.py
-@@ -0,0 +1,561 @@
+@@ -0,0 +1,608 @@
 +"""Authenticated, on-demand text translation with explicit engine selection and local limits."""
 +
 +import hashlib
@@ -3686,6 +3686,8 @@ index 0000000..3fabd5f
 +    "aliyun": {"label": "Alibaba Cloud Machine Translation", "free_characters": 1000000},
 +    # This is a local monthly safety cap, not a claim of recurring free DeepL usage.
 +    "deepl": {"label": "DeepL", "free_characters": 1000000},
++    # Local safety cap only; Youdao credits and billing are managed by the account.
++    "youdao": {"label": "Youdao Text Translation", "free_characters": 1000000},
 +}
 +DEEPL_SERVERS = {
 +    "standard": "https://api.deepl.com/v2/translate",
@@ -3776,14 +3778,14 @@ index 0000000..3fabd5f
 +        return bool(cfg.get("access_key_id") and cfg.get("access_key_secret"))
 +    return (
 +        bool(cfg.get("app_id") and cfg.get("secret"))
-+        if engine == "baidu"
++        if engine in ("baidu", "youdao")
 +        else bool(cfg.get("key"))
 +    )
 +
 +
 +def limit_for(engine, cfg):
 +    # Baidu defaults conservatively to the standard plan; advanced users can set 1,000,000.
-+    default = {"baidu": 50000, "deepl": 500000}.get(engine, ENGINES[engine]["free_characters"])
++    default = {"baidu": 50000, "deepl": 500000, "youdao": 500000}.get(engine, ENGINES[engine]["free_characters"])
 +    return min(
 +        max(int(cfg.get("monthly_limit", default)), 0),
 +        ENGINES[engine]["free_characters"],
@@ -3869,6 +3871,22 @@ index 0000000..3fabd5f
 +    return DEEPL_SERVERS[server]
 +
 +
++def youdao_request(cfg, text, source, target):
++    """Youdao v3 signing, using Unicode characters as in the official Python demo."""
++    salt = secrets.token_hex(16)
++    curtime = str(int(time.time()))
++    signing_text = text if len(text) <= 20 else text[:10] + str(len(text)) + text[-10:]
++    signature = hashlib.sha256(
++        (cfg["app_id"] + signing_text + salt + curtime + cfg["secret"]).encode("utf-8")
++    ).hexdigest()
++    codes = {"zh": "zh-CHS", "zh-TW": "zh-CHT"}
++    return {
++        "q": text, "from": codes.get(source, source), "to": codes.get(target, target),
++        "appKey": cfg["app_id"], "salt": salt, "curtime": curtime,
++        "signType": "v3", "sign": signature, "strict": "true",
++    }
++
++
 +def call_provider(engine, cfg, text, source, target):
 +    # Fixed official endpoints only. Credentials never appear in URLs or error messages.
 +    session = requests.Session()
@@ -3924,6 +3942,12 @@ index 0000000..3fabd5f
 +            response = session.post(
 +                deepl_server(cfg), json=body,
 +                headers={"Authorization": "DeepL-Auth-Key " + cfg["key"]},
++                timeout=(10, 45), allow_redirects=False,
++            )
++        elif engine == "youdao":
++            response = session.post(
++                "https://openapi.youdao.com/api",
++                data=youdao_request(cfg, text, source, target),
 +                timeout=(10, 45), allow_redirects=False,
 +            )
 +        elif engine == "baidu":
@@ -3984,6 +4008,29 @@ index 0000000..3fabd5f
 +            translated = item["text"]
 +            detected = item.get("detected_source_language", source).lower()
 +            detected = {"zh-hans": "zh", "zh-hant": "zh-TW", "en-us": "en", "en-gb": "en", "pt-pt": "pt", "pt-br": "pt"}.get(detected, detected)
++        elif engine == "youdao":
++            if not isinstance(data, dict):
++                raise ValueError("Invalid Youdao response")
++            code = str(data.get("errorCode"))
++            if code == "401":
++                raise TranslationFailure("Translation provider quota has been reached. Check your API account.", 429)
++            if code in ("411", "412"):
++                raise TranslationFailure("Translation provider rate limit reached. Try again later.", 429)
++            if code in ("108", "110", "111", "202", "203", "205"):
++                raise TranslationFailure("Translation credentials or API permissions are invalid.", 503)
++            if code in ("206", "207"):
++                raise TranslationFailure("Youdao rejected the request timestamp or nonce. Check the server clock and try again.", 503)
++            if code != "0":
++                raise TranslationFailure("Translation provider rejected the request. Check the account quota and language pair.", 502)
++            translations = data.get("translation")
++            if not isinstance(translations, list) or not translations or not all(isinstance(item, str) for item in translations):
++                raise ValueError("Invalid Youdao translation")
++            translated = "\n".join(translations)
++            language_pair = data.get("l", "")
++            if not isinstance(language_pair, str):
++                raise ValueError("Invalid Youdao language pair")
++            detected = language_pair.partition("2")[0].lower() or source
++            detected = {"zh-chs": "zh", "zh-cht": "zh-TW"}.get(detected, detected)
 +        else:
 +            if "error_code" in data:
 +                raise TranslationFailure(
@@ -4052,7 +4099,7 @@ index 0000000..3fabd5f
 +    account = (
 +        engine
 +        + ":"
-+        + hashlib.sha256(str(cfg.get("access_key_id") if engine == "aliyun" else cfg.get("key") or cfg.get("app_id")).encode()).hexdigest()
++        + hashlib.sha256(str(cfg.get("access_key_id") if engine == "aliyun" else cfg.get("app_id") if engine == "youdao" else cfg.get("key") or cfg.get("app_id")).encode()).hexdigest()
 +    )
 +    key = hashlib.sha256(
 +        json.dumps(
@@ -13568,10 +13615,10 @@ index 0000000..1371d00
 +.settings .error { color: var(--color-negative-content); }
 diff --git a/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.tsx b/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.tsx
 new file mode 100644
-index 0000000..3b6e2b8
+index 0000000..85e16c0
 --- /dev/null
 +++ b/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.tsx
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,111 @@
 +import { useEffect, useState } from "react";
 +import { uiT as t } from "../../../../i18n/ui";
 +import {
@@ -13657,9 +13704,10 @@ index 0000000..3b6e2b8
 +          <label>AccessKey ID<input aria-label="AccessKey ID" autoComplete="off" value={credentials.access_key_id} onChange={event => setCredentials(value => ({ ...value, access_key_id: event.target.value }))} /></label>
 +          <label>AccessKey Secret<input aria-label="AccessKey Secret" type="password" autoComplete="new-password" value={credentials.access_key_secret} onChange={event => setCredentials(value => ({ ...value, access_key_secret: event.target.value }))} /></label>
 +          <p>{t("Enable Alibaba Cloud Machine Translation General Edition and use a RAM AccessKey with translation permissions.")}</p>
-+        </> : engine === "baidu" ? <>
-+          <label>App ID<input aria-label="App ID" autoComplete="off" value={credentials.app_id} onChange={event => setCredentials(value => ({ ...value, app_id: event.target.value }))} /></label>
-+          <label>{t("Secret Key")}<input aria-label={t("Secret Key")} type="password" autoComplete="new-password" value={credentials.secret} onChange={event => setCredentials(value => ({ ...value, secret: event.target.value }))} /></label>
++        </> : ["baidu", "youdao"].includes(engine) ? <>
++          <label>{engine === "youdao" ? t("Application ID (appKey)") : "App ID"}<input aria-label={engine === "youdao" ? t("Application ID (appKey)") : "App ID"} autoComplete="off" value={credentials.app_id} onChange={event => setCredentials(value => ({ ...value, app_id: event.target.value }))} /></label>
++          <label>{t(engine === "youdao" ? "Application secret" : "Secret Key")}<input aria-label={t(engine === "youdao" ? "Application secret" : "Secret Key")} type="password" autoComplete="new-password" value={credentials.secret} onChange={event => setCredentials(value => ({ ...value, secret: event.target.value }))} /></label>
++          {engine === "youdao" && <p>{t("Create a Youdao application with Text Translation enabled and enter its application ID and secret. The local limit is not a free monthly allowance.")}</p>}
 +        </> : <label>API Key<input aria-label="API Key" type="password" autoComplete="new-password" value={credentials.key} onChange={event => setCredentials(value => ({ ...value, key: event.target.value }))} /></label>}
 +        {engine === "azure" && <label>{t("Azure region")}<input aria-label={t("Azure region")} autoComplete="off" value={credentials.region} onChange={event => setCredentials(value => ({ ...value, region: event.target.value }))} /></label>}
 +        {engine === "deepl" && <>

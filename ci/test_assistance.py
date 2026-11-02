@@ -257,6 +257,7 @@ class TranslationTests(unittest.TestCase):
         for engine, credentials in [
             ("aliyun", {"access_key_id": "synthetic-id", "access_key_secret": "synthetic-secret"}),
             ("deepl", {"key": "synthetic-deepl:fx", "api_server": "free"}),
+            ("youdao", {"app_id": "synthetic-youdao-id", "secret": "synthetic-youdao-secret"}),
         ]:
             with self.subTest(engine=engine):
                 result = self.api(tr.TranslationOptionsAPI, "post", {"engine": engine, **credentials})
@@ -278,6 +279,82 @@ class TranslationTests(unittest.TestCase):
         self.assertFalse(tr.configured("aliyun", {"access_key_id": "incomplete"}))
         with self.assertRaises(tr.TranslationFailure):
             tr.save_config(self.org, "deepl", {"api_server": "https://untrusted.invalid"})
+
+    def test_youdao_v3_signature_boundaries_and_response_mapping(self):
+        # Fixed UTF-8 fixtures follow Youdao's official Python v3 signing contract.
+        cases = [
+            ("12345678901234567890", "5ddad6c359efb2b624c7d598532b69b932c62c0d5c0f2d0e4cc658acaff9a017"),
+            ("123456789012345678901", "20a8e3e542ee12b3af9ba94b08ecc62ddcf23e6eef12ff1bd75d134d1eaa2e35"),
+            ("123456789😀abcdefghij中文", "222d2fefffba745c0b67eb38365d251e16f05d4136400d09375f7a4cff6535a6"),
+        ]
+        cfg = {"app_id": "test-app", "secret": "test-secret"}
+        for text, signature in cases:
+            with self.subTest(text=text), patch.object(tr.requests, "Session") as factory, patch.object(tr.time, "time", return_value=1700000000), patch.object(tr.secrets, "token_hex", return_value="test-nonce"):
+                response = factory.return_value.post.return_value
+                response.status_code = 200
+                response.json.return_value = {"errorCode": "0", "translation": ["你好", "世界"], "l": "EN2zh-CHT"}
+                result = tr.call_provider("youdao", cfg, text, "auto", "zh-TW")
+                args, request = factory.return_value.post.call_args
+                self.assertEqual(args, ("https://openapi.youdao.com/api",))
+                self.assertEqual(request["data"], {
+                    "q": text, "from": "auto", "to": "zh-CHT", "appKey": "test-app",
+                    "salt": "test-nonce", "curtime": "1700000000", "signType": "v3",
+                    "sign": signature, "strict": "true",
+                })
+                self.assertFalse(request["allow_redirects"])
+                self.assertEqual(request["timeout"], (10, 45))
+                self.assertNotIn("test-secret", json.dumps(request))
+                self.assertEqual(result["translation"], "你好\n世界")
+                self.assertEqual(result["detected_source"], "en")
+                factory.return_value.close.assert_called_once()
+        with patch.object(tr.requests, "Session") as factory:
+            response = factory.return_value.post.return_value
+            response.status_code = 200
+            for detected, expected in [("zh-CHS", "zh"), ("zh-CHT", "zh-TW"), ("th", "th"), ("tl", "tl")]:
+                response.json.return_value = {"errorCode": 0, "translation": ["test"], "l": detected + "2en"}
+                result = tr.call_provider("youdao", cfg, "原文", "zh", "en")
+                self.assertEqual(factory.return_value.post.call_args.kwargs["data"]["from"], "zh-CHS")
+                self.assertEqual(result["detected_source"], expected)
+
+    def test_youdao_business_errors_and_malformed_responses_are_sanitized(self):
+        cfg = {"app_id": "test-app", "secret": "test-secret"}
+        with patch.object(tr.requests, "Session") as factory:
+            response = factory.return_value.post.return_value
+            response.status_code = 200
+            cases = [("401", 429), ("411", 429), ("412", 429), ("108", 503), ("110", 503),
+                     ("111", 503), ("202", 503), ("203", 503), ("205", 503), ("206", 503),
+                     ("207", 503), ("102", 502), ("303", 502)]
+            for code, status in cases:
+                with self.subTest(code=code):
+                    response.json.return_value = {"errorCode": code, "errorMessage": "test-secret private text"}
+                    with self.assertRaises(tr.TranslationFailure) as error:
+                        tr.call_provider("youdao", cfg, "text", "auto", "zh")
+                    self.assertEqual(error.exception.status, status)
+                    self.assertNotIn("test-secret", str(error.exception))
+                    self.assertNotIn("private text", str(error.exception))
+            for payload in [None, [], {}, {"errorCode": "0", "translation": "wrong shape"},
+                            {"errorCode": "0", "translation": []}, {"errorCode": "0", "translation": [None]},
+                            {"errorCode": "0", "translation": [" "]}, {"errorCode": "0", "translation": ["ok"], "l": {}}]:
+                response.json.return_value = payload
+                with self.subTest(payload=payload), self.assertRaises(tr.TranslationFailure):
+                    tr.call_provider("youdao", cfg, "text", "auto", "zh")
+
+    def test_youdao_app_identity_cache_and_limits(self):
+        self.assertFalse(tr.configured("youdao", {"app_id": "only-id"}))
+        self.assertFalse(tr.configured("youdao", {"secret": "only-secret"}))
+        self.assertEqual(tr.limit_for("youdao", {}), 500000)
+        tr.save_config(self.org, "youdao", {"app_id": "first", "secret": "test-secret", "monthly_limit": 5})
+        with patch.object(tr, "call_provider", return_value={"translation": "你好", "detected_source": "en"}) as call:
+            self.assertFalse(tr.translate_text("hello", "youdao", "auto", "zh", self.org)["cached"])
+            self.assertTrue(tr.translate_text("hello", "youdao", "auto", "zh", self.org)["cached"])
+            self.assertEqual(call.call_count, 1)
+            with self.assertRaisesRegex(tr.TranslationFailure, "monthly"):
+                tr.translate_text("new", "youdao", "auto", "zh", self.org)
+            tr.save_config(self.org, "youdao", {"app_id": "second"})
+            self.assertFalse(tr.translate_text("hello", "youdao", "auto", "zh", self.org)["cached"])
+            self.assertEqual(call.call_count, 2)
+            with self.assertRaisesRegex(tr.TranslationFailure, "request limit"):
+                tr.translate_text("x" * 5001, "youdao", "auto", "zh", self.org)
 
     def test_aliyun_signed_form_contract_and_business_errors(self):
         cfg = {"access_key_id": "test-id", "access_key_secret": "test-secret"}

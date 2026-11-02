@@ -40,7 +40,7 @@ docker compose up -d --wait --wait-timeout 300
 
 ### 标注文本翻译
 
-标注页右侧的「翻译」标签仅显示原文/目标语言、原文、翻译按钮和译文。引擎选择与 API 配置统一放在「账户与设置 → 翻译设置」（`/user/account/translation`），提供 Azure Translator、Google Cloud Translation NMT、百度通用翻译、阿里云机器翻译和 DeepL。默认原文语言为自动识别、目标语言为简体中文，支持泰语等短信语言及手动切换。只在点击「翻译当前文本」时发送当前任务的原文，同一文本和语言组合复用缓存；切换任务或语言会清除旧译文。原文、实体位置和人工标注不受影响。
+标注页右侧的「翻译」标签仅显示原文/目标语言、原文、翻译按钮和译文。引擎选择与 API 配置统一放在「账户与设置 → 翻译设置」（`/user/account/translation`），提供 Azure Translator、Google Cloud Translation NMT、百度通用翻译、阿里云机器翻译、DeepL 和有道文本翻译。默认原文语言为自动识别、目标语言为简体中文，支持泰语等短信语言及手动切换。只在点击「翻译当前文本」时发送当前任务的原文，同一文本和语言组合复用缓存；切换任务或语言会清除旧译文。原文、实体位置和人工标注不受影响。
 
 组织所有者在「翻译设置」的「API 设置」中输入相应 Key；Azure 可填区域，百度需 App ID 和密钥。Key 在服务器按组织加密保存，响应不回显，浏览器不持久化密钥。空字段保留原值，「移除已保存的密钥」清除该引擎配置。翻译数据和配置保存在本地数据卷的 `translation-cache.sqlite3` 中，备份及升级时应保留整个数据卷与 Django Secret Key；更换 Secret Key 后须重新配置密钥。
 
@@ -51,6 +51,8 @@ docker compose up -d --wait --wait-timeout 300
 阿里云使用机器翻译通用版 `TranslateGeneral`（2018-10-12），配置有翻译权限的 RAM AccessKey ID / AccessKey Secret，通过固定杭州端点和 ACS3-HMAC-SHA256 签名调用；本地默认每月上限 100 万字符。DeepL 配置 API Key，自动模式将 `:fx` 结尾的密钥路由到 `api-free.deepl.com`，其他密钥使用 `api.deepl.com`；也可以按账户说明手动选择这两个官方地址。使用质量优先模型，支持自动识别及简繁中文目标语言映射。
 
 DeepL 默认本地每月上限为 50 万，可调整至 100 万；这只是应用的调用保护，不代表免费套餐。Developer 的 100 万字符是一次性额度，旧 API Free 套餐才是每月 50 万，Translator 网页订阅不能代替 API 订阅。云端返回额度耗尽时停止该次调用，不自动切换引擎或付费服务。详情：[阿里云计费](https://help.aliyun.com/zh/machine-translation/product-overview/billing-overview)、[DeepL 套餐](https://support.deepl.com/hc/en-us/articles/360021200939-DeepL-API-plans)。
+
+有道使用官方文本翻译（NMT）接口，在「翻译设置」选择「有道文本翻译」，填写已绑定文本翻译服务的应用 ID（appKey）和应用密钥。服务端采用 v3 SHA-256 签名及固定 HTTPS 端点，支持自动识别和简繁中文映射。单次最多 5000 字符；本地默认每月上限 50 万，可调整至 100 万，这只是应用调用保护，不代表有道免费额度。账户欠费、限流及鉴权失败会显示对应提示，不自动切换其他服务。配置、缓存及密钥移除规则与其他引擎一致。参考：[有道官方 API 文档](https://ai.youdao.com/DOCSIRMA/html/transapi/trans/api/wbfy/index.html)。接口测试使用模拟响应，真实账户开通、额度及翻译质量需在配置自己的密钥后验证。
 
 ### 独立标注工作台
 
