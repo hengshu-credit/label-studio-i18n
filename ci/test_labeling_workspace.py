@@ -110,5 +110,23 @@ class LabelingTests(unittest.TestCase):
   with ThreadPoolExecutor(max_workers=2) as pool:responses=list(pool.map(claim,[self.user,self.other]))
   for r in responses:self.assertEqual(r.status_code,200,r.data)
   self.assertNotEqual(responses[0].data['task']['id'],responses[1].data['task']['id'])
+ def test_anonymous_background_response_cannot_overwrite_login_cookie(self):
+  from django.conf import settings
+  from django.contrib.auth.models import AnonymousUser
+  from django.contrib.sessions.middleware import SessionMiddleware
+  from django.http import HttpResponse
+  from core.middleware import SetSessionUIDMiddleware
+  from organizations.middleware import DummyGetSessionMiddleware
+  from importlib import import_module
+  for path in ['/__lsa/','/heidi-tips','/health']:
+   for with_uid in [False,True]:
+    session=import_module(settings.SESSION_ENGINE).SessionStore();session['organization_pk']=self.user.active_organization_id
+    if with_uid:session['uid']='old-anonymous-session'
+    session.save();request=APIRequestFactory().get(path);request.COOKIES[settings.SESSION_COOKIE_NAME]=session.session_key
+    middleware=SessionMiddleware(lambda r:HttpResponse());middleware.process_request(request);request.user=AnonymousUser()
+    SetSessionUIDMiddleware(lambda r:HttpResponse()).process_request(request)
+    response=DummyGetSessionMiddleware(lambda r:HttpResponse())(request)
+    response=middleware.process_response(request,response)
+    self.assertFalse(settings.SESSION_COOKIE_NAME in response.cookies, "Anonymous responses must not send a session cookie")
 
 if __name__=='__main__':unittest.main()

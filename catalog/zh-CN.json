@@ -2175,5 +2175,16 @@
   "Invalid annotation result.": "标注结果无效，请检查标注内容。",
   "Sequential sampling": "顺序采样",
   "Uniform sampling": "随机采样",
-  "Task assignment mode": "分配方式"
+  "Task assignment mode": "分配方式",
+  "Accept and next": "接受并下一条",
+  "Submit and next": "提交并下一条",
+  "Accept and inspect": "接受并查看结果",
+  "Submit and inspect": "提交并查看结果",
+  "Accept and exit": "接受并退出",
+  "Submit and exit": "提交并退出",
+  "More submission options": "更多提交选项",
+  "Annotation history": "标注历史",
+  "Last submitted task": "最近提交的样本",
+  "View submitted result": "查看已提交结果",
+  "Human annotation submitted.": "人工标注已提交。"
 }

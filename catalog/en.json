@@ -2175,5 +2175,16 @@
   "Invalid annotation result.": "Invalid annotation result.",
   "Sequential sampling": "Sequential sampling",
   "Uniform sampling": "Uniform sampling",
-  "Task assignment mode": "Task assignment mode"
+  "Task assignment mode": "Task assignment mode",
+  "Accept and next": "Accept and next",
+  "Submit and next": "Submit and next",
+  "Accept and inspect": "Accept and inspect",
+  "Submit and inspect": "Submit and inspect",
+  "Accept and exit": "Accept and exit",
+  "Submit and exit": "Submit and exit",
+  "More submission options": "More submission options",
+  "Annotation history": "Annotation history",
+  "Last submitted task": "Last submitted task",
+  "View submitted result": "View submitted result",
+  "Human annotation submitted.": "Human annotation submitted."
 }
