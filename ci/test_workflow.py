@@ -47,6 +47,9 @@ class WorkflowTests(unittest.TestCase):
    self.assertIsNone(prediction['score']);self.assertTrue(prediction['uncertain'])
    payload=session.return_value.__enter__.return_value.post.call_args.kwargs['json']
    self.assertEqual(payload['response_format']['type'],'json_schema')
+   self.assertEqual(json.loads(payload['messages'][1]['content']),{'content':'synthetic text'})
+   binding=payload['response_format']['json_schema']['schema']['properties']['result']['items']['anyOf'][0]['properties']
+   self.assertEqual(binding['from_name']['enum'],['category']);self.assertEqual(binding['to_name']['enum'],['text'])
   with self.assertRaises(ValueError):validate_result(result('unknown'),self.task,XML)
 
  def test_deepseek_preserves_non_thinking_configuration(self):

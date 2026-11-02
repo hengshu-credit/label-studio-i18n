@@ -258,6 +258,14 @@ class Runtime:
         cfg = self.config(body)
         return self.training_status.get(cfg['identity'], {'status':'idle'})
 
+    def snapshot(self, body):
+        with self.lock:
+            cfg=self.config(body)
+            if cfg['initialize'] and cfg['version']=='base':raise ValueError('Train and publish this model before reusing its weights.')
+            self.load(cfg)  # Check that a trained task head is actually available.
+            source=cfg['source'] if cfg['version']=='base' else cfg['directory']/cfg['version']
+            return {'base_model':str(source),'model_version':cfg['model_version'],'model_task':cfg['params']['model_task']}
+
     def cancel(self, body):
         cfg = self.config(body)
         event = self.cancellations.get(cfg['identity'])
@@ -362,13 +370,13 @@ def create_app(output, device=None):
     def endpoint(method):
         def call(body: dict):
             try:
-                if method in ('predict','promote') and any(s.get('status')=='training' for s in runtime.training_status.values()):
+                if method in ('predict','promote','snapshot') and any(s.get('status')=='training' for s in runtime.training_status.values()):
                     raise HTTPException(503, 'GPU training is in progress. Existing saved predictions remain available; retry after training completes.')
                 return getattr(runtime, method)(body)
             except (ValueError, KeyError, TypeError, OSError, RuntimeError) as exc:
                 raise HTTPException(422, str(exc)) from exc
         return call
-    for path, method in [('setup','setup'),('predict','predict'),('train','train'),('training-status','status'),('cancel-training','cancel'),('promote','promote')]:
+    for path, method in [('setup','setup'),('predict','predict'),('train','train'),('training-status','status'),('cancel-training','cancel'),('promote','promote'),('snapshot','snapshot')]:
         app.post('/'+path)(endpoint(method))
     return app
 

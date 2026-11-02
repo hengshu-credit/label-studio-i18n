@@ -128,5 +128,15 @@ class TransformersTests(unittest.TestCase):
             self.runtime.setup(body);self.runtime.predict(body);self.runtime.setup({**body,'project':'another'})
             self.assertEqual(load.call_count,1)
 
+    def test_snapshot_can_seed_another_project_without_mutating_source(self):
+        import copy,hashlib
+        body=self.body();body['annotations']=[{**body['tasks'][0],'annotations':[{'result':[{'from_name':'category','to_name':'text','type':'choices','value':{'choices':['yes']}}]}]}]
+        first=self.runtime.train(body);snapshot=self.runtime.snapshot(body)
+        weights=Path(snapshot['base_model'])/'model.safetensors';before=hashlib.sha256(weights.read_bytes()).hexdigest()
+        target=copy.deepcopy(body);target['project']='independent';target['params']['base_model']=snapshot['base_model']
+        second=self.runtime.train(target)
+        self.assertNotEqual(first['model_version'],second['model_version']);self.assertEqual(self.runtime.setup(body)['model_version'],first['model_version'])
+        self.assertEqual(hashlib.sha256(weights.read_bytes()).hexdigest(),before)
+
 
 if __name__ == '__main__':unittest.main()

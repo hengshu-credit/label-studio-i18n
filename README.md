@@ -50,7 +50,7 @@ docker compose up -d --wait --wait-timeout 300
 
 ### 本地 Transformers 主动学习
 
-新增「项目设置 → 学习与复核」工作台，支持 OpenAI / DeepSeek / 本地模型的持久批量预标注、独立训练候选与发布、难样本队列和人工复核回流。详见[完整工作流说明](docs/learning-workflow.md)。
+新增「项目设置 → 模型与预标注」工作台，支持 OpenAI / DeepSeek / 本地模型的持久批量预标注、独立训练候选与发布、难样本队列和人工复核回流。详见[完整工作流说明](docs/learning-workflow.md)。
 
 项目模型后台可配置 Hugging Face 缓存 ID 或已训练模型本地目录，分类与实体识别分别选择；支持人工标注训练、版本保存、候选池刷新与低置信度优先采样。需要启动本地推理服务及 Compose 中的主动学习 worker。详见 [配置、模型格式与边界说明](ml_backend/README.md)。
 

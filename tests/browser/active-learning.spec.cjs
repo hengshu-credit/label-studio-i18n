@@ -17,7 +17,7 @@ test('configure local Transformers model and enable uncertainty sampling',async(
   expect((await saving).ok()).toBeTruthy();
   await page.reload();
   await expect(page.locator('input[type="radio"][value="Uncertainty sampling"]')).toBeChecked();
-  await page.goto('/projects/1/settings/ml');
+  await page.goto('/projects/1/settings/ml-advanced');
   await page.getByRole('button',{name:'添加机器学习模型',exact:true}).click();
   await expect(page.locator('select[name="model_task"]')).toHaveValue('text-classification');
   await page.locator('input[name="title"]').fill('Local Transformers');
