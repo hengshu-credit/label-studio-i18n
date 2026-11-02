@@ -4495,10 +4495,10 @@ index 7f55bfb..4e246f8 100644
 
 diff --git a/label_studio/tasks/translation.py b/label_studio/tasks/translation.py
 new file mode 100644
-index 0000000..37e3c31
+index 0000000..e0b1272
 --- /dev/null
 +++ b/label_studio/tasks/translation.py
-@@ -0,0 +1,617 @@
+@@ -0,0 +1,628 @@
 +"""Authenticated, on-demand text translation with explicit engine selection and local limits."""
 +
 +import hashlib
@@ -4684,6 +4684,8 @@ index 0000000..37e3c31
 +                **info,
 +                "configured": configured(key, cfg),
 +                "monthly_limit": limit_for(key, cfg),
++                "saved_credentials": saved_credentials(key, cfg),
++                **({"region": cfg.get("region", "")} if key == "azure" else {}),
 +                **({"api_server": cfg.get("api_server", "auto")} if key == "deepl" else {}),
 +                "languages": {
 +                    k: v
@@ -4699,6 +4701,15 @@ index 0000000..37e3c31
 +        "default_engine": default,
 +        "default_source": "auto",
 +        "default_target": "zh",
++    }
++
++
++def saved_credentials(engine, cfg):
++    fields = ("access_key_id", "access_key_secret") if engine == "aliyun" else ("app_id", "secret") if engine in ("baidu", "youdao") else ("key",)
++    # Return only a display summary, never a recoverable credential or a form value.
++    return {
++        field: "\u2022" * 8 + (cfg[field][-4:] if len(cfg[field]) > 8 else "")
++        for field in fields if isinstance(cfg.get(field), str) and cfg[field]
 +    }
 +
 +
@@ -14818,10 +14829,10 @@ index e649818..cc3de07 100644
            <PersonalInfo />
 diff --git a/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.module.css b/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.module.css
 new file mode 100644
-index 0000000..1371d00
+index 0000000..9d3c80b
 --- /dev/null
 +++ b/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.module.css
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,13 @@
 +.settings { display: flex; flex-direction: column; gap: 20px; max-width: 560px; }
 +.settings label { display: flex; flex-direction: column; gap: 8px; font-weight: 500; }
 +.settings select, .settings input { width: 100%; min-width: 0; box-sizing: border-box; padding: 10px 12px; border: 1px solid var(--color-neutral-border); border-radius: 6px; color: var(--color-neutral-content); background: var(--color-neutral-surface); font: inherit; }
@@ -14833,12 +14844,14 @@ index 0000000..1371d00
 +.actions button[type="submit"] { background: var(--color-primary-surface); color: var(--color-primary-surface-content); }
 +.settings :disabled { opacity: .6; cursor: not-allowed; }
 +.settings .error { color: var(--color-negative-content); }
++.saved { font-size: 12px; font-weight: 400; color: var(--color-neutral-content-subtler); }
++.saved code { font: inherit; letter-spacing: .5px; }
 diff --git a/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.tsx b/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.tsx
 new file mode 100644
-index 0000000..ef9052d
+index 0000000..d07ba7a
 --- /dev/null
 +++ b/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.tsx
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,138 @@
 +import { useEffect, useState } from "react";
 +import { uiT as t } from "../../../../i18n/ui";
 +import {
@@ -14862,7 +14875,10 @@ index 0000000..ef9052d
 +  const [testing, setTesting] = useState(false);
 +  const [tested, setTested] = useState(false);
 +  const provider = providers.find(item => item.id === engine);
-+  const unsaved = Object.values(credentials).some(Boolean) || monthlyLimit !== provider?.monthly_limit || (engine === "deepl" && apiServer !== (provider?.api_server || "auto"));
++  const unsaved = Object.entries(credentials).some(([key, value]) => key === "region" ? value !== (provider?.region || "") : Boolean(value)) || monthlyLimit !== provider?.monthly_limit || (engine === "deepl" && apiServer !== (provider?.api_server || "auto"));
++  const savedValue = (field: string) => provider?.saved_credentials?.[field]
++    ? <span className={styles.saved} data-testid={`saved-${field}`}>{t("Saved value")}: <code>{provider.saved_credentials[field]}</code></span>
++    : null;
 +
 +  useEffect(() => {
 +    const controller = new AbortController();
@@ -14878,10 +14894,10 @@ index 0000000..ef9052d
 +  }, []);
 +
 +  useEffect(() => {
-+    setCredentials(emptyCredentials);
++    setCredentials({ ...emptyCredentials, region: provider?.region || "" });
 +    setMonthlyLimit(provider?.monthly_limit || 0);
 +    setApiServer(provider?.api_server || "auto");
-+  }, [engine, provider?.monthly_limit, provider?.api_server]);
++  }, [engine, provider?.monthly_limit, provider?.api_server, provider?.region]);
 +
 +  function changeEngine(value: string) {
 +    setEngine(value);
@@ -14904,7 +14920,7 @@ index 0000000..ef9052d
 +      const data = await response.json();
 +      if (!response.ok) throw Error(data.detail || "Unable to save API configuration.");
 +      setProviders(data.providers);
-+      setCredentials(emptyCredentials);
++      setCredentials({ ...emptyCredentials, region: data.providers.find((item: TranslationProvider) => item.id === engine)?.region || "" });
 +      writeTranslationPreferences({ engine });
 +      notifyTranslationSettings();
 +      setSaved(true);
@@ -14939,16 +14955,16 @@ index 0000000..ef9052d
 +    {provider && canConfigure && <form onChange={() => { setTested(false); setSaved(false); setError(""); }} onSubmit={event => { event.preventDefault(); void saveCredentials(); }}>
 +      <fieldset disabled={saving || testing}>
 +        <legend>{t("API settings")}</legend>
-+        <p>{t("Keys are encrypted on the server and are never returned to the browser. Leave a field blank to keep its saved value.")}</p>
++        <p>{t("Credentials are encrypted on the server. Only masked summaries are shown. Leave a field blank to keep its saved value.")}</p>
 +        {engine === "aliyun" ? <>
-+          <label>AccessKey ID<input aria-label="AccessKey ID" autoComplete="off" value={credentials.access_key_id} onChange={event => setCredentials(value => ({ ...value, access_key_id: event.target.value }))} /></label>
-+          <label>AccessKey Secret<input aria-label="AccessKey Secret" type="password" autoComplete="new-password" value={credentials.access_key_secret} onChange={event => setCredentials(value => ({ ...value, access_key_secret: event.target.value }))} /></label>
++          <label>AccessKey ID<input aria-label="AccessKey ID" autoComplete="off" value={credentials.access_key_id} onChange={event => setCredentials(value => ({ ...value, access_key_id: event.target.value }))} />{savedValue("access_key_id")}</label>
++          <label>AccessKey Secret<input aria-label="AccessKey Secret" type="password" autoComplete="new-password" value={credentials.access_key_secret} onChange={event => setCredentials(value => ({ ...value, access_key_secret: event.target.value }))} />{savedValue("access_key_secret")}</label>
 +          <p>{t("Enable Alibaba Cloud Machine Translation General Edition and use a RAM AccessKey with translation permissions.")}</p>
 +        </> : ["baidu", "youdao"].includes(engine) ? <>
-+          <label>{engine === "youdao" ? t("Application ID (appKey)") : "App ID"}<input aria-label={engine === "youdao" ? t("Application ID (appKey)") : "App ID"} autoComplete="off" value={credentials.app_id} onChange={event => setCredentials(value => ({ ...value, app_id: event.target.value }))} /></label>
-+          <label>{t(engine === "youdao" ? "Application secret" : "Secret Key")}<input aria-label={t(engine === "youdao" ? "Application secret" : "Secret Key")} type="password" autoComplete="new-password" value={credentials.secret} onChange={event => setCredentials(value => ({ ...value, secret: event.target.value }))} /></label>
++          <label>{engine === "youdao" ? t("Application ID (appKey)") : "App ID"}<input aria-label={engine === "youdao" ? t("Application ID (appKey)") : "App ID"} autoComplete="off" value={credentials.app_id} onChange={event => setCredentials(value => ({ ...value, app_id: event.target.value }))} />{savedValue("app_id")}</label>
++          <label>{t(engine === "youdao" ? "Application secret" : "Secret Key")}<input aria-label={t(engine === "youdao" ? "Application secret" : "Secret Key")} type="password" autoComplete="new-password" value={credentials.secret} onChange={event => setCredentials(value => ({ ...value, secret: event.target.value }))} />{savedValue("secret")}</label>
 +          {engine === "youdao" && <p>{t("Create a Youdao application with Text Translation enabled and enter its application ID and secret. The local limit is not a free monthly allowance.")}</p>}
-+        </> : <label>API Key<input aria-label="API Key" type="password" autoComplete="new-password" value={credentials.key} onChange={event => setCredentials(value => ({ ...value, key: event.target.value }))} /></label>}
++        </> : <label>API Key<input aria-label="API Key" type="password" autoComplete="new-password" value={credentials.key} onChange={event => setCredentials(value => ({ ...value, key: event.target.value }))} />{savedValue("key")}</label>}
 +        {engine === "azure" && <label>{t("Azure region")}<input aria-label={t("Azure region")} autoComplete="off" value={credentials.region} onChange={event => setCredentials(value => ({ ...value, region: event.target.value }))} /></label>}
 +        {engine === "deepl" && <>
 +          <label>{t("DeepL API server")}<select aria-label={t("DeepL API server")} value={apiServer} onChange={event => setApiServer(event.target.value)}>
@@ -14968,7 +14984,7 @@ index 0000000..ef9052d
 +        <p>{t("Save changes before testing. The test translates only the fixed text Hello using your saved configuration and local character limit.")}</p>
 +      </fieldset>
 +    </form>}
-+    {saved && <p role="status">{t("API settings saved. Existing keys are not displayed.")}</p>}
++    {saved && <p role="status">{t("API settings saved. Only masked credential summaries are displayed.")}</p>}
 +    {saved && <p>{t("Saved does not mean verified. Use Test saved configuration to check the provider connection.")}</p>}
 +    {tested && <p role="status">{t("Translation connection succeeded.")}</p>}
 +    {error && <p role="alert" className={styles.error}>{t(error)}</p>}
@@ -15051,10 +15067,10 @@ index 1ee210c..3fac317 100644
          description: PersonalAccessTokenDescription,
 diff --git a/web/libs/app-common/src/utils/translation.ts b/web/libs/app-common/src/utils/translation.ts
 new file mode 100644
-index 0000000..f9ab58d
+index 0000000..b496d13
 --- /dev/null
 +++ b/web/libs/app-common/src/utils/translation.ts
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,51 @@
 +export type TranslationProvider = {
 +  id: string;
 +  label: string;
@@ -15062,6 +15078,8 @@ index 0000000..f9ab58d
 +  monthly_limit: number;
 +  free_characters: number;
 +  api_server?: string;
++  region?: string;
++  saved_credentials?: Record<string, string>;
 +  languages: Record<string, string>;
 +};
 +

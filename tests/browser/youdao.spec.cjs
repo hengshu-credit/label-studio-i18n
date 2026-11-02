@@ -75,6 +75,9 @@ test('Youdao credentials stay in settings and translate through the minimal pane
   await expect(settings.getByLabel('翻译引擎')).toHaveValue('youdao');
   await expect(appId).toHaveValue('');
   await expect(secret).toHaveValue('');
+  await expect(settings.getByTestId('saved-app_id')).toContainText('••••••••o-id');
+  await expect(settings.getByTestId('saved-secret')).toContainText('••••••••cret');
+  await expect(settings).not.toContainText('synthetic-youdao-secret');
   // Blank credentials retain their saved values when only the local cap changes.
   await settings.getByLabel('本地每月字符上限').fill('100000');
   await save();
@@ -116,6 +119,7 @@ test('Youdao credentials stay in settings and translate through the minimal pane
   await settings.getByRole('button',{name:'移除已保存密钥',exact:true}).click();
   expect((await clearing).ok()).toBeTruthy();
   await expect(settings.getByRole('button',{name:'移除已保存密钥',exact:true})).toHaveCount(0);
+  await expect(settings.getByTestId('saved-secret')).toHaveCount(0);
   await page.goto('/projects/1/data?task=1');
   await expect(panel.getByRole('button',{name:'翻译当前文本',exact:true})).toBeDisabled();
   await expect(panel.getByRole('link',{name:'前往设置配置翻译'})).toBeVisible();

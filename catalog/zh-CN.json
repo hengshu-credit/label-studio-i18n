@@ -2237,5 +2237,8 @@
   "Testing connection...": "正在测试连接…",
   "Translation connection succeeded.": "翻译连接测试成功。",
   "Save changes before testing. The test translates only the fixed text Hello using your saved configuration and local character limit.": "修改后请先保存再测试。测试仅翻译固定文本 Hello，使用已保存配置并计入本地字符限额。",
-  "Saved does not mean verified. Use Test saved configuration to check the provider connection.": "保存成功不代表连接可用，请点击「测试已保存配置」验证服务连接。"
+  "Saved does not mean verified. Use Test saved configuration to check the provider connection.": "保存成功不代表连接可用，请点击「测试已保存配置」验证服务连接。",
+  "Saved value": "已保存",
+  "API settings saved. Only masked credential summaries are displayed.": "API 设置已保存，仅显示凭据的脱敏摘要。",
+  "Credentials are encrypted on the server. Only masked summaries are shown. Leave a field blank to keep its saved value.": "凭据在服务器加密保存，仅显示脱敏摘要。留空会保留已保存的值。"
 }

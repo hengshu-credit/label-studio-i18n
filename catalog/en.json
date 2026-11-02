@@ -2237,5 +2237,8 @@
   "Testing connection...": "Testing connection...",
   "Translation connection succeeded.": "Translation connection succeeded.",
   "Save changes before testing. The test translates only the fixed text Hello using your saved configuration and local character limit.": "Save changes before testing. The test translates only the fixed text Hello using your saved configuration and local character limit.",
-  "Saved does not mean verified. Use Test saved configuration to check the provider connection.": "Saved does not mean verified. Use Test saved configuration to check the provider connection."
+  "Saved does not mean verified. Use Test saved configuration to check the provider connection.": "Saved does not mean verified. Use Test saved configuration to check the provider connection.",
+  "Saved value": "Saved value",
+  "API settings saved. Only masked credential summaries are displayed.": "API settings saved. Only masked credential summaries are displayed.",
+  "Credentials are encrypted on the server. Only masked summaries are shown. Leave a field blank to keep its saved value.": "Credentials are encrypted on the server. Only masked summaries are shown. Leave a field blank to keep its saved value."
 }

@@ -554,6 +554,25 @@ class TranslationConnectionTests(unittest.TestCase):
         force_authenticate(request, user=user or self.user)
         return tr.TranslationOptionsAPI.as_view()(request)
 
+    def test_saved_credential_summaries_are_masked_and_not_form_values(self):
+        providers = tr.capabilities(self.org.id)["providers"]
+        youdao = next(p for p in providers if p['id'] == 'youdao')
+        self.assertEqual(youdao['saved_credentials'], {'app_id': '••••••••', 'secret': '••••••••cret'})
+        self.assertNotIn('test-app', json.dumps(providers))
+        self.assertNotIn('test-secret', json.dumps(providers))
+        tr.save_config(self.org.id, 'youdao', {'app_id': '', 'secret': ''})
+        self.assertEqual(tr.read_config(self.org.id)['youdao']['secret'], 'test-secret')
+        tr.save_config(self.org.id, 'youdao', {'clear': True})
+        self.assertEqual(next(p for p in tr.capabilities(self.org.id)['providers'] if p['id']=='youdao')['saved_credentials'], {})
+
+    def test_saved_summary_is_provider_specific_and_region_is_restored(self):
+        tr.save_config(self.org.id, 'azure', {'key': 'long-synthetic-key', 'region': 'eastasia', 'secret': 'irrelevant-secret'})
+        azure = next(p for p in tr.capabilities(self.org.id)['providers'] if p['id']=='azure')
+        self.assertEqual(azure['saved_credentials'], {'key': '••••••••-key'})
+        self.assertEqual(azure['region'], 'eastasia')
+        self.assertNotIn('irrelevant-secret', json.dumps(azure))
+        self.assertEqual(tr.saved_credentials('aliyun', {'access_key_id':'short','access_key_secret':'another-long-value'}), {'access_key_id':'••••••••','access_key_secret':'••••••••alue'})
+
     def test_connection_bypasses_cache_and_never_saves_submitted_credentials(self):
         before = tr.read_config(self.org.id)
         with patch.object(tr, "call_provider", return_value={"translation": "你好", "detected_source": "en"}) as call:
