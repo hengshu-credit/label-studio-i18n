@@ -1,4 +1,22 @@
 const {test,expect}=require('@playwright/test');
+test('DeepSeek inference settings persist without exposing credentials',async({page,context})=>{
+ await context.addCookies([{name:'django_language',value:'zh-hans',url:process.env.LABEL_STUDIO_URL||'http://127.0.0.1:8080'}]);
+ await page.addInitScript(()=>localStorage.setItem('label-studio.language','zh-CN'));
+ await page.goto('/user/login/');await page.locator('#email').fill('ci@example.invalid');await page.locator('#password').fill('ci-only-synthetic-password');await page.locator('#login-form button[type=submit]').click();
+ await expect(page).not.toHaveURL(/user\/login/);await page.goto('/projects/1/settings/learning');
+ const panel=page.getByTestId('learning-workspace');await panel.getByRole('button',{name:'模型服务',exact:true}).click();
+ await panel.getByLabel('名称',{exact:true}).fill('CI DeepSeek settings');await panel.getByLabel('服务类型').selectOption('deepseek');
+ await panel.getByLabel('模型 ID').fill('deepseek-flash');await panel.getByLabel('最大输出 Token 数').fill('800');
+ await expect(panel.getByLabel('DeepSeek 思考模式')).toHaveValue('disabled');await expect(panel.getByLabel('采样温度')).toHaveValue('0');
+ await panel.getByLabel('DeepSeek 思考模式').selectOption('enabled');await expect(panel.getByLabel('采样温度')).toBeDisabled();
+ await panel.getByLabel('DeepSeek 思考模式').selectOption('disabled');
+ const saving=page.waitForResponse(r=>r.url().endsWith('/workflow')&&r.request().method()==='POST');await panel.getByRole('button',{name:'保存模型服务'}).click();
+ const response=await saving;expect(response.ok()).toBeTruthy();const saved=await response.json();
+ expect(saved.options.thinking).toBe('disabled');expect(saved.options.temperature).toBe(0);expect(saved.options.max_tokens).toBe(800);expect(saved).not.toHaveProperty('api_key');
+ await page.reload();await panel.getByRole('button',{name:'模型服务',exact:true}).click();
+ await panel.locator('.learning-cards article').filter({has:page.getByRole('heading',{name:'CI DeepSeek settings',exact:true})}).getByRole('button',{name:'编辑',exact:true}).click();
+ await expect(panel.getByLabel('DeepSeek 思考模式')).toHaveValue('disabled');await expect(panel.getByLabel('采样温度')).toHaveValue('0');await expect(panel.getByLabel('最大输出 Token 数')).toHaveValue('800');
+});
 test('learning workspace provider, persistent job, and review decisions',async({page,context})=>{
  await context.addCookies([{name:'django_language',value:'zh-hans',url:process.env.LABEL_STUDIO_URL||'http://127.0.0.1:8080'}]);
  await page.addInitScript(()=>localStorage.setItem('label-studio.language','zh-CN'));

@@ -48,6 +48,20 @@ class WorkflowTests(unittest.TestCase):
    payload=session.return_value.__enter__.return_value.post.call_args.kwargs['json']
    self.assertEqual(payload['response_format']['type'],'json_schema')
   with self.assertRaises(ValueError):validate_result(result('unknown'),self.task,XML)
+
+ def test_deepseek_preserves_non_thinking_configuration(self):
+  saved=self.api({'action':'provider','name':'DeepSeek','kind':'deepseek','model':'deepseek-flash','api_key':'synthetic-key','options':{'thinking':'disabled','temperature':0,'max_tokens':800}})
+  self.assertEqual(saved.status_code,200,saved.data);p=AnnotationProvider.objects.get(pk=saved.data['id'])
+  self.assertEqual(p.options['thinking'],'disabled');self.assertEqual(p.options['temperature'],0)
+  response=Mock(status_code=200);response.json.return_value={'choices':[{'finish_reason':'stop','message':{'content':json.dumps({'result':result('yes'),'uncertain':False,'reason':''})}}]}
+  with patch('ml.workflow.requests.Session') as session:
+   session.return_value.__enter__.return_value.post.return_value=response
+   cloud_predict(p,self.task,XML);payload=session.return_value.__enter__.return_value.post.call_args.kwargs['json']
+   self.assertEqual(payload['thinking'],{'type':'disabled'});self.assertEqual(payload['temperature'],0);self.assertEqual(payload['max_tokens'],800);self.assertEqual(payload['response_format'],{'type':'json_object'})
+   p.options['thinking']='enabled';p.save();cloud_predict(p,self.task,XML)
+   self.assertNotIn('temperature',session.return_value.__enter__.return_value.post.call_args.kwargs['json'])
+  invalid=self.api({'action':'provider','id':p.pk,'name':p.name,'kind':p.kind,'model':p.model,'options':{'temperature':3}})
+  self.assertEqual(invalid.status_code,400)
  def test_review_requires_annotation_and_excludes_training_until_accepted(self):
   Prediction.objects.create(project=self.project,task=self.task,result=result('no'),score=.2,model_version='test')
   analyze_task(self.task)

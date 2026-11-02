@@ -1969,5 +1969,10 @@
   "No eligible tasks. Training requires submitted annotations; unresolved cases and holdout tasks are excluded.": "No eligible tasks. Training requires submitted annotations; unresolved cases and holdout tasks are excluded.",
   "Choose a non-interactive connection for batch preannotation.": "Choose a non-interactive connection for batch preannotation.",
   "Invalid API key. Use a single ASCII token without internal whitespace.": "Invalid API key. Use a single ASCII token without internal whitespace.",
-  "This model needs initial human annotations, training and publication before preannotation.": "This model needs initial human annotations, training and publication before preannotation."
+  "This model needs initial human annotations, training and publication before preannotation.": "This model needs initial human annotations, training and publication before preannotation.",
+  "DeepSeek thinking mode": "DeepSeek thinking mode",
+  "Disabled for direct annotation": "Disabled for direct annotation",
+  "Temperature": "Temperature",
+  "Thinking mode uses the output token budget. Temperature applies only when thinking is disabled.": "Thinking mode uses the output token budget. Temperature applies only when thinking is disabled.",
+  "DeepSeek thinking mode or temperature is invalid.": "DeepSeek thinking mode or temperature is invalid."
 }

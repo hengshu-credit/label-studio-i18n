@@ -1950,10 +1950,10 @@ index 9a56b73..9299ee3 100644
      path('<int:pk>', api.MLBackendDetailAPI.as_view(), name='ml-detail'),
 diff --git a/label_studio/ml/workflow.py b/label_studio/ml/workflow.py
 new file mode 100644
-index 0000000..a5f0983
+index 0000000..92f5e79
 --- /dev/null
 +++ b/label_studio/ml/workflow.py
-@@ -0,0 +1,507 @@
+@@ -0,0 +1,518 @@
 +"""Project-scoped annotation jobs, review decisions and controlled model release."""
 +import base64
 +import hashlib
@@ -2083,8 +2083,11 @@ index 0000000..a5f0983
 +
 +def provider_signature(p):
 +    # Budgets, display names and key rotation do not change prediction semantics.
-+    return fingerprint([p.kind,p.model,p.endpoint,p.backend_id,
-+        {k:p.options.get(k) for k in ('prompt','max_tokens','json_schema')}])
++    options={k:p.options.get(k) for k in ('prompt','max_tokens','json_schema')}
++    if p.kind=='deepseek':
++        options['thinking']=p.options.get('thinking','disabled')
++        if options['thinking']=='disabled':options['temperature']=float(p.options.get('temperature',0))
++    return fingerprint([p.kind,p.model,p.endpoint,p.backend_id,options])
 +
 +
 +def cloud_version(provider, xml):
@@ -2224,6 +2227,11 @@ index 0000000..a5f0983
 +        if body.get('clear_key'):provider.encrypted_key=''
 +        provider.name=name;provider.kind=kind;provider.model=model;provider.endpoint=endpoint;provider.backend=backend
 +        provider.options={'prompt':prompt,'request_limit':limit,'max_tokens':max_tokens,'json_schema':bool(options.get('json_schema',kind=='openai'))}
++        if kind=='deepseek':
++            thinking=options.get('thinking','disabled');temperature=float(options.get('temperature',0))
++            if thinking not in ('disabled','enabled') or not math.isfinite(temperature) or not 0<=temperature<=2:
++                raise ValueError('DeepSeek thinking mode or temperature is invalid.')
++            provider.options.update(thinking=thinking,temperature=temperature)
 +        if provider.pk:
 +            provider.save(update_fields=['name','kind','model','endpoint','backend','options','encrypted_key','updated_at'])
 +            provider.refresh_from_db(fields=['usage_month','requests_used'])
@@ -2314,6 +2322,9 @@ index 0000000..a5f0983
 +    data={'model':provider.model,'messages':[{'role':'system','content':system+'\nJSON schema: '+json.dumps(schema)},
 +        {'role':'user','content':json.dumps(payload,ensure_ascii=False)}],'response_format':fmt,'max_completion_tokens':provider.options.get('max_tokens',2048)}
 +    if provider.kind!='openai':data['max_tokens']=data.pop('max_completion_tokens')
++    if provider.kind=='deepseek':
++        data['thinking']={'type':provider.options.get('thinking','disabled')}
++        if data['thinking']['type']=='disabled':data['temperature']=provider.options.get('temperature',0)
 +    try:
 +        with requests.Session() as session:
 +            if provider.kind!='local_chat':session.mount('https://',SsrfSafeHTTPAdapter())
@@ -6815,10 +6826,10 @@ index 0000000..7a39411
 +.learning-workspace table{width:100%;table-layout:fixed;border-collapse:collapse;font-size:13px}.learning-workspace th,.learning-workspace td{padding:8px;text-align:left;border-bottom:1px solid var(--color-neutral-border);overflow-wrap:anywhere}
 diff --git a/web/apps/labelstudio/src/pages/Settings/LearningWorkspace.jsx b/web/apps/labelstudio/src/pages/Settings/LearningWorkspace.jsx
 new file mode 100644
-index 0000000..d3a0ea8
+index 0000000..87e13d6
 --- /dev/null
 +++ b/web/apps/labelstudio/src/pages/Settings/LearningWorkspace.jsx
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,101 @@
 +import {useCallback,useContext,useEffect,useRef,useState} from "react";
 +import {uiT as t} from "@humansignal/app-common/i18n/ui";
 +import {ProjectContext} from "../../providers/ProjectProvider";
@@ -6872,11 +6883,13 @@ index 0000000..d3a0ea8
 +     <div className="learning-grid"><label>{t("Name")}<input aria-label={t("Name")}  required value={provider.name} onChange={e=>field("name",e.target.value)}/></label>
 +     <label>{t("Provider type")}<select aria-label={t("Provider type")}  value={provider.kind} onChange={e=>field("kind",e.target.value)}><option value="local">{t("Local model / Transformers")}</option><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option><option value="compatible">{t("Compatible API")}</option><option value="local_chat">{t("Local chat API")}</option></select></label>
 +     {provider.kind==="local"?<label>{t("Model connection")}<select aria-label={t("Model connection")}  required value={provider.backend} onChange={e=>field("backend",e.target.value)}><option value="">{t("Select a model")}</option>{data.backends.map(b=><option key={b.id} value={b.id}>{b.title}</option>)}</select></label>:<>
-+      <label>{t("Model ID")}<input aria-label={t("Model ID")}  required value={provider.model} onChange={e=>field("model",e.target.value)} placeholder={provider.kind==="deepseek"?"deepseek-chat":t("Model ID")}/></label>
++      <label>{t("Model ID")}<input aria-label={t("Model ID")}  required value={provider.model} onChange={e=>field("model",e.target.value)} placeholder={provider.kind==="deepseek"?"deepseek-flash":t("Model ID")}/></label>
 +      <label>{t("API key")}<input aria-label={t("API key")}  type="password" autoComplete="new-password" value={provider.api_key} onChange={e=>field("api_key",e.target.value)} placeholder={provider.key_configured?t("Leave blank to keep saved key"):""}/></label>
 +      {(provider.kind==="compatible"||provider.kind==="local_chat")&&<label>{t("Chat completion endpoint")}<input aria-label={t("Chat completion endpoint")}  type="url" required value={provider.endpoint} onChange={e=>field("endpoint",e.target.value)}/></label>}
 +      <label>{t("Monthly request limit")}<input aria-label={t("Monthly request limit")}  type="number" min="1" max="100000" value={provider.options.request_limit} onChange={e=>opt("request_limit",Number(e.target.value))}/></label>
 +      <label>{t("Maximum output tokens")}<input aria-label={t("Maximum output tokens")}  type="number" min="256" max="16384" value={provider.options.max_tokens} onChange={e=>opt("max_tokens",Number(e.target.value))}/></label>
++      {provider.kind==="deepseek"&&<><label>{t("DeepSeek thinking mode")}<select aria-label={t("DeepSeek thinking mode")} value={provider.options.thinking??"disabled"} onChange={e=>opt("thinking",e.target.value)}><option value="disabled">{t("Disabled for direct annotation")}</option><option value="enabled">{t("Enabled")}</option></select></label><label>{t("Temperature")}<input aria-label={t("Temperature")} type="number" min="0" max="2" step="any" disabled={provider.options.thinking==="enabled"} value={provider.options.temperature??0} onChange={e=>opt("temperature",Number(e.target.value))}/></label><p>{t("Thinking mode uses the output token budget. Temperature applies only when thinking is disabled.")}</p></>}
++
 +     </>}</div>
 +     {provider.kind!=="local"&&<><label>{t("Labeling instructions")}<textarea aria-label={t("Labeling instructions")}  rows="4" value={provider.options.prompt} onChange={e=>opt("prompt",e.target.value)}/></label><p>{t("Only text in the selected job is sent to this provider. Keys are encrypted on the server.")}</p></>}
 +     <div className="learning-actions"><button type="submit" disabled={busy}>{t("Save provider")}</button><button type="button" onClick={()=>setProvider(initialProvider)}>{t("Reset form")}</button>{provider.id&&provider.kind!=="local"&&<button type="button" disabled={busy} onClick={()=>action({action:"provider",...provider,api_key:"",clear_key:true})}>{t("Remove saved key")}</button>}</div>

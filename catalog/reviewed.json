@@ -1566,5 +1566,10 @@
   "No eligible tasks. Training requires submitted annotations; unresolved cases and holdout tasks are excluded.": "没有符合条件的样本。训练需要已提交人工标注，未复核难样本和保留评估集会被排除。",
   "Choose a non-interactive connection for batch preannotation.": "批量预标注请选择非交互式模型连接。",
   "Invalid API key. Use a single ASCII token without internal whitespace.": "密钥格式无效，请使用不含内部空格或换行的 API 密钥。",
-  "This model needs initial human annotations, training and publication before preannotation.": "该模型需要先完成人工标注、初始训练并发布，才能生成预标注。"
+  "This model needs initial human annotations, training and publication before preannotation.": "该模型需要先完成人工标注、初始训练并发布，才能生成预标注。",
+  "DeepSeek thinking mode": "DeepSeek 思考模式",
+  "Disabled for direct annotation": "关闭（直接标注）",
+  "Temperature": "采样温度",
+  "Thinking mode uses the output token budget. Temperature applies only when thinking is disabled.": "思考模式会消耗输出 Token 预算；采样温度仅在关闭思考时生效。",
+  "DeepSeek thinking mode or temperature is invalid.": "DeepSeek 思考模式或采样温度无效。"
 }
