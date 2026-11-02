@@ -40,13 +40,17 @@ docker compose up -d --wait --wait-timeout 300
 
 ### 标注文本翻译
 
-标注页右侧的「翻译」标签仅显示原文/目标语言、原文、翻译按钮和译文。引擎选择与 API 配置统一放在「账户与设置 → 翻译设置」（`/user/account/translation`），提供 Azure Translator、Google Cloud Translation NMT 和百度通用翻译。默认原文语言为自动识别、目标语言为简体中文，支持泰语等短信语言及手动切换。只在点击「翻译当前文本」时发送当前任务的原文，同一文本和语言组合复用缓存；切换任务或语言会清除旧译文。原文、实体位置和人工标注不受影响。
+标注页右侧的「翻译」标签仅显示原文/目标语言、原文、翻译按钮和译文。引擎选择与 API 配置统一放在「账户与设置 → 翻译设置」（`/user/account/translation`），提供 Azure Translator、Google Cloud Translation NMT、百度通用翻译、阿里云机器翻译和 DeepL。默认原文语言为自动识别、目标语言为简体中文，支持泰语等短信语言及手动切换。只在点击「翻译当前文本」时发送当前任务的原文，同一文本和语言组合复用缓存；切换任务或语言会清除旧译文。原文、实体位置和人工标注不受影响。
 
 组织所有者在「翻译设置」的「API 设置」中输入相应 Key；Azure 可填区域，百度需 App ID 和密钥。Key 在服务器按组织加密保存，响应不回显，浏览器不持久化密钥。空字段保留原值，「移除已保存的密钥」清除该引擎配置。翻译数据和配置保存在本地数据卷的 `translation-cache.sqlite3` 中，备份及升级时应保留整个数据卷与 Django Secret Key；更换 Secret Key 后须重新配置密钥。
 
 引擎选择保存在当前浏览器，设置页变更后返回标注页会自动同步。未手动选择引擎时，优先使用已配置且本地每月字符上限最高的引擎；都未配置时默认显示 Azure。初始本地上限为 Azure 200 万、Google 50 万、百度标准版 5 万字符；百度高级版用户可自行调整至 100 万。额度按 UTC 自然月计数，请求失败也保守计入，达到上限停止新调用。该上限不等于服务商账单，应用外使用量、套餐资格和收费由各服务商账户决定。
 
 官方套餐说明：[Azure](https://azure.microsoft.com/en-us/pricing/details/translator/)、[Google](https://cloud.google.com/products/translate/pricing)、[百度](https://fanyi-api.baidu.com/product/112)。必须先开通相应官方 API，界面不提供共享密钥。
+
+阿里云使用机器翻译通用版 `TranslateGeneral`（2018-10-12），配置有翻译权限的 RAM AccessKey ID / AccessKey Secret，通过固定杭州端点和 ACS3-HMAC-SHA256 签名调用；本地默认每月上限 100 万字符。DeepL 配置 API Key，自动模式将 `:fx` 结尾的密钥路由到 `api-free.deepl.com`，其他密钥使用 `api.deepl.com`；也可以按账户说明手动选择这两个官方地址。使用质量优先模型，支持自动识别及简繁中文目标语言映射。
+
+DeepL 默认本地每月上限为 50 万，可调整至 100 万；这只是应用的调用保护，不代表免费套餐。Developer 的 100 万字符是一次性额度，旧 API Free 套餐才是每月 50 万，Translator 网页订阅不能代替 API 订阅。云端返回额度耗尽时停止该次调用，不自动切换引擎或付费服务。详情：[阿里云计费](https://help.aliyun.com/zh/machine-translation/product-overview/billing-overview)、[DeepL 套餐](https://support.deepl.com/hc/en-us/articles/360021200939-DeepL-API-plans)。
 
 ### 独立标注工作台
 
@@ -64,7 +68,7 @@ docker compose up -d --wait --wait-timeout 300
 
 短信规则/Qwen3/GLiNER 服务支持普通预测，连接时须关闭「交互式预标注」；新版上游会跳过交互式模型的批量/普通预标注。可将 `tools/configure-sms-backends.py` 复制到容器，并以 `--project <项目ID> --service-url http://host.docker.internal:9091` 执行，创建合并、分类、NER 三个连接并修正此设置。该脚本仅适用于已运行且提供 `/classification`、`/ner` 路由的本地短信服务，不改变当前模型选择或人工结果。
 
-CI 另包含翻译权限、密钥加密、不回显、缓存、额度及三个官方请求契约测试，以及模型实际选择回归。云端请求使用模拟响应，真实密钥下的翻译质量和账户额度须在配置后验证。
+CI 另包含翻译权限、密钥加密、不回显、缓存、额度及五个官方请求契约测试（包括阿里云签名、DeepL 双端点和额度错误），以及模型实际选择回归。云端请求使用模拟响应，真实密钥下的翻译质量和账户额度须在配置后验证。
 
 SQLite 百万级任务项目若列表长时间加载，可在停止服务并备份后运行 `python tools/optimize-sqlite-listing.py --database <数据目录>/label_studio.sqlite3`，随后重新启动服务。此工具增加项目、标注数、预测数、任务 ID 的覆盖索引，使分页统计避免扫描短信正文；只增加索引，不改写任务或标注。CI 在合成数据库上执行该工具后再运行接口和浏览器回归。
 

@@ -7,6 +7,8 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
+from urllib.parse import parse_qs
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -22,6 +24,13 @@ from tasks.models import Task
 from tasks.api import TaskAPI
 from tasks import translation as tr
 from users.models import User
+
+# Independently generated ACS3 fixture for fixed UTF-8 text, timestamp and nonce.
+ALIYUN_SIGNATURE_FIXTURE = (
+    "ACS3-HMAC-SHA256 Credential=test-id,SignedHeaders=content-type;host;x-acs-action;"
+    "x-acs-content-sha256;x-acs-date;x-acs-signature-nonce;x-acs-version,"
+    "Signature=d996be7e106516e15cca4341f63ee42e7052f869b86e47d81ea4a8fc329f74ae"
+)
 
 
 class TranslationTests(unittest.TestCase):
@@ -243,6 +252,104 @@ class TranslationTests(unittest.TestCase):
             self.assertEqual(
                 session.return_value.post.call_args.kwargs["params"]["from"], "fil"
             )
+
+    def test_added_provider_credentials_are_encrypted_preserved_and_owner_only(self):
+        for engine, credentials in [
+            ("aliyun", {"access_key_id": "synthetic-id", "access_key_secret": "synthetic-secret"}),
+            ("deepl", {"key": "synthetic-deepl:fx", "api_server": "free"}),
+        ]:
+            with self.subTest(engine=engine):
+                result = self.api(tr.TranslationOptionsAPI, "post", {"engine": engine, **credentials})
+                self.assertEqual(result.status_code, 200)
+                provider = next(p for p in result.data["providers"] if p["id"] == engine)
+                self.assertTrue(provider["configured"])
+                self.assertTrue({"th", "zh", "zh-TW", "tl", "uz", "pa"} <= provider["languages"].keys())
+                self.assertNotIn("synthetic-", json.dumps(result.data))
+                con = tr._cache()
+                self.assertNotIn(b"synthetic-", con.execute("SELECT value FROM provider_config").fetchone()[0])
+                con.close()
+                tr.save_config(self.org, engine, {k: "" for k in credentials if k != "api_server"})
+                self.assertEqual(tr.read_config(self.org)[engine], credentials)
+                member = SimpleNamespace(is_authenticated=True, is_superuser=False, id=-100, active_organization=self.owner.active_organization)
+                denied = self.api(tr.TranslationOptionsAPI, "post", {"engine": engine, "clear": True}, user=member)
+                self.assertEqual(denied.status_code, 403)
+                tr.save_config(self.org, engine, {"clear": True})
+                self.assertNotIn(engine, tr.read_config(self.org))
+        self.assertFalse(tr.configured("aliyun", {"access_key_id": "incomplete"}))
+        with self.assertRaises(tr.TranslationFailure):
+            tr.save_config(self.org, "deepl", {"api_server": "https://untrusted.invalid"})
+
+    def test_aliyun_signed_form_contract_and_business_errors(self):
+        cfg = {"access_key_id": "test-id", "access_key_secret": "test-secret"}
+        with patch.object(tr.requests, "Session") as factory, patch.object(tr, "datetime") as clock, patch.object(tr.secrets, "token_hex", return_value="test-nonce"):
+            clock.now.return_value = datetime(2026, 11, 2, 0, 0, 0, tzinfo=timezone.utc)
+            response = factory.return_value.post.return_value
+            response.status_code = 200
+            response.json.return_value = {"Code": 200, "Data": {"Translated": "测试", "DetectedLanguage": "fil"}}
+            result = tr.call_provider("aliyun", cfg, "ทดสอบ & + 😀", "auto", "zh-TW")
+            self.assertEqual(result["detected_source"], "tl")
+            args, request = factory.return_value.post.call_args
+            self.assertEqual(args[0], "https://mt.cn-hangzhou.aliyuncs.com/")
+            self.assertFalse(request["allow_redirects"])
+            self.assertEqual(parse_qs(request["data"].decode()), {
+                "FormatType": ["text"], "Scene": ["general"], "SourceLanguage": ["auto"],
+                "SourceText": ["ทดสอบ & + 😀"], "TargetLanguage": ["zh-tw"],
+            })
+            headers = request["headers"]
+            self.assertEqual(headers["x-acs-action"], "TranslateGeneral")
+            self.assertEqual(headers["x-acs-version"], "2018-10-12")
+            self.assertEqual(headers["x-acs-content-sha256"], hashlib.sha256(request["data"]).hexdigest())
+            self.assertEqual(headers["Authorization"], ALIYUN_SIGNATURE_FIXTURE)
+            self.assertNotIn("test-secret", str(request))
+            tr.call_provider("aliyun", cfg, "test", "tl", "zh")
+            self.assertEqual(parse_qs(factory.return_value.post.call_args.kwargs["data"].decode())["SourceLanguage"], ["fil"])
+            response.json.return_value = {"Code": 10004, "Message": "private provider detail"}
+            with self.assertRaises(tr.TranslationFailure) as error:
+                tr.call_provider("aliyun", cfg, "test", "auto", "zh")
+            self.assertNotIn("private", str(error.exception))
+
+    def test_deepl_servers_language_mapping_and_quota(self):
+        with patch.object(tr.requests, "Session") as factory:
+            response = factory.return_value.post.return_value
+            response.status_code = 200
+            response.json.return_value = {"translations": [{"text": "测试", "detected_source_language": "TH"}]}
+            for cfg, host in [
+                ({"key": "test:fx"}, "api-free.deepl.com"),
+                ({"key": "test"}, "api.deepl.com"),
+                ({"key": "test:fx", "api_server": "standard"}, "api.deepl.com"),
+                ({"key": "test", "api_server": "free"}, "api-free.deepl.com"),
+            ]:
+                result = tr.call_provider("deepl", cfg, "ทดสอบ", "auto", "zh")
+                args, request = factory.return_value.post.call_args
+                self.assertEqual(args[0], f"https://{host}/v2/translate")
+                self.assertFalse(request["allow_redirects"])
+                self.assertEqual(request["headers"]["Authorization"], "DeepL-Auth-Key " + cfg["key"])
+                self.assertEqual(request["json"], {"text": ["ทดสอบ"], "target_lang": "ZH-HANS", "model_type": "quality_optimized"})
+                self.assertEqual(result["detected_source"], "th")
+            tr.call_provider("deepl", {"key": "test"}, "你好", "zh-TW", "en")
+            self.assertEqual(factory.return_value.post.call_args.kwargs["json"]["source_lang"], "ZH")
+            self.assertEqual(factory.return_value.post.call_args.kwargs["json"]["target_lang"], "EN-US")
+            for target, expected in [("zh-TW", "ZH-HANT"), ("pt", "PT-PT"), ("pa", "PA")]:
+                tr.call_provider("deepl", {"key": "test"}, "test", "en", target)
+                self.assertEqual(factory.return_value.post.call_args.kwargs["json"]["target_lang"], expected)
+            for status, expected in [(456, 429), (403, 503), (429, 429), (400, 400), (302, 502)]:
+                response.status_code = status
+                with self.assertRaises(tr.TranslationFailure) as error:
+                    tr.call_provider("deepl", {"key": "test"}, "test", "auto", "zh")
+                self.assertEqual(error.exception.status, expected)
+
+    def test_added_provider_cache_and_usage_are_account_scoped(self):
+        for engine, credentials in [("aliyun", {"access_key_id": "account-a", "access_key_secret": "secret"}), ("deepl", {"key": "account-a:fx"})]:
+            tr.save_config(self.org, engine, {**credentials, "monthly_limit": 3})
+            with patch.object(tr, "call_provider", return_value={"translation": "测试", "detected_source": "th"}) as call:
+                self.assertFalse(tr.translate_text("ก😀", engine, "auto", "zh", self.org)["cached"])
+                self.assertTrue(tr.translate_text("ก😀", engine, "auto", "zh", self.org)["cached"])
+                self.assertEqual(call.call_count, 1)
+                with self.assertRaises(tr.TranslationFailure):
+                    tr.translate_text("new", engine, "auto", "zh", self.org)
+                identity = "access_key_id" if engine == "aliyun" else "key"
+                tr.save_config(self.org, engine, {identity: "account-b"})
+                self.assertFalse(tr.translate_text("ก😀", engine, "auto", "zh", self.org)["cached"])
 
 
 class SelectedModelTests(unittest.TestCase):

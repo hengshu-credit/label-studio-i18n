@@ -3468,21 +3468,23 @@ index 9785528..2bbc111 100644
  def bulk_update_stats_project_tasks(tasks, project=None):
 diff --git a/label_studio/tasks/translation.py b/label_studio/tasks/translation.py
 new file mode 100644
-index 0000000..e48420b
+index 0000000..3fabd5f
 --- /dev/null
 +++ b/label_studio/tasks/translation.py
-@@ -0,0 +1,472 @@
+@@ -0,0 +1,561 @@
 +"""Authenticated, on-demand text translation with explicit engine selection and local limits."""
 +
 +import hashlib
 +import base64
 +import html
++import hmac
 +import json
 +from pathlib import Path
 +import secrets
 +import sqlite3
 +import time
 +from datetime import datetime, timezone
++from urllib.parse import urlencode
 +from cryptography.fernet import Fernet, InvalidToken
 +
 +import requests
@@ -3535,6 +3537,13 @@ index 0000000..e48420b
 +    "azure": {"label": "Azure Translator F0", "free_characters": 2000000},
 +    "baidu": {"label": "Baidu Translate", "free_characters": 1000000},
 +    "google": {"label": "Google Cloud Translation NMT", "free_characters": 500000},
++    "aliyun": {"label": "Alibaba Cloud Machine Translation", "free_characters": 1000000},
++    # This is a local monthly safety cap, not a claim of recurring free DeepL usage.
++    "deepl": {"label": "DeepL", "free_characters": 1000000},
++}
++DEEPL_SERVERS = {
++    "standard": "https://api.deepl.com/v2/translate",
++    "free": "https://api-free.deepl.com/v2/translate",
 +}
 +
 +
@@ -3572,12 +3581,16 @@ index 0000000..e48420b
 +    if engine not in ENGINES:
 +        raise TranslationFailure("Unsupported translation engine.")
 +    changes = {}
-+    for field in ("key", "region", "app_id", "secret"):
++    for field in ("key", "region", "app_id", "secret", "access_key_id", "access_key_secret"):
 +        value = body.get(field, "")
 +        if not isinstance(value, str) or len(value) > 4096:
 +            raise TranslationFailure("Invalid API configuration.")
 +        if value.strip():
 +            changes[field] = value.strip()
++    if engine == "deepl" and "api_server" in body:
++        if body["api_server"] not in ("auto", *DEEPL_SERVERS):
++            raise TranslationFailure("Invalid API configuration.")
++        changes["api_server"] = body["api_server"]
 +    if "monthly_limit" in body:
 +        try:
 +            limit = int(body["monthly_limit"])
@@ -3613,6 +3626,8 @@ index 0000000..e48420b
 +
 +
 +def configured(engine, cfg):
++    if engine == "aliyun":
++        return bool(cfg.get("access_key_id") and cfg.get("access_key_secret"))
 +    return (
 +        bool(cfg.get("app_id") and cfg.get("secret"))
 +        if engine == "baidu"
@@ -3622,7 +3637,7 @@ index 0000000..e48420b
 +
 +def limit_for(engine, cfg):
 +    # Baidu defaults conservatively to the standard plan; advanced users can set 1,000,000.
-+    default = 50000 if engine == "baidu" else ENGINES[engine]["free_characters"]
++    default = {"baidu": 50000, "deepl": 500000}.get(engine, ENGINES[engine]["free_characters"])
 +    return min(
 +        max(int(cfg.get("monthly_limit", default)), 0),
 +        ENGINES[engine]["free_characters"],
@@ -3640,6 +3655,7 @@ index 0000000..e48420b
 +                **info,
 +                "configured": configured(key, cfg),
 +                "monthly_limit": limit_for(key, cfg),
++                **({"api_server": cfg.get("api_server", "auto")} if key == "deepl" else {}),
 +                "languages": {
 +                    k: v
 +                    for k, v in LANGUAGES.items()
@@ -3668,6 +3684,43 @@ index 0000000..e48420b
 +      CREATE TABLE IF NOT EXISTS provider_config(organization_id INTEGER PRIMARY KEY,value BLOB NOT NULL);"""
 +    )
 +    return con
++
++
++def aliyun_request(cfg, text, source, target):
++    """Sign the exact form bytes with Alibaba Cloud OpenAPI ACS3-HMAC-SHA256."""
++    code = lambda value: {"zh-TW": "zh-tw", "tl": "fil"}.get(value, value)
++    body = urlencode({
++        "FormatType": "text", "Scene": "general", "SourceLanguage": code(source),
++        "SourceText": text, "TargetLanguage": code(target),
++    }).encode("utf-8")
++    digest = hashlib.sha256(body).hexdigest()
++    headers = {
++        "content-type": "application/x-www-form-urlencoded",
++        "host": "mt.cn-hangzhou.aliyuncs.com",
++        "x-acs-action": "TranslateGeneral",
++        "x-acs-version": "2018-10-12",
++        "x-acs-date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
++        "x-acs-signature-nonce": secrets.token_hex(16),
++        "x-acs-content-sha256": digest,
++    }
++    names = sorted(headers)
++    signed = ";".join(names)
++    canonical_headers = "".join(f"{name}:{headers[name]}\n" for name in names)
++    canonical = "\n".join(["POST", "/", "", canonical_headers, signed, digest])
++    to_sign = "ACS3-HMAC-SHA256\n" + hashlib.sha256(canonical.encode()).hexdigest()
++    signature = hmac.new(cfg["access_key_secret"].encode(), to_sign.encode(), hashlib.sha256).hexdigest()
++    headers["Authorization"] = (
++        f"ACS3-HMAC-SHA256 Credential={cfg['access_key_id']},SignedHeaders={signed},Signature={signature}"
++    )
++    headers["Accept"] = "application/json"
++    return body, headers
++
++
++def deepl_server(cfg):
++    server = cfg.get("api_server", "auto")
++    if server == "auto":
++        server = "free" if cfg["key"].endswith(":fx") else "standard"
++    return DEEPL_SERVERS[server]
 +
 +
 +def call_provider(engine, cfg, text, source, target):
@@ -3708,7 +3761,26 @@ index 0000000..e48420b
 +                timeout=(10, 45),
 +                allow_redirects=False,
 +            )
-+        else:
++        elif engine == "aliyun":
++            body, headers = aliyun_request(cfg, text, source, target)
++            response = session.post(
++                "https://mt.cn-hangzhou.aliyuncs.com/", data=body, headers=headers,
++                timeout=(10, 45), allow_redirects=False,
++            )
++        elif engine == "deepl":
++            body = {
++                "text": [text],
++                "target_lang": {"zh": "ZH-HANS", "zh-TW": "ZH-HANT", "en": "EN-US", "pt": "PT-PT"}.get(target, target.upper()),
++                "model_type": "quality_optimized",
++            }
++            if source != "auto":
++                body["source_lang"] = "ZH" if source in ("zh", "zh-TW") else source.upper()
++            response = session.post(
++                deepl_server(cfg), json=body,
++                headers={"Authorization": "DeepL-Auth-Key " + cfg["key"]},
++                timeout=(10, 45), allow_redirects=False,
++            )
++        elif engine == "baidu":
 +            salt = secrets.token_hex(16)
 +            signature = hashlib.md5(
 +                (cfg["app_id"] + text + salt + cfg["secret"]).encode("utf-8")
@@ -3726,6 +3798,10 @@ index 0000000..e48420b
 +                timeout=(10, 45),
 +                allow_redirects=False,
 +            )
++        else:
++            raise TranslationFailure("Unsupported translation engine.")
++        if engine == "deepl" and response.status_code == 456:
++            raise TranslationFailure("Translation provider quota has been reached. Check your API account.", 429)
 +        if response.status_code == 429:
 +            raise TranslationFailure(
 +                "Translation provider rate limit reached. Try again later.", 429
@@ -3734,6 +3810,8 @@ index 0000000..e48420b
 +            raise TranslationFailure(
 +                "Translation credentials or API permissions are invalid.", 503
 +            )
++        if response.status_code == 400:
++            raise TranslationFailure("Translation provider rejected the request. Check the account quota and language pair.", 400)
 +        if response.status_code != 200:
 +            raise TranslationFailure("Translation provider is unavailable.", 502)
 +        data = response.json()
@@ -3749,6 +3827,17 @@ index 0000000..e48420b
 +            translated = html.unescape(item["translatedText"])
 +            detected = item.get("detectedSourceLanguage", source)
 +            detected = "zh" if detected == "zh-CN" else detected
++        elif engine == "aliyun":
++            if str(data.get("Code")) != "200":
++                raise TranslationFailure("Translation provider rejected the request. Check the account quota and language pair.", 502)
++            translated = data["Data"]["Translated"]
++            detected = data["Data"].get("DetectedLanguage") or source
++            detected = {"zh-tw": "zh-TW", "fil": "tl"}.get(detected, detected)
++        elif engine == "deepl":
++            item = data["translations"][0]
++            translated = item["text"]
++            detected = item.get("detected_source_language", source).lower()
++            detected = {"zh-hans": "zh", "zh-hant": "zh-TW", "en-us": "en", "en-gb": "en", "pt-pt": "pt", "pt-br": "pt"}.get(detected, detected)
 +        else:
 +            if "error_code" in data:
 +                raise TranslationFailure(
@@ -3817,7 +3906,7 @@ index 0000000..e48420b
 +    account = (
 +        engine
 +        + ":"
-+        + hashlib.sha256(str(cfg.get("key") or cfg.get("app_id")).encode()).hexdigest()
++        + hashlib.sha256(str(cfg.get("access_key_id") if engine == "aliyun" else cfg.get("key") or cfg.get("app_id")).encode()).hexdigest()
 +    )
 +    key = hashlib.sha256(
 +        json.dumps(
@@ -13268,10 +13357,10 @@ index 0000000..1371d00
 +.settings .error { color: var(--color-negative-content); }
 diff --git a/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.tsx b/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.tsx
 new file mode 100644
-index 0000000..72f510a
+index 0000000..3b6e2b8
 --- /dev/null
 +++ b/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.tsx
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,110 @@
 +import { useEffect, useState } from "react";
 +import { uiT as t } from "../../../../i18n/ui";
 +import {
@@ -13280,7 +13369,7 @@ index 0000000..72f510a
 +} from "../../../../utils/translation";
 +import styles from "./TranslationSettings.module.css";
 +
-+const emptyCredentials = { key: "", region: "", app_id: "", secret: "" };
++const emptyCredentials = { key: "", region: "", app_id: "", secret: "", access_key_id: "", access_key_secret: "" };
 +
 +export const TranslationSettings = () => {
 +  const [providers, setProviders] = useState<TranslationProvider[]>([]);
@@ -13288,6 +13377,7 @@ index 0000000..72f510a
 +  const [canConfigure, setCanConfigure] = useState(false);
 +  const [credentials, setCredentials] = useState(emptyCredentials);
 +  const [monthlyLimit, setMonthlyLimit] = useState(0);
++  const [apiServer, setApiServer] = useState("auto");
 +  const [saving, setSaving] = useState(false);
 +  const [saved, setSaved] = useState(false);
 +  const [error, setError] = useState("");
@@ -13309,7 +13399,8 @@ index 0000000..72f510a
 +  useEffect(() => {
 +    setCredentials(emptyCredentials);
 +    setMonthlyLimit(provider?.monthly_limit || 0);
-+  }, [engine, provider?.monthly_limit]);
++    setApiServer(provider?.api_server || "auto");
++  }, [engine, provider?.monthly_limit, provider?.api_server]);
 +
 +  function changeEngine(value: string) {
 +    setEngine(value);
@@ -13325,7 +13416,7 @@ index 0000000..72f510a
 +      const response = await fetch("/api/tasks/translation-options/", {
 +        method: "POST", credentials: "same-origin",
 +        headers: { "Content-Type": "application/json", "X-CSRFToken": translationCsrf() },
-+        body: JSON.stringify({ engine, ...credentials, monthly_limit: monthlyLimit, clear }),
++        body: JSON.stringify({ engine, ...credentials, monthly_limit: monthlyLimit, ...(engine === "deepl" ? { api_server: apiServer } : {}), clear }),
 +      });
 +      const data = await response.json();
 +      if (!response.ok) throw Error(data.detail || "Unable to save API configuration.");
@@ -13343,7 +13434,7 @@ index 0000000..72f510a
 +    <label>{t("Translation engine")}
 +      <select aria-label={t("Translation engine")} value={engine} disabled={saving || !providers.length} onChange={event => changeEngine(event.target.value)}>
 +        {!providers.length && <option value="">{t("Loading...")}</option>}
-+        {providers.map(item => <option key={item.id} value={item.id}>{item.label}{item.configured ? "" : ` (${t("Not configured")})`}</option>)}
++        {providers.map(item => <option key={item.id} value={item.id}>{t(item.label)}{item.configured ? "" : ` (${t("Not configured")})`}</option>)}
 +      </select>
 +    </label>
 +    {provider && !canConfigure && <p role="status">{t("Ask the organization owner to configure this translation engine.")}</p>}
@@ -13351,11 +13442,23 @@ index 0000000..72f510a
 +      <fieldset disabled={saving}>
 +        <legend>{t("API settings")}</legend>
 +        <p>{t("Keys are encrypted on the server and are never returned to the browser. Leave a field blank to keep its saved value.")}</p>
-+        {engine === "baidu" ? <>
++        {engine === "aliyun" ? <>
++          <label>AccessKey ID<input aria-label="AccessKey ID" autoComplete="off" value={credentials.access_key_id} onChange={event => setCredentials(value => ({ ...value, access_key_id: event.target.value }))} /></label>
++          <label>AccessKey Secret<input aria-label="AccessKey Secret" type="password" autoComplete="new-password" value={credentials.access_key_secret} onChange={event => setCredentials(value => ({ ...value, access_key_secret: event.target.value }))} /></label>
++          <p>{t("Enable Alibaba Cloud Machine Translation General Edition and use a RAM AccessKey with translation permissions.")}</p>
++        </> : engine === "baidu" ? <>
 +          <label>App ID<input aria-label="App ID" autoComplete="off" value={credentials.app_id} onChange={event => setCredentials(value => ({ ...value, app_id: event.target.value }))} /></label>
 +          <label>{t("Secret Key")}<input aria-label={t("Secret Key")} type="password" autoComplete="new-password" value={credentials.secret} onChange={event => setCredentials(value => ({ ...value, secret: event.target.value }))} /></label>
 +        </> : <label>API Key<input aria-label="API Key" type="password" autoComplete="new-password" value={credentials.key} onChange={event => setCredentials(value => ({ ...value, key: event.target.value }))} /></label>}
 +        {engine === "azure" && <label>{t("Azure region")}<input aria-label={t("Azure region")} autoComplete="off" value={credentials.region} onChange={event => setCredentials(value => ({ ...value, region: event.target.value }))} /></label>}
++        {engine === "deepl" && <>
++          <label>{t("DeepL API server")}<select aria-label={t("DeepL API server")} value={apiServer} onChange={event => setApiServer(event.target.value)}>
++            <option value="auto">{t("Automatic (based on API key)")}</option>
++            <option value="standard">api.deepl.com</option>
++            <option value="free">api-free.deepl.com</option>
++          </select></label>
++          <p>{t("Use a DeepL API key, not a Translator subscription. Developer trial credits are a one-time allowance and do not reset monthly. Select the server specified in your DeepL account.")}</p>
++        </>}
 +        <label>{t("Local monthly character limit")}<input aria-label={t("Local monthly character limit")} type="number" required min={0} max={provider.free_characters} value={monthlyLimit} onChange={event => setMonthlyLimit(Number(event.target.value))} /></label>
 +        <p>{t("Calls stop at this local limit. Provider billing and usage outside this application are separate.")}</p>
 +        <div className={styles.actions}>
@@ -13445,16 +13548,17 @@ index 1ee210c..3fac317 100644
          description: PersonalAccessTokenDescription,
 diff --git a/web/libs/app-common/src/utils/translation.ts b/web/libs/app-common/src/utils/translation.ts
 new file mode 100644
-index 0000000..b8d64aa
+index 0000000..f9ab58d
 --- /dev/null
 +++ b/web/libs/app-common/src/utils/translation.ts
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,49 @@
 +export type TranslationProvider = {
 +  id: string;
 +  label: string;
 +  configured: boolean;
 +  monthly_limit: number;
 +  free_characters: number;
++  api_server?: string;
 +  languages: Record<string, string>;
 +};
 +

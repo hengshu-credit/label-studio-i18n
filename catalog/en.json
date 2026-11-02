@@ -2192,5 +2192,11 @@
   "Original text": "Original text",
   "Translated text": "Translated text",
   "Translation settings": "Translation settings",
-  "Translation will appear here": "Translation will appear here"
+  "Translation will appear here": "Translation will appear here",
+  "Alibaba Cloud Machine Translation": "Alibaba Cloud Machine Translation",
+  "DeepL API server": "DeepL API server",
+  "Automatic (based on API key)": "Automatic (based on API key)",
+  "Enable Alibaba Cloud Machine Translation General Edition and use a RAM AccessKey with translation permissions.": "Enable Alibaba Cloud Machine Translation General Edition and use a RAM AccessKey with translation permissions.",
+  "Use a DeepL API key, not a Translator subscription. Developer trial credits are a one-time allowance and do not reset monthly. Select the server specified in your DeepL account.": "Use a DeepL API key, not a Translator subscription. Developer trial credits are a one-time allowance and do not reset monthly. Select the server specified in your DeepL account.",
+  "Translation provider quota has been reached. Check your API account.": "Translation provider quota has been reached. Check your API account."
 }

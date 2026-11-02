@@ -1789,5 +1789,11 @@
   "Original text": "原文",
   "Translated text": "译文",
   "Translation settings": "翻译设置",
-  "Translation will appear here": "译文将显示在这里"
+  "Translation will appear here": "译文将显示在这里",
+  "Alibaba Cloud Machine Translation": "阿里云机器翻译",
+  "DeepL API server": "DeepL API 服务地址",
+  "Automatic (based on API key)": "自动（根据 API Key 判断）",
+  "Enable Alibaba Cloud Machine Translation General Edition and use a RAM AccessKey with translation permissions.": "请开通阿里云机器翻译通用版，并使用具有翻译权限的 RAM AccessKey。",
+  "Use a DeepL API key, not a Translator subscription. Developer trial credits are a one-time allowance and do not reset monthly. Select the server specified in your DeepL account.": "请使用 DeepL API Key，网页翻译订阅不能用于 API。Developer 试用为一次性额度，不会按月恢复。请选择 DeepL 账户指定的服务地址。",
+  "Translation provider quota has been reached. Check your API account.": "翻译服务商额度已耗尽，请检查 API 账户。"
 }

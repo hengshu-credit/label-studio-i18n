@@ -94,6 +94,56 @@ test('translation settings keep API controls owner-only and support English',asy
   await expect(settings.getByRole('status')).toHaveText('Ask the organization owner to configure this translation engine.');
 });
 
+test('Alibaba Cloud and DeepL settings persist without exposing credentials',async({page,context})=>{
+  await login(page,context);
+  await page.goto('/user/account/translation');
+  const settings=page.getByTestId('translation-settings');
+  const engine=settings.getByLabel('翻译引擎');
+  await expect(engine.locator('option')).toContainText(['Azure Translator F0','Baidu Translate','Google Cloud Translation NMT','阿里云机器翻译','DeepL']);
+  await engine.selectOption('aliyun');
+  await settings.getByLabel('AccessKey ID',{exact:true}).fill('synthetic-aliyun-id');
+  await settings.getByLabel('AccessKey Secret',{exact:true}).fill('synthetic-aliyun-secret');
+  async function save(){
+    const saving=page.waitForResponse(r=>r.url().includes('/translation-options/')&&r.request().method()==='POST');
+    await settings.getByRole('button',{name:'保存 API 设置',exact:true}).click();
+    const response=await saving;
+    expect(response.status()).toBe(200);
+    expect(await response.text()).not.toContain('synthetic-');
+  }
+  await save();
+  await expect(settings.getByLabel('AccessKey ID',{exact:true})).toHaveValue('');
+  await expect(settings.getByLabel('AccessKey Secret',{exact:true})).toHaveValue('');
+  await page.screenshot({path:'artifacts/translation-aliyun.png',fullPage:true});
+  await engine.selectOption('deepl');
+  await settings.getByLabel('API Key',{exact:true}).fill('synthetic-deepl:fx');
+  await settings.getByLabel('DeepL API 服务地址').selectOption('free');
+  await expect(settings).toContainText('一次性额度');
+  await save();
+  await page.reload();
+  await expect(engine).toHaveValue('deepl');
+  await expect(settings.getByLabel('DeepL API 服务地址')).toHaveValue('free');
+  await expect(settings.getByLabel('API Key',{exact:true})).toHaveValue('');
+  expect(await page.evaluate(()=>JSON.stringify(localStorage))).not.toContain('synthetic-');
+  await page.screenshot({path:'artifacts/translation-deepl.png',fullPage:true});
+  await page.goto('/projects/1/data?task=1');
+  await page.locator('[id="翻译-draggable"]').getByText('翻译',{exact:true}).click();
+  const panel=page.getByTestId('translation-panel');
+  await page.route('**/api/tasks/1/translate/',async route=>{
+    expect(route.request().postDataJSON().engine).toBe('deepl');
+    await route.fulfill({json:{task_id:1,translation:'DeepL 合成译文',engine:'deepl',detected_source:'en',target:'zh',cached:false}});
+  });
+  await panel.getByRole('button',{name:'翻译当前文本',exact:true}).click();
+  await expect(panel.getByLabel('翻译结果',{exact:true})).toHaveValue('DeepL 合成译文');
+  // Leave the shared synthetic fixture unconfigured for other browser tests.
+  await page.goto('/user/account/translation');
+  for(const provider of ['aliyun','deepl']){
+    await engine.selectOption(provider);
+    const clearing=page.waitForResponse(r=>r.url().includes('/translation-options/')&&r.request().method()==='POST');
+    await settings.getByRole('button',{name:'移除已保存密钥',exact:true}).click();
+    expect((await clearing).ok()).toBeTruthy();
+  }
+});
+
 test('selected live model survives save and reload',async({page,context})=>{
   await login(page,context);
   await page.goto('/projects/1/settings/annotation');
