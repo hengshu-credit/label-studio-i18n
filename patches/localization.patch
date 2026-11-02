@@ -13236,8 +13236,127 @@ index e649818..cc3de07 100644
          </CardHeader>
          <CardContent>
            <PersonalInfo />
+diff --git a/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.module.css b/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.module.css
+new file mode 100644
+index 0000000..1371d00
+--- /dev/null
++++ b/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.module.css
+@@ -0,0 +1,11 @@
++.settings { display: flex; flex-direction: column; gap: 20px; max-width: 560px; }
++.settings label { display: flex; flex-direction: column; gap: 8px; font-weight: 500; }
++.settings select, .settings input { width: 100%; min-width: 0; box-sizing: border-box; padding: 10px 12px; border: 1px solid var(--color-neutral-border); border-radius: 6px; color: var(--color-neutral-content); background: var(--color-neutral-surface); font: inherit; }
++.settings p { margin: 0; font-size: 13px; line-height: 1.6; color: var(--color-neutral-content-subtler); }
++.settings fieldset { display: flex; flex-direction: column; gap: 16px; min-width: 0; margin: 0; padding: 20px; border: 1px solid var(--color-neutral-border); border-radius: 8px; }
++.settings legend { padding: 0 6px; font-weight: 600; }
++.actions { display: flex; flex-wrap: wrap; gap: 10px; }
++.actions button { padding: 8px 14px; border: 1px solid var(--color-neutral-border); border-radius: 6px; cursor: pointer; }
++.actions button[type="submit"] { background: var(--color-primary-surface); color: var(--color-primary-surface-content); }
++.settings :disabled { opacity: .6; cursor: not-allowed; }
++.settings .error { color: var(--color-negative-content); }
+diff --git a/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.tsx b/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.tsx
+new file mode 100644
+index 0000000..72f510a
+--- /dev/null
++++ b/web/libs/app-common/src/pages/AccountSettings/sections/Translation/TranslationSettings.tsx
+@@ -0,0 +1,96 @@
++import { useEffect, useState } from "react";
++import { uiT as t } from "../../../../i18n/ui";
++import {
++  type TranslationProvider, resolveTranslationPreferences, writeTranslationPreferences,
++  translationCsrf, notifyTranslationSettings,
++} from "../../../../utils/translation";
++import styles from "./TranslationSettings.module.css";
++
++const emptyCredentials = { key: "", region: "", app_id: "", secret: "" };
++
++export const TranslationSettings = () => {
++  const [providers, setProviders] = useState<TranslationProvider[]>([]);
++  const [engine, setEngine] = useState("");
++  const [canConfigure, setCanConfigure] = useState(false);
++  const [credentials, setCredentials] = useState(emptyCredentials);
++  const [monthlyLimit, setMonthlyLimit] = useState(0);
++  const [saving, setSaving] = useState(false);
++  const [saved, setSaved] = useState(false);
++  const [error, setError] = useState("");
++  const provider = providers.find(item => item.id === engine);
++
++  useEffect(() => {
++    const controller = new AbortController();
++    fetch("/api/tasks/translation-options/", { credentials: "same-origin", signal: controller.signal })
++      .then(async response => {
++        const data = await response.json();
++        if (!response.ok) throw Error(data.detail || "Unable to load translation engines.");
++        setProviders(data.providers);
++        setCanConfigure(data.can_configure);
++        setEngine(resolveTranslationPreferences(data.providers, data.default_engine).engine);
++      }).catch(error => { if (error.name !== "AbortError") setError(error.message); });
++    return () => controller.abort();
++  }, []);
++
++  useEffect(() => {
++    setCredentials(emptyCredentials);
++    setMonthlyLimit(provider?.monthly_limit || 0);
++  }, [engine, provider?.monthly_limit]);
++
++  function changeEngine(value: string) {
++    setEngine(value);
++    setSaved(false);
++    setError("");
++    writeTranslationPreferences({ engine: value });
++    notifyTranslationSettings();
++  }
++
++  async function saveCredentials(clear = false) {
++    setSaving(true); setSaved(false); setError("");
++    try {
++      const response = await fetch("/api/tasks/translation-options/", {
++        method: "POST", credentials: "same-origin",
++        headers: { "Content-Type": "application/json", "X-CSRFToken": translationCsrf() },
++        body: JSON.stringify({ engine, ...credentials, monthly_limit: monthlyLimit, clear }),
++      });
++      const data = await response.json();
++      if (!response.ok) throw Error(data.detail || "Unable to save API configuration.");
++      setProviders(data.providers);
++      setCredentials(emptyCredentials);
++      writeTranslationPreferences({ engine });
++      notifyTranslationSettings();
++      setSaved(true);
++    } catch (error: any) { setError(error.message); }
++    finally { setSaving(false); }
++  }
++
++  return <div className={styles.settings} data-testid="translation-settings">
++    <p>{t("Choose the translation engine for this browser. API settings are shared by your organization.")}</p>
++    <label>{t("Translation engine")}
++      <select aria-label={t("Translation engine")} value={engine} disabled={saving || !providers.length} onChange={event => changeEngine(event.target.value)}>
++        {!providers.length && <option value="">{t("Loading...")}</option>}
++        {providers.map(item => <option key={item.id} value={item.id}>{item.label}{item.configured ? "" : ` (${t("Not configured")})`}</option>)}
++      </select>
++    </label>
++    {provider && !canConfigure && <p role="status">{t("Ask the organization owner to configure this translation engine.")}</p>}
++    {provider && canConfigure && <form onSubmit={event => { event.preventDefault(); void saveCredentials(); }}>
++      <fieldset disabled={saving}>
++        <legend>{t("API settings")}</legend>
++        <p>{t("Keys are encrypted on the server and are never returned to the browser. Leave a field blank to keep its saved value.")}</p>
++        {engine === "baidu" ? <>
++          <label>App ID<input aria-label="App ID" autoComplete="off" value={credentials.app_id} onChange={event => setCredentials(value => ({ ...value, app_id: event.target.value }))} /></label>
++          <label>{t("Secret Key")}<input aria-label={t("Secret Key")} type="password" autoComplete="new-password" value={credentials.secret} onChange={event => setCredentials(value => ({ ...value, secret: event.target.value }))} /></label>
++        </> : <label>API Key<input aria-label="API Key" type="password" autoComplete="new-password" value={credentials.key} onChange={event => setCredentials(value => ({ ...value, key: event.target.value }))} /></label>}
++        {engine === "azure" && <label>{t("Azure region")}<input aria-label={t("Azure region")} autoComplete="off" value={credentials.region} onChange={event => setCredentials(value => ({ ...value, region: event.target.value }))} /></label>}
++        <label>{t("Local monthly character limit")}<input aria-label={t("Local monthly character limit")} type="number" required min={0} max={provider.free_characters} value={monthlyLimit} onChange={event => setMonthlyLimit(Number(event.target.value))} /></label>
++        <p>{t("Calls stop at this local limit. Provider billing and usage outside this application are separate.")}</p>
++        <div className={styles.actions}>
++          <button type="submit">{t(saving ? "Saving..." : "Save API settings")}</button>
++          {provider.configured && <button type="button" onClick={() => saveCredentials(true)}>{t("Remove saved key")}</button>}
++        </div>
++      </fieldset>
++    </form>}
++    {saved && <p role="status">{t("API settings saved. Existing keys are not displayed.")}</p>}
++    {error && <p role="alert" className={styles.error}>{t(error)}</p>}
++  </div>;
++};
 diff --git a/web/libs/app-common/src/pages/AccountSettings/sections/index.tsx b/web/libs/app-common/src/pages/AccountSettings/sections/index.tsx
-index 1ee210c..0c203b3 100644
+index 1ee210c..3fac317 100644
 --- a/web/libs/app-common/src/pages/AccountSettings/sections/index.tsx
 +++ b/web/libs/app-common/src/pages/AccountSettings/sections/index.tsx
 @@ -1,3 +1,4 @@
@@ -13245,15 +13364,16 @@ index 1ee210c..0c203b3 100644
  import { Profile } from "./Profile";
  import { EmailPreferences } from "./EmailPreferences";
  import { PersonalAccessToken, PersonalAccessTokenDescription } from "./PersonalAccessToken";
-@@ -10,6 +11,7 @@ import { ABILITY, type AuthPermissions } from "@humansignal/core/providers/AuthP
+@@ -10,6 +11,8 @@ import { ABILITY, type AuthPermissions } from "@humansignal/core/providers/AuthP
  import { ff, isViewOnlyUser } from "@humansignal/core";
  import type { APIUser } from "@humansignal/core/types/user";
  import { Badge } from "@humansignal/ui";
 +import { LanguageDescription, LanguageSectionTitle, LanguageSettings } from "./Language/Language";
++import { TranslationSettings } from "./Translation/TranslationSettings";
  
  export type SectionType = {
    title: string | React.ReactNode;
-@@ -30,20 +32,19 @@ export const accountSettingsSections = (
+@@ -30,20 +33,20 @@ export const accountSettingsSections = (
  
    return [
      {
@@ -13266,6 +13386,7 @@ index 1ee210c..0c203b3 100644
      // Enterprise-injected sections (e.g. workforce "Skills & Expertise") render right after Profile.
      ...extraSections,
 +    { title: <LanguageSectionTitle />, id: "language", component: LanguageSettings, description: LanguageDescription },
++    { title: __uiT("Translation settings"), id: "translation", component: TranslationSettings },
      !isViewOnly && {
        title: (
          <div className="flex items-center gap-tight">
@@ -13278,7 +13399,7 @@ index 1ee210c..0c203b3 100644
          </div>
        ),
        id: "hotkeys",
-@@ -51,26 +52,26 @@ export const accountSettingsSections = (
+@@ -51,26 +54,26 @@ export const accountSettingsSections = (
        rendersOwnCards: true,
      },
      {
@@ -13309,6 +13430,60 @@ index 1ee210c..0c203b3 100644
          id: "legacy-token",
          component: PersonalAccessToken,
          description: PersonalAccessTokenDescription,
+diff --git a/web/libs/app-common/src/utils/translation.ts b/web/libs/app-common/src/utils/translation.ts
+new file mode 100644
+index 0000000..b8d64aa
+--- /dev/null
++++ b/web/libs/app-common/src/utils/translation.ts
+@@ -0,0 +1,48 @@
++export type TranslationProvider = {
++  id: string;
++  label: string;
++  configured: boolean;
++  monthly_limit: number;
++  free_characters: number;
++  languages: Record<string, string>;
++};
++
++export type TranslationPreferences = { engine: string; source: string; target: string };
++export const translationStorageKey = "label-studio.translation-preferences";
++export const translationSettingsEvent = "label-studio.translation-settings-changed";
++export const translationRevisionKey = "label-studio.translation-settings-revision";
++
++export function notifyTranslationSettings() {
++  try { localStorage.setItem(translationRevisionKey, `${Date.now()}-${Math.random()}`); } catch {}
++  window.dispatchEvent(new Event(translationSettingsEvent));
++}
++
++export function readTranslationPreferences(): TranslationPreferences {
++  let saved: Partial<TranslationPreferences> = {};
++  try { saved = JSON.parse(localStorage.getItem(translationStorageKey) || "{}") || {}; } catch {}
++  return {
++    engine: typeof saved.engine === "string" ? saved.engine : "",
++    source: typeof saved.source === "string" ? saved.source : "auto",
++    target: typeof saved.target === "string" ? saved.target : "zh",
++  };
++}
++
++export function writeTranslationPreferences(changes: Partial<TranslationPreferences>) {
++  const preferences = { ...readTranslationPreferences(), ...changes };
++  try { localStorage.setItem(translationStorageKey, JSON.stringify(preferences)); } catch {}
++  return preferences;
++}
++
++export function resolveTranslationPreferences(providers: TranslationProvider[], defaultEngine: string) {
++  const saved = readTranslationPreferences();
++  const provider = providers.find(item => item.id === saved.engine) || providers.find(item => item.id === defaultEngine);
++  return {
++    engine: provider?.id || "",
++    source: saved.source === "auto" || provider?.languages[saved.source] ? saved.source : "auto",
++    target: provider?.languages[saved.target] ? saved.target : "zh",
++  };
++}
++
++export function translationCsrf() {
++  return decodeURIComponent(document.cookie.split("; ").find(value => value.startsWith("csrftoken="))?.split("=").slice(1).join("=") || "");
++}
 diff --git a/web/libs/core/src/lib/topbar/AnnotationButton.tsx b/web/libs/core/src/lib/topbar/AnnotationButton.tsx
 index 13d83a9..2b03cf1 100644
 --- a/web/libs/core/src/lib/topbar/AnnotationButton.tsx
@@ -18208,162 +18383,136 @@ index 0c04780..3db771a 100644
  
 diff --git a/web/libs/editor/src/components/SidePanels/TranslationPanel/TranslationPanel.prefix.css b/web/libs/editor/src/components/SidePanels/TranslationPanel/TranslationPanel.prefix.css
 new file mode 100644
-index 0000000..2783eec
+index 0000000..538a7f3
 --- /dev/null
 +++ b/web/libs/editor/src/components/SidePanels/TranslationPanel/TranslationPanel.prefix.css
-@@ -0,0 +1,14 @@
-+.translation-panel { display:flex; flex-direction:column; gap:12px; padding:14px; min-width:0; overflow:auto; font-size:14px; }
-+.translation-panel label { display:flex; flex-direction:column; gap:6px; font-weight:600; min-width:0; }
-+.translation-panel select,.translation-panel textarea,.translation-panel input { width:100%; box-sizing:border-box; padding:8px; border:1px solid var(--color-neutral-border,#cbd5e1); border-radius:6px; color:var(--color-neutral-content,#1f2937); background:var(--color-neutral-surface,#fff); font:inherit; }
-+.translation-panel textarea { line-height:1.6; resize:vertical; min-height:150px; }
-+.translation-panel__languages { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-+.translation-panel button { padding:8px 12px; border:1px solid var(--color-neutral-border,#cbd5e1); border-radius:6px; cursor:pointer; }
-+.translation-panel__button { color:var(--color-primary-content,#fff); background:var(--color-primary-background,#4e5baa); }
-+.translation-panel button:disabled { opacity:.5; cursor:not-allowed; }
-+.translation-panel__hint { margin:0; font-size:12px; color:var(--color-neutral-content-subtler,#64748b); line-height:1.5; }
-+.translation-panel__error { margin:0; color:var(--color-negative-content,#b91c1c); }
-+.translation-panel__config { border:1px solid var(--color-neutral-border,#cbd5e1); padding:10px; border-radius:6px; }
-+.translation-panel__config summary { cursor:pointer; font-weight:600; }
-+.translation-panel__config label,.translation-panel__config p,.translation-panel__actions { margin-top:10px; }
-+.translation-panel__actions { display:flex; gap:8px; flex-wrap:wrap; }
+@@ -0,0 +1,9 @@
++.translation-panel { display:flex; flex-direction:column; gap:12px; padding:12px; min-width:0; overflow:auto; font-size:13px; }
++.translation-panel label { display:flex; flex-direction:column; gap:6px; font-weight:500; min-width:0; }
++.translation-panel select,.translation-panel textarea { width:100%; min-width:0; box-sizing:border-box; padding:8px; border:1px solid var(--color-neutral-border,#cbd5e1); border-radius:6px; color:var(--color-neutral-content,#1f2937); background:var(--color-neutral-surface,#fff); font:inherit; }
++.translation-panel textarea { line-height:1.6; resize:vertical; font-weight:400; }
++.translation-panel__languages { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:8px; }
++.translation-panel__button { padding:8px 12px; border:0; border-radius:6px; cursor:pointer; color:var(--color-primary-surface-content,#fff); background:var(--color-primary-surface,#4e5baa); }
++.translation-panel :disabled { opacity:.5; cursor:not-allowed; }
++.translation-panel__hint { font-size:12px; color:var(--color-primary-content,#4e5baa); }
++.translation-panel__error { margin:0; color:var(--color-negative-content,#b91c1c); line-height:1.5; }
 diff --git a/web/libs/editor/src/components/SidePanels/TranslationPanel/TranslationPanel.tsx b/web/libs/editor/src/components/SidePanels/TranslationPanel/TranslationPanel.tsx
 new file mode 100644
-index 0000000..b339d2f
+index 0000000..a845232
 --- /dev/null
 +++ b/web/libs/editor/src/components/SidePanels/TranslationPanel/TranslationPanel.tsx
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,113 @@
 +import { inject, observer } from "mobx-react";
-+import { useEffect, useRef, useState } from "react";
++import { useEffect, useMemo, useRef, useState } from "react";
 +import { uiT as t } from "@humansignal/app-common/i18n/ui";
++import {
++  type TranslationProvider, type TranslationPreferences, readTranslationPreferences,
++  resolveTranslationPreferences, writeTranslationPreferences, translationCsrf,
++  translationStorageKey, translationSettingsEvent, translationRevisionKey,
++} from "@humansignal/app-common/utils/translation";
 +import { cn } from "../../../utils/bem";
 +import "./TranslationPanel.prefix.css";
 +
-+type Provider = {id:string;label:string;configured:boolean;monthly_limit:number;languages:Record<string,string>};
-+type Preferences = {engine:string;source:string;target:string};
-+const storageKey = "label-studio.translation-preferences";
-+function readPreferences(): Preferences {
-+  try { return {engine:"",source:"auto",target:"zh",...JSON.parse(localStorage.getItem(storageKey)||"{}")}; }
-+  catch { return {engine:"",source:"auto",target:"zh"}; }
-+}
-+function csrf() {
-+  return decodeURIComponent(document.cookie.split("; ").find(v=>v.startsWith("csrftoken="))?.split("=").slice(1).join("=")||"");
-+}
-+
-+export const TranslationPanel = inject("store")(observer(({store,isActive=true}:any) => {
++export const TranslationPanel = inject("store")(observer(({ store, isActive = true }: any) => {
 +  const taskId = store?.task?.id;
-+  const [providers,setProviders] = useState<Provider[]>([]);
-+  const [prefs,setPrefs] = useState<Preferences>(readPreferences);
-+  const [result,setResult] = useState<any>(null);
-+  const [error,setError] = useState("");
-+  const [busy,setBusy] = useState(false);
-+  const [canConfigure,setCanConfigure] = useState(false);
-+  const [credentials,setCredentials] = useState({key:"",region:"",app_id:"",secret:""});
-+  const [monthlyLimit,setMonthlyLimit] = useState(0);
-+  const [saving,setSaving] = useState(false);
-+  const [saved,setSaved] = useState(false);
-+  const request = useRef<AbortController|null>(null);
++  const [providers, setProviders] = useState<TranslationProvider[]>([]);
++  const [prefs, setPrefs] = useState<TranslationPreferences>(readTranslationPreferences);
++  const [result, setResult] = useState<string>("");
++  const [error, setError] = useState("");
++  const [busy, setBusy] = useState(false);
++  const [loading, setLoading] = useState(true);
++  const request = useRef<AbortController | null>(null);
 +  const generation = useRef(0);
-+  const provider = providers.find(p=>p.id===prefs.engine);
++  const provider = providers.find(item => item.id === prefs.engine);
++  // Match the server's first inline Text field; never translate labels or arbitrary task metadata.
++  const fields = useMemo(() => Array.from(new DOMParser().parseFromString(store?.config || "", "text/xml").getElementsByTagName("Text"))
++    .filter(tag => (tag.getAttribute("valueType") || "text") === "text" && tag.getAttribute("value")?.startsWith("$"))
++    .map(tag => tag.getAttribute("value")!.slice(1)), [store?.config]);
++  const data = store?.task?.dataObj || {};
++  const field = fields.find(name => typeof data[name] === "string");
++  const original = field ? data[field] : "";
 +
-+  useEffect(()=>{
-+    if(!isActive)return;
-+    const controller=new AbortController();
-+    fetch("/api/tasks/translation-options/",{credentials:"same-origin",signal:controller.signal})
-+      .then(async response=>{const data=await response.json();if(!response.ok)throw Error(data.detail||"Unable to load translation engines.");return data;})
-+      .then(data=>{
-+        setProviders(data.providers);
-+        setCanConfigure(data.can_configure);
-+        setPrefs(old=>({...old,engine:data.providers.some((p:Provider)=>p.id===old.engine)?old.engine:data.default_engine}));
-+      }).catch(e=>{if(e.name!=="AbortError")setError(e.message);});
-+    return ()=>controller.abort();
-+  },[isActive]);
++  useEffect(() => {
++    if (!isActive) return;
++    let controller: AbortController;
++    function refresh() {
++      controller?.abort();
++      controller = new AbortController();
++      generation.current++; request.current?.abort(); setBusy(false); setResult(""); setError(""); setLoading(true);
++      fetch("/api/tasks/translation-options/", { credentials: "same-origin", signal: controller.signal })
++        .then(async response => {
++          const data = await response.json();
++          if (!response.ok) throw Error(data.detail || "Unable to load translation engines.");
++          return data;
++        }).then(data => {
++          setProviders(data.providers);
++          setPrefs(resolveTranslationPreferences(data.providers, data.default_engine));
++          setLoading(false);
++        }).catch(error => { if (error.name !== "AbortError") { setError(error.message); setLoading(false); } });
++    }
++    function onStorage(event: StorageEvent) {
++      if (event.key === translationStorageKey || event.key === translationRevisionKey || event.key === null) refresh();
++    }
++    refresh();
++    window.addEventListener(translationSettingsEvent, refresh);
++    window.addEventListener("storage", onStorage);
++    return () => {
++      controller?.abort();
++      window.removeEventListener(translationSettingsEvent, refresh);
++      window.removeEventListener("storage", onStorage);
++    };
++  }, [isActive]);
 +
-+  useEffect(()=>{
-+    generation.current++;request.current?.abort();setBusy(false);setResult(null);setError("");
-+    try {localStorage.setItem(storageKey,JSON.stringify(prefs));} catch {}
-+    return ()=>request.current?.abort();
-+  },[taskId,prefs.engine,prefs.source,prefs.target,isActive]);
++  useEffect(() => {
++    generation.current++; request.current?.abort(); setBusy(false); setResult(""); setError("");
++    return () => request.current?.abort();
++  }, [taskId, original, prefs.engine, prefs.source, prefs.target, isActive]);
 +
-+  useEffect(()=>{
-+    setCredentials({key:"",region:"",app_id:"",secret:""});setSaved(false);
-+    setMonthlyLimit(provider?.monthly_limit||0);
-+  },[prefs.engine,provider?.monthly_limit]);
-+
-+  async function saveCredentials(clear=false) {
-+    setSaving(true);setSaved(false);setError("");
-+    try {
-+      const response=await fetch("/api/tasks/translation-options/",{method:"POST",credentials:"same-origin",
-+        headers:{"Content-Type":"application/json","X-CSRFToken":csrf()},
-+        body:JSON.stringify({engine:prefs.engine,...credentials,monthly_limit:monthlyLimit,clear})});
-+      const data=await response.json();if(!response.ok)throw Error(data.detail||"Unable to save API configuration.");
-+      setProviders(data.providers);setCredentials({key:"",region:"",app_id:"",secret:""});setSaved(true);
-+    } catch(e:any){setError(e.message);} finally{setSaving(false);}
++  function changeLanguage(key: "source" | "target", value: string) {
++    setPrefs(old => ({ ...old, [key]: value }));
++    writeTranslationPreferences({ [key]: value });
 +  }
 +
-+  function change(key:keyof Preferences,value:string) {
-+    setPrefs(old=>{
-+      const next={...old,[key]:value};const engine=providers.find(p=>p.id===next.engine);
-+      if(engine && next.source!=="auto" && !engine.languages[next.source])next.source="auto";
-+      if(engine && !engine.languages[next.target])next.target="zh";
-+      return next;
-+    });
-+  }
 +  async function translate() {
-+    request.current?.abort();const controller=new AbortController();request.current=controller;
-+    const current=++generation.current;setBusy(true);setError("");setResult(null);
++    request.current?.abort();
++    const controller = new AbortController(); request.current = controller;
++    const current = ++generation.current; setBusy(true); setError(""); setResult("");
 +    try {
-+      const response=await fetch(`/api/tasks/${taskId}/translate/`,{method:"POST",credentials:"same-origin",signal:controller.signal,
-+        headers:{"Content-Type":"application/json","X-CSRFToken":csrf()},body:JSON.stringify(prefs)});
-+      const data=await response.json();if(!response.ok)throw Error(data.detail||"Translation request failed.");
-+      if(current===generation.current)setResult(data);
-+    } catch(e:any) {if(e.name!=="AbortError"&&current===generation.current)setError(e.message);}
-+    finally {if(current===generation.current)setBusy(false);}
++      const response = await fetch(`/api/tasks/${taskId}/translate/`, {
++        method: "POST", credentials: "same-origin", signal: controller.signal,
++        headers: { "Content-Type": "application/json", "X-CSRFToken": translationCsrf() },
++        body: JSON.stringify({ ...prefs, field }),
++      });
++      const data = await response.json();
++      if (!response.ok) throw Error(data.detail || "Translation request failed.");
++      if (current === generation.current) setResult(data.translation);
++    } catch (error: any) {
++      if (error.name !== "AbortError" && current === generation.current) setError(error.message);
++    } finally { if (current === generation.current) setBusy(false); }
 +  }
-+  if(!isActive)return null;
++
++  if (!isActive) return null;
 +  return <section className={cn("translation-panel").toClassName()} data-testid="translation-panel">
-+    <label>{t("Translation engine")}
-+      <select aria-label={t("Translation engine")} value={prefs.engine} onChange={e=>change("engine",e.target.value)}>
-+        {!providers.length&&<option value="">{t("Loading...")}</option>}
-+        {providers.map(p=><option key={p.id} value={p.id}>{p.label}{p.configured?"":` (${t("Not configured")})`}</option>)}
-+      </select>
-+    </label>
 +    <div className={cn("translation-panel").elem("languages").toClassName()}>
-+      <label>{t("Source language")}<select aria-label={t("Source language")} value={prefs.source} onChange={e=>change("source",e.target.value)}>
-+        <option value="auto">{t("Auto-detect")}</option>
-+        {Object.entries(provider?.languages||{}).map(([code,label])=><option key={code} value={code}>{t(label)}</option>)}
-+      </select></label>
-+      <label>{t("Target language")}<select aria-label={t("Target language")} value={prefs.target} onChange={e=>change("target",e.target.value)}>
-+        {Object.entries(provider?.languages||{zh:"Chinese (Simplified)"}).map(([code,label])=><option key={code} value={code}>{t(label)}</option>)}
-+      </select></label>
++      <label>{t("Source language")}
++        <select aria-label={t("Source language")} value={prefs.source} disabled={loading} onChange={event => changeLanguage("source", event.target.value)}>
++          <option value="auto">{t("Auto-detect")}</option>
++          {Object.entries(provider?.languages || {}).map(([code, label]) => <option key={code} value={code}>{t(label)}</option>)}
++        </select>
++      </label>
++      <label>{t("Target language")}
++        <select aria-label={t("Target language")} value={prefs.target} disabled={loading} onChange={event => changeLanguage("target", event.target.value)}>
++          {Object.entries(provider?.languages || { zh: "Chinese (Simplified)" }).map(([code, label]) => <option key={code} value={code}>{t(label)}</option>)}
++        </select>
++      </label>
 +    </div>
-+    {provider&&<p className={cn("translation-panel").elem("hint").toClassName()}>{t("Local monthly character limit")}: {provider.monthly_limit.toLocaleString()}</p>}
-+    {provider&&!provider.configured&&<p role="status">{t(canConfigure?"Configure an API key below to enable this engine.":"Ask the organization owner to configure this translation engine.")}</p>}
-+    {provider&&canConfigure&&<details className={cn("translation-panel").elem("config").toClassName()}>
-+      <summary>{t("API settings")}</summary>
-+      <p className={cn("translation-panel").elem("hint").toClassName()}>{t("Keys are encrypted on the server and are never returned to the browser. Leave a field blank to keep its saved value.")}</p>
-+      {prefs.engine==="baidu"?<>
-+        <label>App ID<input aria-label="App ID" autoComplete="off" value={credentials.app_id} onChange={e=>setCredentials(v=>({...v,app_id:e.target.value}))}/></label>
-+        <label>{t("Secret Key")}<input aria-label={t("Secret Key")} type="password" autoComplete="new-password" value={credentials.secret} onChange={e=>setCredentials(v=>({...v,secret:e.target.value}))}/></label>
-+      </>:<label>API Key<input aria-label="API Key" type="password" autoComplete="new-password" value={credentials.key} onChange={e=>setCredentials(v=>({...v,key:e.target.value}))}/></label>}
-+      {prefs.engine==="azure"&&<label>{t("Azure region")}<input aria-label={t("Azure region")} autoComplete="off" value={credentials.region} onChange={e=>setCredentials(v=>({...v,region:e.target.value}))}/></label>}
-+      <label>{t("Local monthly character limit")}<input aria-label={t("Local monthly character limit")} type="number" min={0} max={providers.find(p=>p.id===prefs.engine)?.id==='azure'?2000000:prefs.engine==='baidu'?1000000:500000} value={monthlyLimit} onChange={e=>setMonthlyLimit(Number(e.target.value))}/></label>
-+      <p className={cn("translation-panel").elem("hint").toClassName()}>{t("Calls stop at this local limit. Provider billing and usage outside this application are separate.")}</p>
-+      <div className={cn("translation-panel").elem("actions").toClassName()}>
-+        <button type="button" disabled={saving} onClick={()=>saveCredentials()}>{t(saving?"Saving...":"Save API settings")}</button>
-+        {provider.configured&&<button type="button" disabled={saving} onClick={()=>saveCredentials(true)}>{t("Remove saved key")}</button>}
-+      </div>
-+      {saved&&<p role="status">{t("API settings saved. Existing keys are not displayed.")}</p>}
-+    </details>}
-+    <button type="button" className={cn("translation-panel").elem("button").toClassName()} disabled={busy||!taskId||!provider?.configured} onClick={translate}>
-+      {t(busy?"Translating...":"Translate current text")}
++    <label>{t("Original text")}<textarea aria-label={t("Original text")} readOnly rows={3} value={original} placeholder={t("This task has no inline text to translate.")} /></label>
++    <button type="button" className={cn("translation-panel").elem("button").toClassName()} disabled={loading || busy || !taskId || !original.trim() || !provider?.configured} onClick={translate}>
++      {t(busy ? "Translating..." : "Translate current text")}
 +    </button>
-+    {error&&<p role="alert" className={cn("translation-panel").elem("error").toClassName()}>{t(error)}</p>}
-+    {result&&<>
-+      <p className={cn("translation-panel").elem("hint").toClassName()}>{t("Detected language")}: {t(provider?.languages[result.detected_source]||result.detected_source)}{result.cached?` · ${t("Cached translation")}`:""}</p>
-+      <textarea aria-label={t("Translation result")} readOnly rows={10} value={result.translation}/>
-+      <button type="button" onClick={()=>navigator.clipboard.writeText(result.translation)}>{t("Copy translation")}</button>
-+    </>}
-+    <p className={cn("translation-panel").elem("hint").toClassName()}>{t("Translation is for reference only. Annotate the original text; translations never replace task data or annotations.")}</p>
++    {!loading && provider && !provider.configured && <a className={cn("translation-panel").elem("hint").toClassName()} href="/user/account/translation" target="_blank" rel="noopener noreferrer">{t("Configure translation in settings")}</a>}
++    {error && <p role="alert" className={cn("translation-panel").elem("error").toClassName()}>{t(error)}</p>}
++    <label>{t("Translated text")}<textarea aria-label={t("Translation result")} readOnly rows={4} value={result} aria-busy={busy} placeholder={t(busy ? "Translating..." : "Translation will appear here")} /></label>
 +  </section>;
 +}));
 diff --git a/web/libs/editor/src/components/TaskSummary/Aggregation.tsx b/web/libs/editor/src/components/TaskSummary/Aggregation.tsx

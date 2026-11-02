@@ -2186,5 +2186,11 @@
   "Annotation history": "标注历史",
   "Last submitted task": "最近提交的样本",
   "View submitted result": "查看已提交结果",
-  "Human annotation submitted.": "人工标注已提交。"
+  "Human annotation submitted.": "人工标注已提交。",
+  "Choose the translation engine for this browser. API settings are shared by your organization.": "选择当前浏览器使用的翻译引擎。API 配置由组织共享。",
+  "Configure translation in settings": "前往设置配置翻译",
+  "Original text": "原文",
+  "Translated text": "译文",
+  "Translation settings": "翻译设置",
+  "Translation will appear here": "译文将显示在这里"
 }

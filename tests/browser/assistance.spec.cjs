@@ -10,52 +10,88 @@ async function login(page,context){
   await expect(page).not.toHaveURL(/user\/login/);
 }
 
-test('translation defaults, credentials, engine/language switching and reference result',async({page,context})=>{
+test('translation settings own engines and keys while the panel stays minimal',async({page,context})=>{
   await login(page,context);
+  await page.goto('/user/account/translation');
+  const settings=page.getByTestId('translation-settings');
+  await expect(settings).toBeVisible();
+  await expect(settings.getByLabel('翻译引擎')).toHaveValue('azure');
+  await settings.getByLabel('API Key',{exact:true}).fill('synthetic-ui-key-only');
+  await settings.getByLabel('Azure 区域').fill('eastasia');
+  const saving=page.waitForResponse(r=>r.url().includes('/translation-options/')&&r.request().method()==='POST');
+  await settings.getByRole('button',{name:'保存 API 设置',exact:true}).click();
+  const response=await saving;
+  expect(response.status()).toBe(200);expect(await response.text()).not.toContain('synthetic-ui-key-only');
+  await expect(settings.getByLabel('API Key',{exact:true})).toHaveValue('');
+  expect(await page.evaluate(()=>JSON.stringify(localStorage))).not.toContain('synthetic-ui-key-only');
+  await page.screenshot({path:'artifacts/translation-settings.png',fullPage:true});
   await page.goto('/projects/1/data?task=1');
-  // The editor also renders a hidden drag ghost with the same tab text.
   await page.locator('[id="翻译-draggable"]').getByText('翻译',{exact:true}).click();
   const panel=page.getByTestId('translation-panel');
   await expect(panel).toBeVisible();
   await expect(panel).toHaveCSS('display','flex');
-  await expect(panel.getByLabel('翻译引擎')).toHaveValue('azure');
+  await expect(panel.getByLabel('翻译引擎')).toHaveCount(0);
+  await expect(panel.getByLabel('API Key',{exact:true})).toHaveCount(0);
+  await expect(panel.locator('details')).toHaveCount(0);
+  await expect(panel).not.toContainText('本地每月字符上限');
   await expect(panel.getByLabel('原文语言')).toHaveValue('auto');
   await expect(panel.getByLabel('目标语言')).toHaveValue('zh');
-  await expect(panel.getByRole('button',{name:'翻译当前文本',exact:true})).toBeDisabled();
-  await panel.locator('summary').click();
-  await panel.getByLabel('API Key',{exact:true}).fill('synthetic-ui-key-only');
-  await panel.getByLabel('Azure 区域').fill('eastasia');
-  const saving=page.waitForResponse(r=>r.url().includes('/translation-options/')&&r.request().method()==='POST');
-  await panel.getByRole('button',{name:'保存 API 设置',exact:true}).click();
-  const response=await saving;
-  expect(response.status()).toBe(200);expect(await response.text()).not.toContain('synthetic-ui-key-only');
-  await expect(panel.getByLabel('API Key',{exact:true})).toHaveValue('');
+  await expect(panel.getByLabel('原文',{exact:true})).toHaveValue('Acme Bank transferred 2500 THB.');
   await expect(panel.getByRole('button',{name:'翻译当前文本',exact:true})).toBeEnabled();
   const before=await (await page.request.get('/api/tasks/1/')).json();
   await page.route('**/api/tasks/1/translate/',async route=>{
-    expect(route.request().postDataJSON()).toEqual({engine:'azure',source:'auto',target:'zh'});
+    expect(route.request().postDataJSON()).toEqual({engine:'azure',source:'auto',target:'zh',field:'content'});
     await route.fulfill({json:{task_id:1,translation:'合成银行已转账 2500 泰铢。',engine:'azure',detected_source:'en',target:'zh',cached:false}});
   });
   await panel.getByRole('button',{name:'翻译当前文本',exact:true}).click();
   await expect(panel.getByLabel('翻译结果')).toHaveValue('合成银行已转账 2500 泰铢。');
   await expect(page.getByText('Acme Bank',{exact:false}).first()).toBeVisible();
+  await page.setViewportSize({width:1440,height:1080});
+  await panel.getByLabel('原文语言').scrollIntoViewIfNeeded();
+  await page.screenshot({path:'artifacts/translation-panel.png',fullPage:true});
   await panel.getByLabel('目标语言').selectOption('en');
-  await expect(panel.getByLabel('翻译结果')).toHaveCount(0);
+  await expect(panel.getByLabel('翻译结果')).toHaveValue('');
   await panel.getByLabel('原文语言').selectOption('th');
-  await panel.getByLabel('翻译引擎').selectOption('google');
-  await expect(panel.getByLabel('原文语言')).toHaveValue('th');
-  await expect(panel.getByLabel('目标语言')).toHaveValue('en');
-  await expect(panel.getByLabel('API Key',{exact:true})).toHaveValue('');
-  await panel.getByLabel('翻译引擎').selectOption('baidu');
-  await expect(panel.getByLabel('App ID',{exact:true})).toBeVisible();
-  await expect(panel.getByLabel('密钥',{exact:true})).toBeVisible();
+  // Settings opened separately must update an already-mounted translation panel.
+  const settingsPage=await context.newPage();
+  await settingsPage.goto('/user/account/translation');
+  const separate=settingsPage.getByTestId('translation-settings');
+  await separate.getByLabel('翻译引擎').selectOption('google');
+  await expect(panel.getByRole('button',{name:'翻译当前文本',exact:true})).toBeDisabled();
+  await expect(panel.getByRole('link',{name:'前往设置配置翻译'})).toHaveAttribute('href','/user/account/translation');
+  await separate.getByLabel('翻译引擎').selectOption('baidu');
+  await expect(separate.getByLabel('App ID',{exact:true})).toBeVisible();
+  await expect(separate.getByLabel('密钥',{exact:true})).toBeVisible();
+  await expect(separate.getByLabel('API Key',{exact:true})).toHaveCount(0);
+  await settingsPage.reload();
+  await expect(separate.getByLabel('翻译引擎')).toHaveValue('baidu');
   await page.reload();
-  await expect(panel.getByLabel('翻译引擎')).toHaveValue('baidu');
   await expect(panel.getByLabel('原文语言')).toHaveValue('th');
   await expect(panel.getByLabel('目标语言')).toHaveValue('en');
+  // Removing a key in settings must disable translation without exposing credentials.
+  await separate.getByLabel('翻译引擎').selectOption('azure');
+  await expect(panel.getByRole('button',{name:'翻译当前文本',exact:true})).toBeEnabled();
+  await separate.getByRole('button',{name:'移除已保存密钥',exact:true}).click();
+  await expect(separate.getByRole('button',{name:'移除已保存密钥',exact:true})).toHaveCount(0);
+  await expect(panel.getByRole('button',{name:'翻译当前文本',exact:true})).toBeDisabled();
   const after=await (await page.request.get('/api/tasks/1/')).json();
   expect(after.data).toEqual(before.data);expect(after.annotations).toEqual(before.annotations);
-  await page.screenshot({path:'artifacts/translation-panel.png',fullPage:true});
+  await settingsPage.close();
+});
+
+test('translation settings keep API controls owner-only and support English',async({page,context})=>{
+  await login(page,context);
+  await page.addInitScript(()=>localStorage.setItem('label-studio.language','en'));
+  await page.route('**/api/tasks/translation-options/',async route=>{
+    const response=await route.fetch();
+    await route.fulfill({json:{...await response.json(),can_configure:false}});
+  });
+  await page.goto('/user/account/translation');
+  const settings=page.getByTestId('translation-settings');
+  await expect(settings.getByLabel('Translation engine')).toBeEnabled();
+  await expect(settings.getByLabel('API Key',{exact:true})).toHaveCount(0);
+  await expect(settings.getByRole('button',{name:'Save API settings',exact:true})).toHaveCount(0);
+  await expect(settings.getByRole('status')).toHaveText('Ask the organization owner to configure this translation engine.');
 });
 
 test('selected live model survives save and reload',async({page,context})=>{

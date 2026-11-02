@@ -2186,5 +2186,11 @@
   "Annotation history": "Annotation history",
   "Last submitted task": "Last submitted task",
   "View submitted result": "View submitted result",
-  "Human annotation submitted.": "Human annotation submitted."
+  "Human annotation submitted.": "Human annotation submitted.",
+  "Choose the translation engine for this browser. API settings are shared by your organization.": "Choose the translation engine for this browser. API settings are shared by your organization.",
+  "Configure translation in settings": "Configure translation in settings",
+  "Original text": "Original text",
+  "Translated text": "Translated text",
+  "Translation settings": "Translation settings",
+  "Translation will appear here": "Translation will appear here"
 }
