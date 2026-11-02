@@ -25,10 +25,11 @@ test('learning workspace provider, persistent job, and review decisions',async({
  await page.goto('/projects/1/settings/learning');
  const panel=page.getByTestId('learning-workspace');await expect(panel.getByRole('heading',{name:'模型与预标注',exact:true})).toBeVisible();
  await panel.getByRole('button',{name:'模型管理',exact:true}).click();
- await panel.locator('.learning-cards article').filter({has:page.getByRole('heading',{name:'CI Classification',exact:true})}).getByRole('button',{name:'生成预标注',exact:true}).click();
- await panel.getByLabel('样本范围').selectOption('all');await panel.getByLabel('本次最多处理条数',{exact:true}).fill('1');
- const started=page.waitForResponse(r=>r.url().endsWith('/workflow')&&r.request().method()==='POST');
- await panel.getByRole('button',{name:'批量生成预标注',exact:true}).click();const run=await (await started).json();
+ const started=page.waitForResponse(r=>r.url().endsWith('/workflow')&&r.request().method()==='POST'&&r.request().postDataJSON().action==='start');
+ await panel.locator('.learning-cards article').filter({has:page.getByRole('heading',{name:'CI Classification',exact:true})}).getByRole('button',{name:'试运行 1 条',exact:true}).click();
+ const response=await started;expect(response.ok()).toBeTruthy();const run=await response.json();
+ await expect(panel.getByLabel('模型服务',{exact:true})).toHaveValue(String(run.provider));
+ await expect(panel.getByRole('button',{name:'批量生成预标注',exact:true})).toBeEnabled();
  const job=panel.getByTestId(`learning-run-${run.id}`);await expect(job).toContainText('排队中');
  await job.getByRole('button',{name:'取消任务'}).click();await expect(job.getByRole('button',{name:'正在取消'})).toBeDisabled();
  await panel.getByRole('button',{name:'难样本复核',exact:true}).click();
