@@ -8,3 +8,5 @@
 **/*.sqlite*
 **/data/
 **/cache/
+/.secrets/
+/backups/

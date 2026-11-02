@@ -2228,5 +2228,7 @@
   "Application ID (appKey)": "Application ID (appKey)",
   "Application secret": "Application secret",
   "Create a Youdao application with Text Translation enabled and enter its application ID and secret. The local limit is not a free monthly allowance.": "Create a Youdao application with Text Translation enabled and enter its application ID and secret. The local limit is not a free monthly allowance.",
-  "Youdao rejected the request timestamp or nonce. Check the server clock and try again.": "Youdao rejected the request timestamp or nonce. Check the server clock and try again."
+  "Youdao rejected the request timestamp or nonce. Check the server clock and try again.": "Youdao rejected the request timestamp or nonce. Check the server clock and try again.",
+  "Loading project and samples...": "Loading project and samples...",
+  "Could not load the project. Please retry.": "Could not load the project. Please retry."
 }

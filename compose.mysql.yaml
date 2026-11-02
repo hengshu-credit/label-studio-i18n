@@ -1,0 +1,166 @@
+name: jianzhi-label-studio
+services:
+  mysql:
+    image: mysql:8.4.13@sha256:a0225d1ea6631c8bc2385dc4c2faba17bbf1834ecf369e1659a9a382bd8d5dd7
+    restart: unless-stopped
+    command:
+    - --character-set-server=utf8mb4
+    - --collation-server=utf8mb4_0900_bin
+    - --innodb-buffer-pool-size=2147483648
+    - --max-allowed-packet=67108864
+    - --group-concat-max-len=16777216
+    environment:
+      MYSQL_DATABASE: labelstudio
+      MYSQL_USER: labelstudio
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/mysql-root-password
+      MYSQL_PASSWORD_FILE: /run/secrets/mysql-password
+      TZ: Asia/Shanghai
+    secrets:
+    - mysql-root-password
+    - mysql-password
+    - mysql-root-client
+    volumes:
+    - mysql-data:/var/lib/mysql
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - cp /run/secrets/mysql-root-client /tmp/ls-root-client.cnf && chmod 600 /tmp/ls-root-client.cnf
+        && mysql --defaults-extra-file=/tmp/ls-root-client.cnf --batch --skip-column-names
+        -e 'SELECT 1'
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+  migration:
+    profiles:
+    - tools
+    image: ${LABEL_STUDIO_IMAGE:-hengshu/label-studio-i18n:local}
+    entrypoint:
+    - python
+    - /label-studio/label_studio/manage.py
+    environment:
+      DJANGO_DB: mysql
+      MYSQL_HOST: mysql
+      MYSQL_PORT: '3306'
+      MYSQL_NAME: labelstudio
+      MYSQL_USER: labelstudio
+      MYSQL_PASSWORD_FILE: /run/secrets/mysql-password
+      LABEL_STUDIO_BASE_DATA_DIR: /label-studio/data
+      LABEL_STUDIO_DISABLE_TELEMETRY: 'true'
+      SENTRY_DSN: ''
+      TZ: Asia/Shanghai
+    secrets:
+    - mysql-password
+    volumes:
+    - ../data:/label-studio/data:ro
+    - ./artifacts:/migration-artifacts
+    - ./tools:/migration-tools:ro
+    - ../backups:/migration-backups:ro
+  active-learning:
+    image: ${LABEL_STUDIO_IMAGE:-hengshu/label-studio-i18n:local}
+    entrypoint:
+    - python
+    - /label-studio/label_studio/manage.py
+    - active_learning_worker
+    restart: unless-stopped
+    depends_on:
+      label-studio:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+    environment:
+      LABEL_STUDIO_BASE_DATA_DIR: /label-studio/data
+      LABEL_STUDIO_DISABLE_TELEMETRY: 'true'
+      SENTRY_DSN: ''
+      FRONTEND_SENTRY_DSN: ''
+      ML_BLOCK_LOCAL_IP: 'false'
+      ML_TIMEOUT_PREDICT: '180'
+      TZ: Asia/Shanghai
+      DJANGO_DB: mysql
+      MYSQL_HOST: mysql
+      MYSQL_PORT: '3306'
+      MYSQL_NAME: labelstudio
+      MYSQL_USER: labelstudio
+      MYSQL_PASSWORD_FILE: /run/secrets/mysql-password
+    volumes:
+    - type: bind
+      source: ../data
+      target: /label-studio/data
+    secrets:
+    - mysql-password
+  label-studio:
+    image: ${LABEL_STUDIO_IMAGE:-hengshu/label-studio-i18n:local}
+    build:
+      context: ./upstream
+      dockerfile: ../Dockerfile
+      target: production
+      args:
+        COMMIT_VERSION: 1.24.0.dev0-hengshu-i18n
+        COMMIT_SHA: ${COMMIT_SHA:-local}
+        COMMIT_BRANCH: hengshu-credit/main
+    restart: unless-stopped
+    ports:
+    - 127.0.0.1:8080:8080
+    environment:
+      LABEL_STUDIO_BASE_DATA_DIR: /label-studio/data
+      LABEL_STUDIO_LOCAL_FILES_SERVING_ENABLED: 'true'
+      LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT: /label-studio/local-files
+      LABEL_STUDIO_DISABLE_TELEMETRY: 'true'
+      SENTRY_DSN: ''
+      FRONTEND_SENTRY_DSN: ''
+      SSRF_PROTECTION_ENABLED: 'true'
+      ML_BLOCK_LOCAL_IP: 'false'
+      ML_TIMEOUT_PREDICT: '180'
+      TZ: Asia/Shanghai
+      DJANGO_DB: mysql
+      MYSQL_HOST: mysql
+      MYSQL_PORT: '3306'
+      MYSQL_NAME: labelstudio
+      MYSQL_USER: labelstudio
+      MYSQL_PASSWORD_FILE: /run/secrets/mysql-password
+    volumes:
+    - type: bind
+      source: ../../outputs/label_studio_merge_v1
+      target: /import-source
+      read_only: true
+    - type: bind
+      source: ../data
+      target: /label-studio/data
+    - type: bind
+      source: ../local-files
+      target: /label-studio/local-files
+    healthcheck:
+      test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health',
+        timeout=10).read()
+      interval: 30s
+      timeout: 15s
+      start_period: 120s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+    secrets:
+    - mysql-password
+    depends_on:
+      mysql:
+        condition: service_healthy
+volumes:
+  mysql-data: null
+secrets:
+  mysql-root-password:
+    file: ../.secrets/mysql-root-password
+  mysql-password:
+    file: ../.secrets/mysql-password
+  mysql-root-client:
+    file: ../.secrets/mysql-root-client.cnf

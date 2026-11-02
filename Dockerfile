@@ -55,7 +55,7 @@ ENV PYTHONUNBUFFERED=1 \
     UV_PYTHON_DOWNLOADS=never \
     PATH="/label-studio/.venv/bin:$PATH"
 
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential git libpcre2-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential git libpcre2-dev default-libmysqlclient-dev pkg-config && rm -rf /var/lib/apt/lists/*
 
 # Install uv
 RUN pip install --no-cache-dir uv==0.13.5
@@ -114,7 +114,7 @@ ENV LS_DIR=/label-studio \
 WORKDIR $LS_DIR
 
 # install prerequisites for app
-RUN apt-get update && apt-get install -y --no-install-recommends libexpat1 libglib2.0-0 libgl1 libgomp1 nginx curl bash procps && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends libexpat1 libglib2.0-0 libgl1 libgomp1 libmariadb3 nginx curl bash procps && rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
     mkdir -p $LS_DIR $LABEL_STUDIO_BASE_DATA_DIR $OPT_DIR && \

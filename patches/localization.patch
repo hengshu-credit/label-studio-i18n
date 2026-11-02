@@ -40,11 +40,82 @@ index 1e18de7..7b5dd6f 100644
          if 'uid' not in request.session:
              request.session['uid'] = str(uuid4())
  
+diff --git a/label_studio/core/migration_helpers.py b/label_studio/core/migration_helpers.py
+index 74fd5f0..6ff12a7 100644
+--- a/label_studio/core/migration_helpers.py
++++ b/label_studio/core/migration_helpers.py
+@@ -237,8 +237,8 @@ def execute_sql_job(
+             migration.save()
+
+         try:
+-            if connection.vendor == 'sqlite' and not apply_on_sqlite:
+-                logger.info('SQLite detected; skipping SQL execution as requested')
++            if connection.vendor != 'postgresql' and not (connection.vendor == 'sqlite' and apply_on_sqlite):
++                logger.info('Skipping PostgreSQL-specific SQL on %s', connection.vendor)
+             else:
+                 _execute_statements(sql)
+             migration.status = AsyncMigrationStatus.STATUS_FINISHED
+@@ -254,8 +254,8 @@ def execute_sql_job(
+     else:
+         # Reverse path: don't create/update AsyncMigrationStatus. Just run SQL.
+         try:
+-            if connection.vendor == 'sqlite' and not apply_on_sqlite:
+-                logger.info('SQLite detected; skipping SQL execution as requested (reverse)')
++            if connection.vendor != 'postgresql' and not (connection.vendor == 'sqlite' and apply_on_sqlite):
++                logger.info('Skipping PostgreSQL-specific SQL on %s (reverse)', connection.vendor)
+                 return
+             _execute_statements(sql)
+         except Exception as e:
+@@ -291,8 +291,8 @@ def make_sql_migration(
+         # Early return for linter to not actually run code
+         if getattr(schema_editor, 'collect_sql', False) is True:
+             return
+-        if schema_editor.connection.vendor == 'sqlite' and not apply_on_sqlite:
+-            logger.info('Skipping migration for SQLite (apply_on_sqlite=False)')
++        if schema_editor.connection.vendor != 'postgresql' and not (schema_editor.connection.vendor == 'sqlite' and apply_on_sqlite):
++            logger.info('Skipping PostgreSQL-specific migration on %s', schema_editor.connection.vendor)
+             return
+         should_execute = execute_immediately or not settings.ALLOW_SCHEDULED_MIGRATIONS or settings.CI
+         if should_execute:
 diff --git a/label_studio/core/settings/base.py b/label_studio/core/settings/base.py
-index 0ef6558..173f30d 100644
+index 0ef6558..80be2df 100644
 --- a/label_studio/core/settings/base.py
 +++ b/label_studio/core/settings/base.py
-@@ -592,7 +592,9 @@ GRAPHIQL = True
+@@ -179,6 +179,14 @@ DJANGO_DB_POSTGRESQL = 'postgresql'
+ DJANGO_DB = 'default'
+ DATABASE_NAME_DEFAULT = os.path.join(BASE_DATA_DIR, 'label_studio.sqlite3')
+ DATABASE_NAME = get_env('DATABASE_NAME', DATABASE_NAME_DEFAULT)
++
++def database_secret(name, default=''):
++    path = get_env(name + '_FILE', None)
++    if path:
++        with open(path, encoding='utf-8') as secret:
++            return secret.read().strip()
++    return get_env(name, default)
++
+ DATABASES_ALL = {
+     DJANGO_DB_POSTGRESQL: {
+         'ENGINE': 'django.db.backends.postgresql',
+@@ -191,10 +199,17 @@ DATABASES_ALL = {
+     DJANGO_DB_MYSQL: {
+         'ENGINE': 'django.db.backends.mysql',
+         'USER': get_env('MYSQL_USER', 'root'),
+-        'PASSWORD': get_env('MYSQL_PASSWORD', ''),
++        'PASSWORD': database_secret('MYSQL_PASSWORD'),
+         'NAME': get_env('MYSQL_NAME', 'labelstudio'),
+         'HOST': get_env('MYSQL_HOST', 'localhost'),
+         'PORT': int(get_env('MYSQL_PORT', '3306')),
++        'CONN_MAX_AGE': 60,
++        'CONN_HEALTH_CHECKS': True,
++        'OPTIONS': {
++            'charset': 'utf8mb4',
++            'isolation_level': 'read committed',
++            'init_command': "SET sql_mode='STRICT_TRANS_TABLES,ONLY_FULL_GROUP_BY,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'",
++        },
+     },
+     DJANGO_DB_SQLITE: {
+         'ENGINE': 'django.db.backends.sqlite3',
+@@ -592,7 +607,9 @@ GRAPHIQL = True
  # https://docs.djangoproject.com/en/2.1/topics/i18n/
  LANGUAGE_CODE = 'en-us'
  TIME_ZONE = 'UTC'
@@ -85,6 +156,59 @@ index 47804df..10b0438 100644
      re_path(r'^$', views.main, name='main'),
      re_path(r'^sw\.js$', views.static_file_with_host_resolver('js/sw.js', content_type='text/javascript')),
      re_path(
+diff --git a/label_studio/core/utils/db.py b/label_studio/core/utils/db.py
+index 7581910..c788a17 100644
+--- a/label_studio/core/utils/db.py
++++ b/label_studio/core/utils/db.py
+@@ -20,6 +20,48 @@ class SQCount(Subquery):
+ ModelType = TypeVar('ModelType', bound=Model)
+
+
++def bulk_create_with_ids(model, objects, batch_size=None):
++    """Return primary keys on MySQL without a racy MAX(id) allocation.
++
++    A simple multi-row INSERT reserves a contiguous auto-increment range per statement.
++    Capture the server's first ID and affected-row count, including Django's batch splits.
++    Conflict-skipping and mixed explicit/generated IDs are deliberately not accepted.
++    """
++    objects = list(objects)
++    if not objects or connection.vendor != 'mysql' or connection.features.can_return_rows_from_bulk_insert:
++        return model.objects.bulk_create(objects, batch_size=batch_size)
++    if all(obj.pk is not None for obj in objects):
++        return model.objects.bulk_create(objects, batch_size=batch_size)
++    if any(obj.pk is not None for obj in objects):
++        raise ValueError('Mixed explicit and generated primary keys are not supported.')
++    ranges = []
++    prefix = 'INSERT INTO ' + connection.ops.quote_name(model._meta.db_table) + ' '
++
++    def capture(execute, sql, params, many, context):
++        result = execute(sql, params, many, context)
++        if sql.lstrip().upper().startswith(prefix.upper()):
++            cursor = context['cursor']
++            if many or not cursor.lastrowid or cursor.rowcount <= 0:
++                raise RuntimeError('Cannot recover generated primary keys from this INSERT.')
++            ranges.append((int(cursor.lastrowid), int(cursor.rowcount)))
++        return result
++
++    with transaction.atomic():
++        with connection.cursor() as cursor:
++            cursor.execute('SELECT @@auto_increment_increment')
++            increment = int(cursor.fetchone()[0])
++        with connection.execute_wrapper(capture):
++            created = model.objects.bulk_create(objects, batch_size=batch_size)
++        ids = [first + i * increment for first, count in ranges for i in range(count)]
++        if len(ids) != len(created):
++            raise RuntimeError('The inserted row count did not match the generated primary keys.')
++        for obj, pk in zip(created, ids):
++            obj.pk = pk
++            obj._state.adding = False
++            obj._state.db = connection.alias
++    return created
++
++
+ def fast_first(queryset: QuerySet[ModelType]) -> Optional[ModelType]:
+     """Replacement for queryset.first() when you don't need ordering,
+     queryset.first() works slowly in some cases
 diff --git a/label_studio/core/utils/secret_key.py b/label_studio/core/utils/secret_key.py
 index 5713e34..f280250 100644
 --- a/label_studio/core/utils/secret_key.py
@@ -211,7 +335,7 @@ index 6d86b06..1dbc5eb 100644
          'experimental': True,
          'dialog': {
 diff --git a/label_studio/data_manager/actions/data_columns.py b/label_studio/data_manager/actions/data_columns.py
-index 918df64..3881206 100644
+index 918df64..6f14932 100644
 --- a/label_studio/data_manager/actions/data_columns.py
 +++ b/label_studio/data_manager/actions/data_columns.py
 @@ -1,4 +1,5 @@
@@ -220,6 +344,24 @@ index 918df64..3881206 100644
  
  import random
  
+@@ -57,7 +58,7 @@ def _validate_column_request(request_data, project):
+
+
+ def _set_data_value_in_batches(queryset, value_name, postgres_value, sqlite_value):
+-    if settings.DJANGO_DB == settings.DJANGO_DB_SQLITE:
++    if settings.DJANGO_DB != settings.DJANGO_DB_POSTGRESQL:
+         updated_count = 0
+         task_iterator = iterate_queryset(queryset.only('id', 'data'), chunk_size=settings.UPDATE_COLUMN_BATCH_SIZE)
+         for task_batch in batched_iterator(task_iterator, settings.UPDATE_COLUMN_BATCH_SIZE):
+@@ -101,7 +102,7 @@ def _set_selected_or_empty_data_value(task_queryset, selected_queryset, value_na
+     selected_ids = selected_queryset.order_by().values('id')
+     sqlite_selected_ids = (
+         set(selected_queryset.values_list('id', flat=True))
+-        if settings.DJANGO_DB == settings.DJANGO_DB_SQLITE
++        if settings.DJANGO_DB != settings.DJANGO_DB_POSTGRESQL
+         else set()
+     )
+     return _set_data_value_in_batches(
 @@ -351,8 +352,8 @@ def add_data_field_form(user, project):
                  {
                      'type': 'select',
@@ -392,7 +534,7 @@ index 5c12bca..2caede4 100644
          'experimental': False,
          'dialog': {
 diff --git a/label_studio/data_manager/api.py b/label_studio/data_manager/api.py
-index 0f6b330..452dafd 100644
+index 0f6b330..4938f69 100644
 --- a/label_studio/data_manager/api.py
 +++ b/label_studio/data_manager/api.py
 @@ -1,4 +1,5 @@
@@ -401,6 +543,15 @@ index 0f6b330..452dafd 100644
  
  import logging
  
+@@ -27,7 +28,7 @@ from django_filters.rest_framework import DjangoFilterBackend
+ from drf_spectacular.types import OpenApiTypes
+ from drf_spectacular.utils import OpenApiExample, OpenApiParameter, OpenApiResponse, extend_schema
+ from io_storages.functions import get_import_storage_link_prefetches
+-from projects.models import Project
++from projects.models import Project, ProjectManager
+ from projects.serializers import ProjectSerializer
+ from rest_framework import generics, viewsets
+ from rest_framework.decorators import action
 @@ -341,17 +342,17 @@ class TaskPagination(PageNumberPagination):
                  'tasks': schema,
                  'total': {
@@ -440,7 +591,37 @@ index 0f6b330..452dafd 100644
                                      'type': 'Datetime',
                                      'target': 'tasks',
                                      'help': 'Latest annotation time, set once the task has all required annotations',
-@@ -627,36 +628,36 @@ class ProjectStateAPI(APIView):
+@@ -590,7 +591,13 @@ class ProjectStateAPI(APIView):
+         pk = int_from_request(request.GET, 'project', 1)  # replace 1 to None, it's for debug only
+         project = generics.get_object_or_404(Project, pk=pk)
+         self.check_object_permissions(request, project)
+-        data = ProjectSerializer(project).data
++        # Explorer screens need configuration and totals, not the per-user labeling queue.
++        # Keep the full response for labeling streams and existing API clients.
++        lightweight = bool_from_request(request.GET, 'lightweight', False)
++        metadata_only = bool_from_request(request.GET, 'metadata_only', False)
++        omit = [*ProjectManager.COUNTER_FIELDS, 'queue_total', 'queue_done', 'state'] if metadata_only else ['queue_total', 'queue_done'] if lightweight else []
++        data = ProjectSerializer(project, context={'request': request},
++                                 omit=omit).data
+
+         data.update(
+             {
+@@ -599,11 +606,12 @@ class ProjectStateAPI(APIView):
+                 'can_manage_tasks': True,
+                 'source_syncing': False,
+                 'target_syncing': False,
+-                'task_count': project.tasks.count(),
+-                'annotation_count': Annotation.objects.filter(project=project).count(),
+                 'config_has_control_tags': len(project.get_parsed_config()) > 0,
+             }
+         )
++        if not metadata_only:
++            data['task_count'] = project.tasks.count()
++            data['annotation_count'] = Annotation.objects.filter(project=project).count()
+         return Response(data)
+
+
+@@ -627,36 +635,36 @@ class ProjectStateAPI(APIView):
                  description='Actions retrieved successfully',
                  response={
                      'type': 'array',
@@ -490,7 +671,7 @@ index 0f6b330..452dafd 100644
                                          'items': {'type': 'object'},
                                          'nullable': True,
                                      },
-@@ -671,12 +672,12 @@ class ProjectStateAPI(APIView):
+@@ -671,12 +679,12 @@ class ProjectStateAPI(APIView):
                          value=[
                              {
                                  'id': 'predictions_to_annotations',
@@ -505,7 +686,7 @@ index 0f6b330..452dafd 100644
                                      'text': 'Create annotations from predictions using selected predictions set for each selected task. Your account will be assigned as an owner to those annotations.',
                                      'type': 'confirm',
                                      'form': None,
-@@ -810,7 +811,7 @@ class ProjectActionsAPI(APIView):
+@@ -810,7 +818,7 @@ class ProjectActionsAPI(APIView):
                  description='Action form configuration returned successfully',
                  response={
                      'type': 'object',
@@ -725,7 +906,7 @@ index 9d30512..82984d7 100644
 
 
 diff --git a/label_studio/data_manager/managers.py b/label_studio/data_manager/managers.py
-index 0414eb6..0f8593a 100644
+index 0414eb6..68d8f77 100644
 --- a/label_studio/data_manager/managers.py
 +++ b/label_studio/data_manager/managers.py
 @@ -1,4 +1,5 @@
@@ -734,6 +915,15 @@ index 0414eb6..0f8593a 100644
  
  import logging
  import re
+@@ -15,7 +16,7 @@ from data_manager.prepare_params import ConjunctionEnum
+ from django.conf import settings
+ from django.contrib.postgres.aggregates import ArrayAgg
+ from django.core.exceptions import FieldDoesNotExist, FieldError
+-from django.db import models
++from django.db import connection, models
+ from django.db.models import (
+     Aggregate,
+     Avg,
 @@ -624,11 +625,10 @@ def validate_in_list_filter(_filter, field_name: str) -> str:
          return 'ok'
      if not _is_supported_in_list_field(field_name):
@@ -748,7 +938,33 @@ index 0414eb6..0f8593a 100644
      _normalize_in_list_value(_filter)
      if not _filter.value:
          return 'none' if _filter.operator == Operator.IN_LIST else 'skip'
-@@ -702,7 +702,7 @@ def parse_user_filter_ids(value):
+@@ -636,7 +636,6 @@ def validate_in_list_filter(_filter, field_name: str) -> str:
+
+
+ def add_result_filter(field_name, _filter, filter_expressions, project):
+-    from django.db.models.expressions import RawSQL
+     from tasks.models import Annotation, Prediction
+
+     _class = Annotation if field_name == 'annotations_results' else Prediction
+@@ -644,7 +643,7 @@ def add_result_filter(field_name, _filter, filter_expressions, project):
+     # Annotation
+     if field_name == 'annotations_results':
+         subquery = Q(
+-            id__in=Annotation.objects.annotate(json_str=RawSQL('cast(result as text)', ''))
++            id__in=Annotation.objects.annotate(json_str=Cast('result', TextField()))
+             .filter(Q(project=project) & Q(json_str__contains=_filter.value))
+             .filter(task=OuterRef('pk'))
+             .values_list('task', flat=True)
+@@ -652,7 +651,7 @@ def add_result_filter(field_name, _filter, filter_expressions, project):
+     # Predictions: they don't have `project` yet
+     else:
+         subquery = Exists(
+-            _class.objects.annotate(json_str=RawSQL('cast(result as text)', '')).filter(
++            _class.objects.annotate(json_str=Cast('result', TextField())).filter(
+                 Q(task=OuterRef('pk')) & Q(json_str__contains=_filter.value)
+             )
+         )
+@@ -702,7 +701,7 @@ def parse_user_filter_ids(value):
                  raise ValueError
              user_id = int(item)
          except (TypeError, ValueError):
@@ -757,7 +973,7 @@ index 0414eb6..0f8593a 100644
          if user_id not in seen:
              seen.add(user_id)
              ids.append(user_id)
-@@ -975,7 +975,7 @@ def apply_filters(queryset, filters, project, request):
+@@ -975,7 +974,7 @@ def apply_filters(queryset, filters, project, request):
                  value_type = type(queryset.values_list(field_name, flat=True)[0]).__name__
  
              if (value_type == 'list' or value_type == 'tuple') and 'equal' in _filter.operator:
@@ -766,6 +982,74 @@ index 0414eb6..0f8593a 100644
  
              # special case: for strings empty is "" or null=True
              if _filter.type in ('String', 'Unknown') and _filter.operator == 'empty':
+@@ -1135,6 +1134,22 @@ class GroupConcat(Aggregate):
+         super().__init__(expression, distinct='DISTINCT ' if distinct else '', output_field=output_field, **extra)
+
+
++class MySQLArrayAgg(Aggregate):
++    function = 'JSON_ARRAYAGG'
++    output_field = models.JSONField()
++
++
++def annotate_mysql_related_array(queryset, relation, field, alias):
++    """Aggregate each task's related records independently, avoiding join multiplication."""
++    from tasks.models import Annotation, Prediction
++    model = Annotation if relation == 'annotations' else Prediction
++    values = model.objects.filter(task_id=OuterRef('pk')).order_by().values('task_id').annotate(
++        items=MySQLArrayAgg(field)
++    ).values('items')[:1]
++    return queryset.annotate(**{alias: Coalesce(Subquery(values, output_field=models.JSONField()),
++                                               Value([], output_field=models.JSONField()))})
++
++
+ def newest_annotation_subquery() -> Subquery:
+     from tasks.models import Annotation
+
+@@ -1231,6 +1246,8 @@ def annotate_storage_filename(queryset: TaskQuerySet) -> TaskQuerySet:
+
+
+ def annotate_annotations_results(queryset):
++    if connection.vendor == 'mysql':
++        return annotate_mysql_related_array(queryset, 'annotations', 'result', 'annotations_results')
+     if settings.DJANGO_DB == settings.DJANGO_DB_SQLITE:
+         return queryset.annotate(
+             annotations_results=Coalesce(
+@@ -1242,6 +1259,8 @@ def annotate_annotations_results(queryset):
+
+
+ def annotate_predictions_results(queryset):
++    if connection.vendor == 'mysql':
++        return annotate_mysql_related_array(queryset, 'predictions', 'result', 'predictions_results')
+     if settings.DJANGO_DB == settings.DJANGO_DB_SQLITE:
+         return queryset.annotate(
+             predictions_results=Coalesce(
+@@ -1253,6 +1272,8 @@ def annotate_predictions_results(queryset):
+
+
+ def annotate_annotators(queryset):
++    if connection.vendor == 'mysql':
++        return annotate_mysql_related_array(queryset, 'annotations', 'completed_by_id', 'annotators')
+     if settings.DJANGO_DB == settings.DJANGO_DB_SQLITE:
+         return queryset.annotate(
+             annotators=Coalesce(GroupConcat('annotations__completed_by'), Value(''), output_field=models.CharField())
+@@ -1294,6 +1315,8 @@ def annotate_predictions_score(queryset):
+
+
+ def annotate_annotations_ids(queryset):
++    if connection.vendor == 'mysql':
++        return annotate_mysql_related_array(queryset, 'annotations', 'id', 'annotations_ids')
+     if settings.DJANGO_DB == settings.DJANGO_DB_SQLITE:
+         return queryset.annotate(annotations_ids=GroupConcat('annotations__id', output_field=models.CharField()))
+     else:
+@@ -1301,6 +1324,8 @@ def annotate_annotations_ids(queryset):
+
+
+ def annotate_predictions_model_versions(queryset):
++    if connection.vendor == 'mysql':
++        return annotate_mysql_related_array(queryset, 'predictions', 'model_version', 'predictions_model_versions')
+     if settings.DJANGO_DB == settings.DJANGO_DB_SQLITE:
+         return queryset.annotate(
+             predictions_model_versions=GroupConcat('predictions__model_version', output_field=models.CharField())
 diff --git a/label_studio/data_manager/migrations/0001_squashed_0005_view_user.py b/label_studio/data_manager/migrations/0001_squashed_0005_view_user.py
 index f175e16..bfff275 100644
 --- a/label_studio/data_manager/migrations/0001_squashed_0005_view_user.py
@@ -1492,6 +1776,171 @@ index 84331b7..03605fd 100644
              ('contains', False, 'contains', []),
              ('contains', 1.5, 'contains', []),
              ('regex', '7', 'contains', []),
+diff --git a/label_studio/fsm/migrations/0004_task_project_latest_idx_async.py b/label_studio/fsm/migrations/0004_task_project_latest_idx_async.py
+index 698c386..cb1ecb2 100644
+--- a/label_studio/fsm/migrations/0004_task_project_latest_idx_async.py
++++ b/label_studio/fsm/migrations/0004_task_project_latest_idx_async.py
+@@ -1,6 +1,6 @@
+ from core.migration_helpers import make_sql_migration
+ from django.conf import settings
+-from django.db import migrations, models
++from django.db import connection, migrations, models
+
+ sql_forwards = (
+     'CREATE INDEX CONCURRENTLY IF NOT EXISTS task_project_latest_idx '
+@@ -34,8 +34,8 @@ class Migration(migrations.Migration):
+                 migrations.AddIndex(
+                     model_name='taskstate',
+                     index=models.Index(
+-                        fields=['project_id', 'task_id', '-id'],
+-                        include=['state'],
++                        fields=['project_id', 'task_id', '-id'] + (['state'] if connection.vendor == 'mysql' else []),
++                        include=[] if connection.vendor == 'mysql' else ['state'],
+                         name='task_project_latest_idx',
+                     ),
+                 ),
+diff --git a/label_studio/fsm/migrations/0005_mysql_state_index.py b/label_studio/fsm/migrations/0005_mysql_state_index.py
+new file mode 100644
+index 0000000..db67883
+--- /dev/null
++++ b/label_studio/fsm/migrations/0005_mysql_state_index.py
+@@ -0,0 +1,25 @@
++from django.db import migrations
++
++
++def forwards(apps, schema_editor):
++    connection = schema_editor.connection
++    if connection.vendor != 'mysql':
++        return
++    with connection.cursor() as cursor:
++        if 'task_project_latest_idx' not in connection.introspection.get_constraints(cursor, 'fsm_taskstate'):
++            cursor.execute('CREATE INDEX task_project_latest_idx ON fsm_taskstate (project_id, task_id, id DESC, state)')
++
++
++def backwards(apps, schema_editor):
++    connection = schema_editor.connection
++    if connection.vendor != 'mysql':
++        return
++    with connection.cursor() as cursor:
++        if 'task_project_latest_idx' in connection.introspection.get_constraints(cursor, 'fsm_taskstate'):
++            cursor.execute('DROP INDEX task_project_latest_idx ON fsm_taskstate')
++
++
++class Migration(migrations.Migration):
++    atomic = False
++    dependencies = [('fsm', '0004_task_project_latest_idx_async')]
++    operations = [migrations.RunPython(forwards, backwards)]
+diff --git a/label_studio/fsm/state_models.py b/label_studio/fsm/state_models.py
+index b0e4195..778a075 100644
+--- a/label_studio/fsm/state_models.py
++++ b/label_studio/fsm/state_models.py
+@@ -14,7 +14,7 @@ from datetime import datetime
+ from typing import Any, Dict, Optional
+
+ from django.conf import settings
+-from django.db import models
++from django.db import connection, models
+ from django.db.models import QuerySet, UUIDField
+ from fsm.registry import register_state_model
+ from fsm.state_choices import (
+@@ -259,8 +259,8 @@ class TaskState(BaseState):
+             # Project-scoped latest state per task, e.g. "give me tasks in project X with state Y"
+             # (filter by state after selecting the latest row).
+             models.Index(
+-                fields=['project_id', 'task_id', '-id'],
+-                include=['state'],
++                fields=['project_id', 'task_id', '-id'] + (['state'] if connection.vendor == 'mysql' else []),
++                include=[] if connection.vendor == 'mysql' else ['state'],
+                 name='task_project_latest_idx',
+             ),
+             models.Index(fields=['organization_id', 'state', '-id'], name='task_org_reporting_idx'),
+diff --git a/label_studio/io_storages/migrations/0017_auto_20240731_1638.py b/label_studio/io_storages/migrations/0017_auto_20240731_1638.py
+index 3429270..5fa8721 100644
+--- a/label_studio/io_storages/migrations/0017_auto_20240731_1638.py
++++ b/label_studio/io_storages/migrations/0017_auto_20240731_1638.py
+@@ -11,7 +11,7 @@ import logging
+ logger = logging.getLogger(__name__)
+
+
+-IS_SQLITE = connection.vendor == 'sqlite'
++IS_SQLITE = connection.vendor != 'postgresql'
+ migration_name = '0017_auto_20240731_1638'
+
+ def create_index_sql(table_name, index_name, column_name):
+diff --git a/label_studio/io_storages/migrations/0018_alter_azureblobexportstorage_project_and_more.py b/label_studio/io_storages/migrations/0018_alter_azureblobexportstorage_project_and_more.py
+index 83679d9..f6e0a5e 100644
+--- a/label_studio/io_storages/migrations/0018_alter_azureblobexportstorage_project_and_more.py
++++ b/label_studio/io_storages/migrations/0018_alter_azureblobexportstorage_project_and_more.py
+@@ -8,7 +8,7 @@ from django.conf import settings
+
+ logger = logging.getLogger(__name__)
+
+-IS_SQLITE = connection.vendor == 'sqlite'
++IS_SQLITE = connection.vendor != 'postgresql'
+
+
+ class Migration(migrations.Migration):
+diff --git a/label_studio/labels_manager/migrations/0001_initial.py b/label_studio/labels_manager/migrations/0001_initial.py
+index 667d637..1cfdac5 100644
+--- a/label_studio/labels_manager/migrations/0001_initial.py
++++ b/label_studio/labels_manager/migrations/0001_initial.py
+@@ -3,7 +3,8 @@
+ import django.contrib.postgres.fields
+ import django.db.models.deletion
+ from django.conf import settings
+-from django.db import migrations, models
++from django.db import connection, migrations, models
++from django.db.models.functions import SHA256
+
+
+ class Migration(migrations.Migration):
+@@ -48,6 +49,6 @@ class Migration(migrations.Migration):
+         ),
+         migrations.AddConstraint(
+             model_name='label',
+-            constraint=models.UniqueConstraint(fields=('title', 'organization'), name='unique_title'),
++            constraint=(models.UniqueConstraint(SHA256('title'), models.F('organization'), name='unique_title') if connection.vendor == 'mysql' else models.UniqueConstraint(fields=('title', 'organization'), name='unique_title')),
+         ),
+     ]
+diff --git a/label_studio/labels_manager/models.py b/label_studio/labels_manager/models.py
+index 36e5d8a..0a8c9f3 100755
+--- a/label_studio/labels_manager/models.py
++++ b/label_studio/labels_manager/models.py
+@@ -1,5 +1,6 @@
+ from django.conf import settings
+-from django.db import models
++from django.db import connection, models
++from django.db.models.functions import SHA256
+ from django.utils.translation import gettext_lazy as _
+
+
+@@ -27,7 +28,7 @@ class Label(models.Model):
+         return self.organization_id == user.active_organization_id
+
+     class Meta:
+-        constraints = [models.UniqueConstraint(fields=['title', 'organization'], name='unique_title')]
++        constraints = [models.UniqueConstraint(SHA256('title'), models.F('organization'), name='unique_title')] if connection.vendor == 'mysql' else [models.UniqueConstraint(fields=['title', 'organization'], name='unique_title')]
+
+
+ class LabelLink(models.Model):
+diff --git a/label_studio/labels_manager/serializers.py b/label_studio/labels_manager/serializers.py
+index e893e93..c6fb077 100755
+--- a/label_studio/labels_manager/serializers.py
++++ b/label_studio/labels_manager/serializers.py
+@@ -1,3 +1,4 @@
++from core.utils.db import bulk_create_with_ids
+ from django.conf import settings
+ from django.db import transaction
+ from projects.models import Project
+@@ -50,7 +51,7 @@ class LabelListSerializer(serializers.ListSerializer):
+                         label.save()
+                         created_labels[label.title] = label
+                 else:
+-                    created_labels = {label.title: label for label in Label.objects.bulk_create(labels_create)}
++                    created_labels = {label.title: label for label in bulk_create_with_ids(Label, labels_create)}
+
+             # connect existing and created labels to project with LabelLink
+             links = []
 diff --git a/label_studio/ml/active_learning.py b/label_studio/ml/active_learning.py
 new file mode 100644
 index 0000000..0173345
@@ -2975,6 +3424,68 @@ index d86c7af..b062416 100644
        </p>
      </div>
  
+diff --git a/label_studio/projects/api.py b/label_studio/projects/api.py
+index fef1a9f..ef8b63b 100644
+--- a/label_studio/projects/api.py
++++ b/label_studio/projects/api.py
+@@ -11,6 +11,7 @@ from core.mixins import GetParentObjectMixin
+ from core.permissions import ViewClassPermission, all_permissions
+ from core.redis import start_job_async_or_sync
+ from core.utils.common import paginator, paginator_help, temporary_disconnect_all_signals
++from core.utils.params import bool_from_request
+ from core.utils.exceptions import LabelStudioDatabaseException, ProjectExistException
+ from core.utils.filterset_to_openapi_params import filterset_to_openapi_params
+ from core.utils.io import find_dir, find_file, read_yaml
+@@ -402,18 +403,24 @@ class ProjectAPI(generics.RetrieveUpdateDestroyAPIView):
+         serializer = GetFieldsSerializer(data=self.request.query_params)
+         serializer.is_valid(raise_exception=True)
+         fields = serializer.validated_data.get('include')
+-        projects = Project.objects.with_counts(fields=fields).filter(
++        metadata_only = self.request.method == 'GET' and bool_from_request(self.request.GET, 'metadata_only', False)
++        projects = (Project.objects.all() if metadata_only else Project.objects.with_counts(fields=fields)).filter(
+             organization=self.request.user.active_organization
+         )
+
+         # Only annotate FSM state for UI/API consumption when both feature flags are enabled
+-        if flag_set('fflag_feat_fit_568_finite_state_management', user=self.request.user) and flag_set(
++        if not metadata_only and flag_set('fflag_feat_fit_568_finite_state_management', user=self.request.user) and flag_set(
+             'fflag_feat_fit_710_fsm_state_fields', user=self.request.user
+         ):
+             projects = projects.with_state()
+
+         return projects
+
++    def get_serializer(self, *args, **kwargs):
++        if self.request.method == 'GET' and bool_from_request(self.request.GET, 'metadata_only', False):
++            kwargs['omit'] = [*ProjectManager.COUNTER_FIELDS, 'queue_total', 'queue_done', 'state']
++        return super().get_serializer(*args, **kwargs)
++
+     def get(self, request, *args, **kwargs):
+         return super(ProjectAPI, self).get(request, *args, **kwargs)
+
+diff --git a/label_studio/projects/functions/__init__.py b/label_studio/projects/functions/__init__.py
+index 0b431aa..777367e 100644
+--- a/label_studio/projects/functions/__init__.py
++++ b/label_studio/projects/functions/__init__.py
+@@ -1,5 +1,5 @@
+ from core.utils.db import SQCount
+-from django.db.models import Count, OuterRef, Q
++from django.db.models import OuterRef, Q
+ from tasks.models import Annotation, Prediction, Task
+
+
+@@ -9,7 +9,10 @@ def annotate_task_number(queryset):
+
+
+ def annotate_finished_task_number(queryset):
+-    return queryset.annotate(finished_task_number=Count('tasks', filter=Q(tasks__is_labeled=True)))
++    # A join groups every task against the full project row (including label_config).
++    # The correlated count can use the existing (project, is_labeled) index instead.
++    tasks = Task.objects.filter(project=OuterRef('id'), is_labeled__in=[True]).values('id')
++    return queryset.annotate(finished_task_number=SQCount(tasks))
+
+
+ def annotate_total_predictions_number(queryset):
 diff --git a/label_studio/projects/functions/next_task.py b/label_studio/projects/functions/next_task.py
 index 040a8a0..9ef61c0 100644
 --- a/label_studio/projects/functions/next_task.py
@@ -2992,7 +3503,7 @@ index 040a8a0..9ef61c0 100644
          # collect all clusters already solved by user, count number of solved task in them
 diff --git a/label_studio/projects/labeling.py b/label_studio/projects/labeling.py
 new file mode 100644
-index 0000000..8c5e3c1
+index 0000000..3c5cd12
 --- /dev/null
 +++ b/label_studio/projects/labeling.py
 @@ -0,0 +1,419 @@
@@ -3195,7 +3706,7 @@ index 0000000..8c5e3c1
 +                         'recent_submissions': recent,
 +                         'reservation_minutes': (project.custom_task_lock_ttl or settings.TASK_LOCK_TTL) // 60,
 +                         'skip_queue': project.skip_queue, 'can_manage': can_manage,
-+                         'task_count': project.tasks.count(), 'completed_tasks': project.tasks.filter(is_labeled=True).count(),
++                         'task_count': project.tasks.count(), 'completed_tasks': project.tasks.filter(is_labeled__in=[True]).count(),
 +                         'my_completed': Annotation.objects.filter(project=project, completed_by=request.user, was_cancelled=False).values('task').distinct().count(),
 +                         'my_assigned': LabelingAssignment.objects.filter(task__project=project, user=request.user).count(),
 +                         'users': [{'id': u.pk, 'name': u.get_full_name() or u.username} for u in User.objects.filter(organizations=project.organization, is_active=True) if project.has_permission(u)] if can_manage else [],
@@ -3452,6 +3963,33 @@ index 0000000..dd3dfec
 +
 +    class Meta:
 +        constraints = [models.UniqueConstraint(fields=['task', 'user'], name='unique_labeling_workspace_draft')]
+diff --git a/label_studio/projects/migrations/0033_projects_soft_delete_indexes_async.py b/label_studio/projects/migrations/0033_projects_soft_delete_indexes_async.py
+index 9070f5f..75ccae6 100644
+--- a/label_studio/projects/migrations/0033_projects_soft_delete_indexes_async.py
++++ b/label_studio/projects/migrations/0033_projects_soft_delete_indexes_async.py
+@@ -16,6 +16,11 @@ def forward_migration(migration_name, db_alias):
+             'CREATE INDEX CONCURRENTLY IF NOT EXISTS project_deleted_at_idx ON project (deleted_at)',
+             'CREATE INDEX CONCURRENTLY IF NOT EXISTS project_purge_at_idx ON project (purge_at)',
+         ]
++    elif conn.vendor == 'mysql':
++        with conn.cursor() as cursor:
++            indexes = conn.introspection.get_constraints(cursor, 'project')
++        definitions = {'project_org_deleted_idx':'organization_id, deleted_at', 'project_deleted_at_idx':'deleted_at', 'project_purge_at_idx':'purge_at'}
++        sqls = [f'CREATE INDEX {name} ON project ({columns})' for name, columns in definitions.items() if name not in indexes]
+     else:
+         sqls = [
+             'CREATE INDEX IF NOT EXISTS project_org_deleted_idx ON project (organization_id, deleted_at)',
+@@ -38,6 +43,10 @@ def reverse_migration(migration_name, db_alias):
+             'DROP INDEX CONCURRENTLY IF EXISTS project_deleted_at_idx',
+             'DROP INDEX CONCURRENTLY IF EXISTS project_purge_at_idx',
+         ]
++    elif conn.vendor == 'mysql':
++        with conn.cursor() as cursor:
++            indexes = conn.introspection.get_constraints(cursor, 'project')
++        sqls = [f'DROP INDEX {name} ON project' for name in ['project_org_deleted_idx','project_deleted_at_idx','project_purge_at_idx'] if name in indexes]
+     else:
+         sqls = [
+             'DROP INDEX IF EXISTS project_org_deleted_idx',
 diff --git a/label_studio/projects/migrations/0039_labeling_workspace.py b/label_studio/projects/migrations/0039_labeling_workspace.py
 new file mode 100644
 index 0000000..6760fba
@@ -3491,7 +4029,7 @@ index 0000000..6760fba
 +        ], options={'constraints': [models.UniqueConstraint(fields=('task', 'user'), name='unique_labeling_workspace_draft')]}),
 +    ]
 diff --git a/label_studio/projects/models.py b/label_studio/projects/models.py
-index d19ece5..0fcdd05 100644
+index d19ece5..8924618 100644
 --- a/label_studio/projects/models.py
 +++ b/label_studio/projects/models.py
 @@ -391,7 +391,11 @@ class Project(ProjectMixin, FsmHistoryStateModel):
@@ -3516,6 +4054,24 @@ index d19ece5..0fcdd05 100644
  
      def has_ml_backend(self, *args, **kwargs):
          return self.get_ml_backends(**kwargs).exists()
+@@ -1277,7 +1281,7 @@ class Project(ProjectMixin, FsmHistoryStateModel):
+     def get_max_annotation_result_size(self):
+         """Get the maximum annotation result size for this project"""
+         # For SQLite, return 0 (no annotations to consider)
+-        if settings.DJANGO_DB == settings.DJANGO_DB_SQLITE:
++        if connection.vendor != 'postgresql':
+             return 0
+
+         # Using raw SQL to ensure we use the specific index annotation_proj_result_octlen_idx
+@@ -1304,7 +1308,7 @@ class Project(ProjectMixin, FsmHistoryStateModel):
+     def get_task_batch_size(self):
+         """Calculate optimal batch size based on task data size and annotation result size"""
+         # For SQLite, use default MAX_TASK_BATCH_SIZE
+-        if settings.DJANGO_DB == settings.DJANGO_DB_SQLITE:
++        if connection.vendor != 'postgresql':
+             return settings.MAX_TASK_BATCH_SIZE
+
+         # Get maximum task data size using the optimized index
 @@ -1987,3 +1991,6 @@ class ProjectReimport(models.Model):
  
      def has_permission(self, user):
@@ -3523,6 +4079,82 @@ index d19ece5..0fcdd05 100644
 +
 +# Project-scoped workbench configuration; no rewrite of existing task/annotation tables.
 +from projects.labeling_models import LabelingQueueSettings, LabelingAssignment, LabelingWorkspaceDraft  # noqa: E402,F401
+diff --git a/label_studio/projects/serializers.py b/label_studio/projects/serializers.py
+index d2fc531..a5139b4 100644
+--- a/label_studio/projects/serializers.py
++++ b/label_studio/projects/serializers.py
+@@ -4,7 +4,7 @@ from decimal import Decimal
+
+ import bleach
+ from constants import SAFE_HTML_ATTRIBUTES, SAFE_HTML_TAGS, SAFE_INSTRUCTION_HTML_TAGS
+-from django.db.models import Exists, OuterRef, Q
++from django.db.models import Q
+ from drf_spectacular.utils import extend_schema_field, extend_schema_serializer
+ from fsm.serializer_fields import FSMStateField
+ from label_studio_sdk.label_interface import LabelInterface
+@@ -154,6 +154,7 @@ class ProjectSerializer(FlexFieldsModelSerializer):
+
+     queue_total = serializers.SerializerMethodField()
+     queue_done = serializers.SerializerMethodField()
++    has_tasks = serializers.SerializerMethodField()
+     state = FSMStateField(read_only=True)  # FSM state - automatically uses annotation if present
+
+     @property
+@@ -167,6 +168,10 @@ class ProjectSerializer(FlexFieldsModelSerializer):
+     def get_config_has_control_tags(project) -> bool:
+         return len(project.get_parsed_config()) > 0
+
++    @staticmethod
++    def get_has_tasks(project) -> bool:
++        return project.tasks.exists()
++
+     @staticmethod
+     def get_config_suitable_for_bulk_annotation(project) -> bool:
+         li = LabelInterface(project.label_config)
+@@ -321,6 +326,7 @@ class ProjectSerializer(FlexFieldsModelSerializer):
+             'show_collab_predictions',
+             'num_tasks_with_annotations',
+             'task_number',
++            'has_tasks',
+             'useful_annotation_number',
+             'ground_truth_number',
+             'skipped_annotations_number',
+@@ -382,21 +388,26 @@ class ProjectSerializer(FlexFieldsModelSerializer):
+         return super().update(instance, validated_data)
+
+     def get_queue_total(self, project) -> int:
+-        user_annotations = Annotation.objects.filter(task_id=OuterRef('pk'), completed_by_id=self.user_id)
+-        remain = project.tasks.filter(Q(is_labeled=False) | Exists(user_annotations))
+-        return remain.count()
++        total = getattr(project, 'task_number', None)
++        finished = getattr(project, 'finished_task_number', None)
++        remaining = total - finished if total is not None and finished is not None else project.tasks.filter(is_labeled__in=[False]).count()
++        # The two sets are disjoint: unfinished tasks, plus finished tasks annotated by this user.
++        completed_by_me = Annotation.objects.filter(
++            task__project=project, task__is_labeled__in=[True], completed_by_id=self.user_id
++        ).order_by().values('task_id').distinct().count()
++        return remaining + completed_by_me
+
+     def get_queue_done(self, project) -> int:
+-        tasks_filter = {
+-            'project': project,
+-            'annotations__completed_by_id': self.user_id,
++        annotations_filter = {
++            'task__project': project,
++            'completed_by_id': self.user_id,
+         }
+
+         if project.skip_queue == project.SkipQueue.REQUEUE_FOR_ME:
+-            tasks_filter['annotations__was_cancelled'] = False
++            annotations_filter['was_cancelled'] = False
+
+-        already_done_tasks = Task.objects.filter(**tasks_filter)
+-        result = already_done_tasks.distinct().count()
++        already_done_tasks = Annotation.objects.filter(**annotations_filter)
++        result = already_done_tasks.order_by().values('task_id').distinct().count()
+
+         return result
+
 diff --git a/label_studio/projects/urls.py b/label_studio/projects/urls.py
 index e70d92e..ad8bc82 100644
 --- a/label_studio/projects/urls.py
@@ -3598,6 +4230,140 @@ index d3cd3f2..e1fa054 100644
          self.task.predictions_score = sum(scores) / len(scores) if scores else None
  
      def get(self, request, pk):
+diff --git a/label_studio/tasks/migrations/0044_auto_20230907_0155.py b/label_studio/tasks/migrations/0044_auto_20230907_0155.py
+index f00c730..3dd3d07 100644
+--- a/label_studio/tasks/migrations/0044_auto_20230907_0155.py
++++ b/label_studio/tasks/migrations/0044_auto_20230907_0155.py
+@@ -3,7 +3,7 @@
+ from django.db import migrations, models
+ from django.conf import settings
+
+-IS_SQLITE = settings.DJANGO_DB == settings.DJANGO_DB_SQLITE
++IS_SQLITE = settings.DJANGO_DB != settings.DJANGO_DB_POSTGRESQL
+
+ if IS_SQLITE:
+     from django.db.migrations import AddIndex
+@@ -12,7 +12,7 @@ else:
+
+
+ class Migration(migrations.Migration):
+-    atomic = IS_SQLITE
++    atomic = settings.DJANGO_DB == settings.DJANGO_DB_SQLITE
+
+     dependencies = [
+         ('tasks', '0043_auto_20230825'),
+diff --git a/label_studio/tasks/migrations/0052_auto_20241030_1757.py b/label_studio/tasks/migrations/0052_auto_20241030_1757.py
+index 0ca827e..197c9ca 100644
+--- a/label_studio/tasks/migrations/0052_auto_20241030_1757.py
++++ b/label_studio/tasks/migrations/0052_auto_20241030_1757.py
+@@ -25,6 +25,9 @@ def forward_migration(migration_name, db_alias):
+         SET created_at = datetime(expire_at, %s);
+         """
+         sql_params = (f'-{settings.TASK_LOCK_TTL} seconds',)
++    elif conn.vendor == 'mysql':
++        sql_update_created_at = 'UPDATE tasks_tasklock SET created_at = TIMESTAMPADD(SECOND, %s, expire_at)'
++        sql_params = (-settings.TASK_LOCK_TTL,)
+     else:
+         sql_update_created_at = """
+         UPDATE tasks_tasklock
+diff --git a/label_studio/tasks/migrations/0054_add_brin_index_updated_at.py b/label_studio/tasks/migrations/0054_add_brin_index_updated_at.py
+index 1a5cdda..3111e46 100644
+--- a/label_studio/tasks/migrations/0054_add_brin_index_updated_at.py
++++ b/label_studio/tasks/migrations/0054_add_brin_index_updated_at.py
+@@ -27,2 +27,6 @@ def forward_migration(migration_name, db_alias):
+         '''
++    elif conn.vendor == 'mysql':
++        with conn.cursor() as cursor:
++            present = 'task_updated_at_brin_idx' in conn.introspection.get_constraints(cursor, 'task')
++        sql = 'SELECT 1' if present else 'CREATE INDEX task_updated_at_brin_idx ON task (updated_at)'
+     else:
+@@ -52,2 +56,6 @@ def reverse_migration(migration_name, db_alias):
+         sql = 'DROP INDEX CONCURRENTLY IF EXISTS "task_updated_at_brin_idx";'
++    elif conn.vendor == 'mysql':
++        with conn.cursor() as cursor:
++            present = 'task_updated_at_brin_idx' in conn.introspection.get_constraints(cursor, 'task')
++        sql = 'DROP INDEX task_updated_at_brin_idx ON task' if present else 'SELECT 1'
+     else:
+diff --git a/label_studio/tasks/migrations/0055_task_proj_octlen_idx_async.py b/label_studio/tasks/migrations/0055_task_proj_octlen_idx_async.py
+index 5ee19e3..e81c52f 100644
+--- a/label_studio/tasks/migrations/0055_task_proj_octlen_idx_async.py
++++ b/label_studio/tasks/migrations/0055_task_proj_octlen_idx_async.py
+@@ -7,7 +7,7 @@ from core.redis import start_job_async_or_sync
+ import logging
+ logger = logging.getLogger(__name__)
+
+-IS_SQLITE = settings.DJANGO_DB == settings.DJANGO_DB_SQLITE
++IS_SQLITE = settings.DJANGO_DB != settings.DJANGO_DB_POSTGRESQL
+
+ migration_name = '0055_task_proj_octlen_idx_async'
+
+diff --git a/label_studio/tasks/migrations/0056_task_prediction_result_proj_gin_idx_async.py b/label_studio/tasks/migrations/0056_task_prediction_result_proj_gin_idx_async.py
+index f5852ec..478278d 100644
+--- a/label_studio/tasks/migrations/0056_task_prediction_result_proj_gin_idx_async.py
++++ b/label_studio/tasks/migrations/0056_task_prediction_result_proj_gin_idx_async.py
+@@ -11,7 +11,7 @@ from core.utils.common import btree_gin_migration_operations
+
+ logger = logging.getLogger(__name__)
+
+-IS_SQLITE = settings.DJANGO_DB == settings.DJANGO_DB_SQLITE
++IS_SQLITE = settings.DJANGO_DB != settings.DJANGO_DB_POSTGRESQL
+
+ migration_name = "0056_prediction_result_proj_gin_idx_async"
+
+diff --git a/label_studio/tasks/migrations/0057_annotation_proj_result_octlen_idx_async.py b/label_studio/tasks/migrations/0057_annotation_proj_result_octlen_idx_async.py
+index 4ce28a6..b7f787f 100644
+--- a/label_studio/tasks/migrations/0057_annotation_proj_result_octlen_idx_async.py
++++ b/label_studio/tasks/migrations/0057_annotation_proj_result_octlen_idx_async.py
+@@ -7,7 +7,7 @@ from core.redis import start_job_async_or_sync
+ import logging
+ logger = logging.getLogger(__name__)
+
+-IS_SQLITE = settings.DJANGO_DB == settings.DJANGO_DB_SQLITE
++IS_SQLITE = settings.DJANGO_DB != settings.DJANGO_DB_POSTGRESQL
+
+ migration_name = '0057_annotation_proj_result_octlen_idx_async'
+
+diff --git a/label_studio/tasks/migrations/0063_mysql_query_indexes.py b/label_studio/tasks/migrations/0063_mysql_query_indexes.py
+new file mode 100644
+index 0000000..5fe48e5
+--- /dev/null
++++ b/label_studio/tasks/migrations/0063_mysql_query_indexes.py
+@@ -0,0 +1,35 @@
++"""Cover the project/task and per-user query paths on MySQL."""
++from django.db import migrations
++
++INDEXES = [
++    ('task', 'task_project_totals_idx', 'project_id, total_annotations, total_predictions, id'),
++    ('task', 'task_proj_updated_id_idx', 'project_id, updated_at, id'),
++    ('task_completion', 'anno_user_task_cancel_idx', 'completed_by_id, task_id, was_cancelled'),
++    ('prediction', 'pred_proj_model_task_idx', 'project_id, model_version(191), task_id'),
++]
++
++
++def forwards(apps, schema_editor):
++    conn = schema_editor.connection
++    if conn.vendor != 'mysql':
++        return
++    with conn.cursor() as cursor:
++        for table, name, columns in INDEXES:
++            if name not in conn.introspection.get_constraints(cursor, table):
++                cursor.execute(f'CREATE INDEX `{name}` ON `{table}` ({columns})')
++
++
++def backwards(apps, schema_editor):
++    conn = schema_editor.connection
++    if conn.vendor != 'mysql':
++        return
++    with conn.cursor() as cursor:
++        for table, name, _ in reversed(INDEXES):
++            if name in conn.introspection.get_constraints(cursor, table):
++                cursor.execute(f'DROP INDEX `{name}` ON `{table}`')
++
++
++class Migration(migrations.Migration):
++    atomic = False
++    dependencies = [('tasks', '0062_task_data_trgm_idx_async')]
++    operations = [migrations.RunPython(forwards, backwards)]
 diff --git a/label_studio/tasks/models.py b/label_studio/tasks/models.py
 index 9785528..2bbc111 100644
 --- a/label_studio/tasks/models.py
@@ -3612,6 +4378,39 @@ index 9785528..2bbc111 100644
  
  
  def bulk_update_stats_project_tasks(tasks, project=None):
+diff --git a/label_studio/tasks/serializers.py b/label_studio/tasks/serializers.py
+index 7f55bfb..4e246f8 100644
+--- a/label_studio/tasks/serializers.py
++++ b/label_studio/tasks/serializers.py
+@@ -1,3 +1,4 @@
++from core.utils.db import bulk_create_with_ids
+ """This file and its contents are licensed under the Apache License 2.0. Please see the included NOTICE for copyright information and LICENSE for a copy of the license."""
+
+ import logging
+@@ -960,9 +961,9 @@ class BaseTaskSerializerBulk(serializers.ListSerializer):
+             for annotation in db_annotations:
+                 annotation.id = current_id
+                 current_id += 1
+-            self.db_annotations = Annotation.objects.bulk_create(db_annotations, batch_size=settings.BATCH_SIZE)
++            self.db_annotations = bulk_create_with_ids(Annotation, db_annotations, batch_size=settings.BATCH_SIZE)
+         else:
+-            self.db_annotations = Annotation.objects.bulk_create(db_annotations, batch_size=settings.BATCH_SIZE)
++            self.db_annotations = bulk_create_with_ids(Annotation, db_annotations, batch_size=settings.BATCH_SIZE)
+         logging.info(f'Annotations serialization success, len = {len(self.db_annotations)}')
+
+         # Backfill FSM states for bulk-created annotations
+@@ -1014,9 +1015,9 @@ class BaseTaskSerializerBulk(serializers.ListSerializer):
+             for task in db_tasks:
+                 task.id = current_id
+                 current_id += 1
+-            self.db_tasks = Task.objects.bulk_create(db_tasks, batch_size=settings.BATCH_SIZE)
++            self.db_tasks = bulk_create_with_ids(Task, db_tasks, batch_size=settings.BATCH_SIZE)
+         else:
+-            self.db_tasks = Task.objects.bulk_create(db_tasks, batch_size=settings.BATCH_SIZE)
++            self.db_tasks = bulk_create_with_ids(Task, db_tasks, batch_size=settings.BATCH_SIZE)
+
+         logging.info(f'Tasks serialization success, len = {len(self.db_tasks)}')
+
 diff --git a/label_studio/tasks/translation.py b/label_studio/tasks/translation.py
 new file mode 100644
 index 0000000..ddb1b78
@@ -4970,6 +5769,67 @@ index 1b4007b..9608d21 100644
    </form>
  
  {% endblock %}
+diff --git a/pyproject.toml b/pyproject.toml
+index 903b975..ce1a2f9 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -69,6 +69,7 @@ dependencies = [
+     "tldextract (>=5.1.3)",
+     "uuid-utils (>=0.11.0,<1.0.0)",
+     "label-studio-sdk",
++    "mysqlclient==2.3.0",
+ ]
+
+ [tool.uv.sources]
+diff --git a/uv.lock b/uv.lock
+index de3ca39..51161fd 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -1614,6 +1614,7 @@ dependencies = [
+     { name = "label-studio-sdk" },
+     { name = "launchdarkly-server-sdk" },
+     { name = "lxml", extra = ["html-clean"] },
++    { name = "mysqlclient" },
+     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+     { name = "openai" },
+@@ -1706,6 +1707,7 @@ requires-dist = [
+     { name = "label-studio-sdk", git = "https://github.com/HumanSignal/label-studio-sdk.git?rev=debf4444cdf163a695286796f3af497b319b878d" },
+     { name = "launchdarkly-server-sdk", specifier = "==8.2.1" },
+     { name = "lxml", extras = ["html-clean"], specifier = ">=6.1.0" },
++    { name = "mysqlclient", specifier = "==2.3.0" },
+     { name = "numpy", specifier = ">=2.2.6,<3.0.0" },
+     { name = "openai", specifier = ">=1.10.0,<2.0.0" },
+     { name = "ordered-set", specifier = "==4.0.2" },
+@@ -2065,6 +2067,28 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/79/7b/2c79738432f5c924bef5071f933bcc9efd0473bac3b4aa584a6f7c1c8df8/mypy_extensions-1.1.0-py3-none-any.whl", hash = "sha256:1be4cccdb0f2482337c4743e60421de3a356cd97508abadd57d47403e94f5505", size = 4963, upload-time = "2025-04-22T14:54:22.983Z" },
+ ]
+
++[[package]]
++name = "mysqlclient"
++version = "2.3.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/ef/8f/b9488795d21a76c1520905feba5afb6233f16510797a28b51f2b2688c93e/mysqlclient-2.3.0.tar.gz", hash = "sha256:bea8294964266f6486f1ca514ccfcdbc54d4fe0d32882b38c1d4594df870be8b", size = 102185, upload-time = "2026-09-14T15:38:30.784Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/bd/9a/49c257f71e187f37ec24cc4a7c071b1788a819054ee3b3133332c074b2cb/mysqlclient-2.3.0-cp311-cp311-win_amd64.whl", hash = "sha256:6a691aab1a6d22fb04aa08977ced9ecf0c1c781d0d985f7814972c3626db9390", size = 217316, upload-time = "2026-09-14T15:38:15.847Z" },
++    { url = "https://files.pythonhosted.org/packages/87/91/cdf42e08f3188ec4efb5e89883afb78cda3db50cd68616bce5814a27b769/mysqlclient-2.3.0-cp311-cp311-win_arm64.whl", hash = "sha256:8b3a5ebc0a2983bc252116dd132ab4c746085fa727b5c98c09edcda09dc09d0f", size = 208447, upload-time = "2026-09-14T15:38:16.867Z" },
++    { url = "https://files.pythonhosted.org/packages/61/48/5474ffb47d1f27600737ae6b4860fc4bbc17b7e7f1dec9b8b765a75d66e5/mysqlclient-2.3.0-cp312-cp312-win_amd64.whl", hash = "sha256:effb81eb6d1f1df6c1d95f63f117bec5007e9c64487e9fa17d5696f2a5338358", size = 217531, upload-time = "2026-09-14T15:38:17.871Z" },
++    { url = "https://files.pythonhosted.org/packages/a3/37/9205f687a60196e77d9bc4dd94fdb3c88a24b5cb920fdaf1acf363791bdd/mysqlclient-2.3.0-cp312-cp312-win_arm64.whl", hash = "sha256:7c3c4b3edcc7dc50d23fb5634e0e82bce8ab7de5b83d03fddc1c9979c18607a4", size = 208548, upload-time = "2026-09-14T15:38:18.884Z" },
++    { url = "https://files.pythonhosted.org/packages/1d/12/cf11b4df3ee7ca9957487a5e4c99f33611119b086b1d94e14a2ceb21797e/mysqlclient-2.3.0-cp313-cp313-win_amd64.whl", hash = "sha256:60365cce6765b94eeb621aa0f9505044ec9b4ea191cd68500f0a35b2d6d2758b", size = 217521, upload-time = "2026-09-14T15:38:19.87Z" },
++    { url = "https://files.pythonhosted.org/packages/6c/ed/4ef9c56dd78a5b6f4ede1574629e532e3f2b97bdd764a6d172fb7ed20fc4/mysqlclient-2.3.0-cp313-cp313-win_arm64.whl", hash = "sha256:a6beb9ca67a9224ff4b45f7f9118f0932038fa38d59ca2e38ae35b5225984d7d", size = 208546, upload-time = "2026-09-14T15:38:21.073Z" },
++    { url = "https://files.pythonhosted.org/packages/6e/5f/f62d1263a942e97ca34ea8bf151c13a638fea7a5a544aa9db3d6dad7671d/mysqlclient-2.3.0-cp314-cp314-win_amd64.whl", hash = "sha256:5d4c53eb9c5625dd68b6fed32c8cf00ba19cd1c3073645dec309a9d16bd029e2", size = 222543, upload-time = "2026-09-14T15:38:22.036Z" },
++    { url = "https://files.pythonhosted.org/packages/9d/e5/1de3e1fc27009a6da30a52167e98f52ab4277d089eaff7152f6156745af9/mysqlclient-2.3.0-cp314-cp314-win_arm64.whl", hash = "sha256:cfe14103280d5a4968fe8a3ace2a8939ef68a1d881aec9872d06746106b49f7f", size = 213120, upload-time = "2026-09-14T15:38:23.063Z" },
++    { url = "https://files.pythonhosted.org/packages/b3/ea/d7ebc53af9d3341e5c049795ec5e88946d83cbd26ee468475ae0c3b21d7f/mysqlclient-2.3.0-cp314-cp314t-win_amd64.whl", hash = "sha256:673891700dafbc66a6a8df12059b53a65905ec6e8dec615392fb984299880c0d", size = 222969, upload-time = "2026-09-14T15:38:24.168Z" },
++    { url = "https://files.pythonhosted.org/packages/4b/42/9ff798c066e33df9f7b58822a3eaf26185c3cb7e61a8186a56243b006066/mysqlclient-2.3.0-cp314-cp314t-win_arm64.whl", hash = "sha256:fe27c63ba9088b28467bf276f93f0b4a9062beabaeeb9692593e774d1146cce2", size = 213680, upload-time = "2026-09-14T15:38:25.259Z" },
++    { url = "https://files.pythonhosted.org/packages/d2/0f/29185111b7c0dd264e910c1250f2fd9a452ebad7fb272e750d8ffb18e67c/mysqlclient-2.3.0-cp315-cp315-win_amd64.whl", hash = "sha256:3c601984c286c51080e0d3e9a857bc014713e6338b5f9c0a5df453a341b14022", size = 222537, upload-time = "2026-09-14T15:38:26.308Z" },
++    { url = "https://files.pythonhosted.org/packages/32/7b/4a050453adb5d07ee5f979f17409f93be545baae786dd58698f82b08a3e1/mysqlclient-2.3.0-cp315-cp315-win_arm64.whl", hash = "sha256:3d39527a5525b4ebff99721d063f4fe9e459b9e437c7b7698374966d92d4355d", size = 213112, upload-time = "2026-09-14T15:38:27.329Z" },
++    { url = "https://files.pythonhosted.org/packages/a2/13/a046e9df6d69778b7de66f3d2ad83e563045992959efafb7b2ef62af0560/mysqlclient-2.3.0-cp315-cp315t-win_amd64.whl", hash = "sha256:24164ba592065ae5ff0149bb5707d05772335935059474fb75d864e5d0f94d63", size = 222969, upload-time = "2026-09-14T15:38:28.468Z" },
++    { url = "https://files.pythonhosted.org/packages/f8/13/cf40c2957bebe95fa109feb8a28fe0871ba4bd5e37c77b6128114ec20712/mysqlclient-2.3.0-cp315-cp315t-win_arm64.whl", hash = "sha256:f1ec49f73dad7df8f2da4d9de0f875f03c8bd44fbe77878522204c0646822f63", size = 213723, upload-time = "2026-09-14T15:38:29.69Z" },
++]
++
+ [[package]]
+ name = "nh3"
+ version = "0.3.3"
 diff --git a/web/apps/labelstudio/src/app/App.jsx b/web/apps/labelstudio/src/app/App.jsx
 index da31eb1..5f60211 100644
 --- a/web/apps/labelstudio/src/app/App.jsx
@@ -6521,7 +7381,7 @@ index d5c43aa..1af3513 100644
        </Modal.Header>
        <ImportPage
 diff --git a/web/apps/labelstudio/src/pages/DataManager/DataManager.jsx b/web/apps/labelstudio/src/pages/DataManager/DataManager.jsx
-index 9c51e5d..33c9bea 100644
+index 9c51e5d..c83b243 100644
 --- a/web/apps/labelstudio/src/pages/DataManager/DataManager.jsx
 +++ b/web/apps/labelstudio/src/pages/DataManager/DataManager.jsx
 @@ -1,3 +1,4 @@
@@ -6529,7 +7389,17 @@ index 9c51e5d..33c9bea 100644
  import { Button, buttonVariant, ToastContext, ToastType } from "@humansignal/ui";
  import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
  import { generatePath, useHistory } from "react-router";
-@@ -47,7 +48,7 @@ export const DataManagerPage = ({ ...props }) => {
+@@ -37,7 +38,8 @@ export const DataManagerPage = ({ ...props }) => {
+   const { project } = useProject();
+   const setContextProps = useContextProps();
+   const [crashed, _setCrashed] = useState(false);
+-  const [loading, setLoading] = useState(!window.DataManager || !window.LabelStudio);
++  const [loading, setLoading] = useState(true);
++  const [initError, setInitError] = useState(null);
+   const dataManagerRef = useRef();
+   /** Bumped in destroyDM so in-flight init after unmount cannot construct a detached DM. */
+   const initGenerationRef = useRef(0);
+@@ -47,7 +49,7 @@ export const DataManagerPage = ({ ...props }) => {
      if (!window.LabelStudio) return;
      if (!window.DataManager) return;
      if (!root.current) return;
@@ -6538,7 +7408,41 @@ index 9c51e5d..33c9bea 100644
      if (dataManagerRef.current) return;
  
      const generation = initGenerationRef.current;
-@@ -213,11 +214,9 @@ export const DataManagerPage = ({ ...props }) => {
+@@ -79,6 +81,8 @@ export const DataManagerPage = ({ ...props }) => {
+     }
+
+     dataManagerRef.current = created;
++    setLoading(false);
++    setInitError(null);
+     const dataManager = created;
+
+     Object.assign(window, { dataManager });
+@@ -185,6 +189,7 @@ export const DataManagerPage = ({ ...props }) => {
+
+   const destroyDM = useCallback(() => {
+     initGenerationRef.current += 1;
++    setLoading(true);
+     if (dataManagerRef.current) {
+       dataManagerRef.current.destroy();
+       dataManagerRef.current = null;
+@@ -201,9 +206,14 @@ export const DataManagerPage = ({ ...props }) => {
+   useReloadDataManagerOnProjectChange(projectId, destroyDM);
+
+   useEffect(() => {
++    const generation = initGenerationRef.current;
+     Promise.all(dependencies)
+-      .then(() => setLoading(false))
+-      .then(init);
++      .then(init)
++      .catch(() => {
++        if (generation !== initGenerationRef.current) return;
++        setLoading(false);
++        setInitError(__uiT("Could not load the project. Please retry."));
++      });
+   }, [init]);
+
+   useEffect(() => {
+@@ -213,22 +223,19 @@ export const DataManagerPage = ({ ...props }) => {
  
    return crashed ? (
      <div className={cn("crash").toClassName()}>
@@ -6551,8 +7455,25 @@ index 9c51e5d..33c9bea 100644
 +      <Button to="/projects" aria-label={__uiT("Back to projects")}>{" "}{__uiT("Back to projects")}{" "}</Button>
      </div>
    ) : (
-     <>
-@@ -242,7 +241,8 @@ DataManagerPage.context = ({ dmRef }) => {
+-    <>
+-      {loading && (
+-        <div className="flex-1 absolute inset-0 flex items-center justify-center">
+-          <Spinner size={64} />
+-        </div>
+-      )}
++    <div className="datamanager-shell">
++      {(loading || initError) && <div className="project-load-state" data-testid="project-loading" role={initError ? "alert" : "status"}>
++        <div className="project-load-state__message">{loading && <Spinner size={24} />}{initError || __uiT("Loading project and samples...")}{initError && <Button size="small" onClick={() => { setInitError(null);setLoading(true);Promise.all(dependencies).then(init).catch(() => {setLoading(false);setInitError(__uiT("Could not load the project. Please retry."));}); }}>{__uiT("Retry")}</Button>}</div>
++        {loading && <div className="project-load-state__skeleton" aria-hidden="true">{[0,1,2,3,4].map(i => <div key={i}/>)}</div>}
++      </div>}
+       {/* Allow this to exist before the DataManager is initialized as the async app.fetchData call eventually calls startLabeling, and that requires the root element to exist */}
+       <div ref={root} className={cn("datamanager").toClassName()} />
+-    </>
++    </div>
+   );
+ };
+
+@@ -242,7 +249,8 @@ DataManagerPage.context = ({ dmRef }) => {
    const [mode, setMode] = useState(dmRef?.mode ?? "explorer");
  
    const links = {
@@ -6562,7 +7483,7 @@ index 9c51e5d..33c9bea 100644
    };
  
    const updateCrumbs = (currentMode) => {
-@@ -253,7 +253,7 @@ DataManagerPage.context = ({ dmRef }) => {
+@@ -253,7 +261,7 @@ DataManagerPage.context = ({ dmRef }) => {
      } else {
        addCrumb({
          key: "dm-crumb",
@@ -6571,7 +7492,7 @@ index 9c51e5d..33c9bea 100644
        });
      }
    };
-@@ -264,7 +264,7 @@ DataManagerPage.context = ({ dmRef }) => {
+@@ -264,7 +272,7 @@ DataManagerPage.context = ({ dmRef }) => {
  
      if (isLabelStream && show_instruction && expert_instruction) {
        modal({
@@ -6580,7 +7501,7 @@ index 9c51e5d..33c9bea 100644
          body: <div dangerouslySetInnerHTML={{ __html: expert_instruction }} />,
          style: { width: 680 },
        });
-@@ -295,7 +295,7 @@ DataManagerPage.context = ({ dmRef }) => {
+@@ -295,7 +303,7 @@ DataManagerPage.context = ({ dmRef }) => {
            look="outlined"
            onClick={() => {
              modal({
@@ -6589,7 +7510,7 @@ index 9c51e5d..33c9bea 100644
                body: () => (
                  <div
                    dangerouslySetInnerHTML={{
-@@ -305,9 +305,7 @@ DataManagerPage.context = ({ dmRef }) => {
+@@ -305,9 +313,7 @@ DataManagerPage.context = ({ dmRef }) => {
                ),
              });
            }}
@@ -6600,8 +7521,23 @@ index 9c51e5d..33c9bea 100644
        )}
  
        {Object.entries(links).map(([path, label]) => (
+diff --git a/web/apps/labelstudio/src/pages/DataManager/DataManager.prefix.css b/web/apps/labelstudio/src/pages/DataManager/DataManager.prefix.css
+index dbf891a..0f463d6 100644
+--- a/web/apps/labelstudio/src/pages/DataManager/DataManager.prefix.css
++++ b/web/apps/labelstudio/src/pages/DataManager/DataManager.prefix.css
+@@ -11,3 +11,10 @@
+ .datamanager * {
+   font-family: var(--font-sans) !important;
+ }
++
++.project-load-state{position:absolute;inset:0;z-index:2;padding:20px;background:var(--color-neutral-background);color:var(--color-neutral-content-subtler)}
++.project-load-state__message{display:flex;align-items:center;gap:12px;font-size:14px;min-height:32px}
++.project-load-state__skeleton{margin-top:24px;border:1px solid var(--color-neutral-border);border-radius:4px;overflow:hidden}
++.project-load-state__skeleton>div{height:48px;margin:0 16px;border-bottom:1px solid var(--color-neutral-border);background:linear-gradient(90deg,transparent,var(--color-neutral-surface),transparent)}
++
++.datamanager-shell{position:relative;flex:1;min-width:0;min-height:0}
 diff --git a/web/apps/labelstudio/src/pages/ExportPage/ExportPage.jsx b/web/apps/labelstudio/src/pages/ExportPage/ExportPage.jsx
-index a1c1f3a..cfcbc03 100644
+index a1c1f3a..645674e 100644
 --- a/web/apps/labelstudio/src/pages/ExportPage/ExportPage.jsx
 +++ b/web/apps/labelstudio/src/pages/ExportPage/ExportPage.jsx
 @@ -1,3 +1,4 @@
@@ -6609,6 +7545,15 @@ index a1c1f3a..cfcbc03 100644
  import { useEffect, useRef, useState, useCallback } from "react";
  import { useHistory } from "react-router";
  import { Button, Badge } from "@humansignal/ui";
+@@ -139,7 +140,7 @@ export const ExportPage = () => {
+       // This is best-effort and should not trigger global error UI if it fails.
+       api
+         .callApi("project", {
+-          params: { pk: pageParams.id },
++          params: { pk: pageParams.id, include: "id,task_number" },
+           errorFilter: () => true,
+         })
+         .then((project) => {
 @@ -161,7 +162,7 @@ export const ExportPage = () => {
  
          history.replace(`${path}${search !== "?" ? search : ""}`);
@@ -7398,7 +8343,7 @@ index f398c54..dfa6b4d 100644
    exact: true,
    layout: MenuLayout,
 diff --git a/web/apps/labelstudio/src/pages/Projects/Projects.jsx b/web/apps/labelstudio/src/pages/Projects/Projects.jsx
-index 593bb40..00b9aaf 100644
+index 593bb40..a1592a0 100644
 --- a/web/apps/labelstudio/src/pages/Projects/Projects.jsx
 +++ b/web/apps/labelstudio/src/pages/Projects/Projects.jsx
 @@ -1,3 +1,4 @@
@@ -7414,8 +8359,11 @@ index 593bb40..00b9aaf 100644
  import { SettingsPage } from "../Settings";
  import { EmptyProjectsList, ProjectsList } from "./ProjectsList";
  import { useAbortController, useUpdatePageTitle } from "@humansignal/core";
-@@ -29,7 +31,7 @@ export const ProjectsPage = () => {
+@@ -27,9 +29,10 @@ export const ProjectsPage = () => {
+   const [networkState, setNetworkState] = React.useState(null);
+   const [currentPage, setCurrentPage] = useState(getCurrentPage());
    const [totalItems, setTotalItems] = useState(1);
++  const requestGeneration = React.useRef(0);
    const setContextProps = useContextProps();
  
 -  useUpdatePageTitle("Projects");
@@ -7423,7 +8371,54 @@ index 593bb40..00b9aaf 100644
    const defaultPageSize = Number.parseInt(localStorage.getItem("pages:projects-list") ?? 30);
  
    const [modal, setModal] = React.useState(false);
-@@ -141,7 +143,7 @@ export const ProjectsPage = () => {
+@@ -39,6 +42,7 @@ export const ProjectsPage = () => {
+   const closeModal = () => setModal(false);
+
+   const fetchProjects = async (page = currentPage, pageSize = defaultPageSize) => {
++    const generation = ++requestGeneration.current;
+     setNetworkState("loading");
+     abortController.renew(); // Cancel any in flight requests
+
+@@ -58,11 +62,13 @@ export const ProjectsPage = () => {
+     const data = await api.callApi("projects", {
+       params: requestParams,
+       signal: abortController.controller.current.signal,
+-      errorFilter: (e) => e.error.includes("aborted"),
++      errorFilter: (e) => String(e?.error).includes("aborted"),
+     });
+
++    if (generation !== requestGeneration.current || abortController.controller.current.signal.aborted) return;
++
+     setTotalItems(data?.count ?? 1);
+-    setProjectsList(data.results ?? []);
++    setProjectsList(data?.results ?? []);
+     setNetworkState("loaded");
+
+     if (data?.results?.length) {
+@@ -83,19 +89,12 @@ export const ProjectsPage = () => {
+           page_size: pageSize,
+         },
+         signal: abortController.controller.current.signal,
+-        errorFilter: (e) => e.error.includes("aborted"),
++        errorFilter: (e) => String(e?.error).includes("aborted"),
+       });
+
+-      if (additionalData?.results?.length) {
++      if (generation === requestGeneration.current && !abortController.controller.current.signal.aborted && additionalData?.results?.length) {
+         setProjectsList((prev) =>
+-          additionalData.results.map((project) => {
+-            const prevProject = prev.find(({ id }) => id === project.id);
+-
+-            return {
+-              ...prevProject,
+-              ...project,
+-            };
+-          }),
++          prev.map((project) => ({...project,...additionalData.results.find(({id})=>id===project.id)})),
+         );
+       }
+     }
+@@ -141,7 +140,7 @@ export const ProjectsPage = () => {
    );
  };
  
@@ -7432,7 +8427,7 @@ index 593bb40..00b9aaf 100644
  ProjectsPage.path = "/projects";
  ProjectsPage.exact = true;
  ProjectsPage.routes = ({ store }) => [
-@@ -156,6 +158,7 @@ ProjectsPage.routes = ({ store }) => [
+@@ -156,6 +155,7 @@ ProjectsPage.routes = ({ store }) => [
      },
      pages: {
        DataManagerPage,
@@ -7440,7 +8435,7 @@ index 593bb40..00b9aaf 100644
        SettingsPage,
      },
    },
-@@ -163,8 +166,6 @@ ProjectsPage.routes = ({ store }) => [
+@@ -163,8 +163,6 @@ ProjectsPage.routes = ({ store }) => [
  ProjectsPage.context = ({ openModal, showButton }) => {
    if (!showButton) return null;
    return (
@@ -7451,7 +8446,7 @@ index 593bb40..00b9aaf 100644
    );
  };
 diff --git a/web/apps/labelstudio/src/pages/Projects/ProjectsList.jsx b/web/apps/labelstudio/src/pages/Projects/ProjectsList.jsx
-index 3075f9f..b755f9a 100644
+index 3075f9f..592c84a 100644
 --- a/web/apps/labelstudio/src/pages/Projects/ProjectsList.jsx
 +++ b/web/apps/labelstudio/src/pages/Projects/ProjectsList.jsx
 @@ -1,3 +1,4 @@
@@ -7459,7 +8454,15 @@ index 3075f9f..b755f9a 100644
  import chr from "chroma-js";
  import { format } from "date-fns";
  import { useMemo } from "react";
-@@ -22,7 +23,7 @@ export const ProjectsList = ({ projects, currentPage, totalItems, loadNextPage,
+@@ -10,6 +11,7 @@ import { absoluteURL } from "../../utils/helpers";
+ import { ProjectStateChip } from "@humansignal/app-common";
+
+ const DEFAULT_CARD_COLORS = ["#FFFFFF", "#FDFDFC"];
++const formatCount = value => typeof value === "number" ? value.toLocaleString() : "—";
+
+ export const ProjectsList = ({ projects, currentPage, totalItems, loadNextPage, pageSize }) => {
+   return (
+@@ -22,7 +24,7 @@ export const ProjectsList = ({ projects, currentPage, totalItems, loadNextPage,
        <div className={cn("projects-page").elem("pages").toClassName()}>
          <Pagination
            name="projects-list"
@@ -7468,7 +8471,7 @@ index 3075f9f..b755f9a 100644
            page={currentPage}
            totalItems={totalItems}
            urlParamName="page"
-@@ -43,11 +44,9 @@ export const EmptyProjectsList = ({ openModal }) => {
+@@ -43,11 +45,9 @@ export const EmptyProjectsList = ({ openModal }) => {
          className={cn("empty-projects-page").elem("heidi").toClassName()}
          src={absoluteURL("/static/images/opossum_looking.png")}
        />
@@ -7483,7 +8486,7 @@ index 3075f9f..b755f9a 100644
      </div>
    );
  };
-@@ -82,9 +81,9 @@ const ProjectCard = ({ project }) => {
+@@ -82,9 +82,9 @@ const ProjectCard = ({ project }) => {
          <div className={cn("project-card").elem("header").toClassName()}>
            <div className={cn("project-card").elem("title").toClassName()}>
              <div className={cn("project-card").elem("title-text-wrapper").toClassName()}>
@@ -7495,7 +8498,7 @@ index 3075f9f..b755f9a 100644
                  </div>
                </Tooltip>
              </div>
-@@ -99,12 +98,12 @@ const ProjectCard = ({ project }) => {
+@@ -99,12 +99,12 @@ const ProjectCard = ({ project }) => {
                <Dropdown.Trigger
                  content={
                    <Menu contextual>
@@ -7511,6 +8514,35 @@ index 3075f9f..b755f9a 100644
                    <DotsThreeIcon />
                  </Button>
                </Dropdown.Trigger>
+@@ -116,23 +116,23 @@ const ProjectCard = ({ project }) => {
+               </div>
+             )}
+           </div>
+-          <div className={cn("project-card").elem("summary").toClassName()}>
++          <div className={cn("project-card").elem("summary").toClassName()} aria-busy={project.task_number == null}>
+             <div className={cn("project-card").elem("annotation").toClassName()}>
+               <div className={cn("project-card").elem("total").toClassName()}>
+-                {project.finished_task_number} / {project.task_number}
++                {formatCount(project.finished_task_number)} / {formatCount(project.task_number)}
+               </div>
+               <div className={cn("project-card").elem("detail").toClassName()}>
+                 <div className={cn("project-card").elem("detail-item").mod({ type: "completed" }).toClassName()}>
+                   <CheckIcon className={cn("project-card").elem("icon").toClassName()} />
+-                  {project.total_annotations_number}
++                  {formatCount(project.total_annotations_number)}
+                 </div>
+                 <div className={cn("project-card").elem("detail-item").mod({ type: "rejected" }).toClassName()}>
+                   <MinusIcon className={cn("project-card").elem("icon").toClassName()} />
+-                  {project.skipped_annotations_number}
++                  {formatCount(project.skipped_annotations_number)}
+                 </div>
+                 <div className={cn("project-card").elem("detail-item").mod({ type: "predictions" }).toClassName()}>
+                   <IconSparks className={cn("project-card").elem("icon").toClassName()} />
+-                  {project.total_predictions_number}
++                  {formatCount(project.total_predictions_number)}
+                 </div>
+               </div>
+             </div>
 diff --git a/web/apps/labelstudio/src/pages/Settings/AnnotationSettings.jsx b/web/apps/labelstudio/src/pages/Settings/AnnotationSettings.jsx
 index d4fad0d..8f762a1 100644
 --- a/web/apps/labelstudio/src/pages/Settings/AnnotationSettings.jsx
@@ -7732,24 +8764,35 @@ index a39468a..20c67cb 100644
 +  </div>;
  };
 diff --git a/web/apps/labelstudio/src/pages/Settings/DangerZone.jsx b/web/apps/labelstudio/src/pages/Settings/DangerZone.jsx
-index 7daed28..bae3c53 100644
+index 7daed28..3dc8043 100644
 --- a/web/apps/labelstudio/src/pages/Settings/DangerZone.jsx
 +++ b/web/apps/labelstudio/src/pages/Settings/DangerZone.jsx
-@@ -1,3 +1,4 @@
+@@ -1,4 +1,5 @@
+-import { useMemo, useState } from "react";
 +import { uiT as __uiT } from "@humansignal/app-common/i18n/ui";
- import { useMemo, useState } from "react";
++import { useEffect, useMemo, useState } from "react";
  import { useHistory } from "react-router";
  import { Button, Typography, useToast } from "@humansignal/ui";
-@@ -19,7 +20,7 @@ export const DangerZone = () => {
+ import { useUpdatePageTitle, createTitleFromSegments } from "@humansignal/core";
+@@ -18,8 +19,16 @@ export const DangerZone = () => {
+   const history = useHistory();
    const toast = useToast();
    const [processing, setProcessing] = useState(null);
++  const [counts, setCounts] = useState({});
++  useEffect(() => {
++    if (!project.id) return;
++    let active = true;setCounts({});
++    api.callApi("project", {params:{pk:project.id,include:"id,task_number,total_annotations_number,total_predictions_number"},errorFilter:()=>true})
++      .then(result=>{if(active&&result?.id===project.id)setCounts(result);});
++    return()=>{active=false;};
++  },[project.id]);
  
 -  useUpdatePageTitle(createTitleFromSegments([project?.title, "Danger Zone"]));
 +  useUpdatePageTitle(createTitleFromSegments([project?.title, __uiT("Danger Zone")]));
  
    const showDangerConfirmation = ({ title, message, requiredWord, buttonText, onConfirm }) => {
      const isDev = process.env.NODE_ENV === "development";
-@@ -38,7 +39,7 @@ export const DangerZone = () => {
+@@ -38,7 +47,7 @@ export const DangerZone = () => {
                {message}
              </Typography>
              <Input
@@ -7758,7 +8801,7 @@ index 7daed28..bae3c53 100644
                value={inputValue}
                onChange={(e) => ctrl?.setState({ inputValue: e.target.value })}
                autoFocus
-@@ -60,9 +61,7 @@ export const DangerZone = () => {
+@@ -60,9 +69,7 @@ export const DangerZone = () => {
                look="outline"
                onClick={() => ctrl?.hide()}
                data-testid="danger-zone-cancel-button"
@@ -7769,7 +8812,7 @@ index 7daed28..bae3c53 100644
              <Button
                variant="negative"
                disabled={!isValid}
-@@ -83,34 +82,28 @@ export const DangerZone = () => {
+@@ -83,34 +90,28 @@ export const DangerZone = () => {
    const handleOnClick = (type) => () => {
      const actionConfig = {
        reset_cache: {
@@ -7813,7 +8856,7 @@ index 7daed28..bae3c53 100644
        },
      };
  
-@@ -131,25 +124,25 @@ export const DangerZone = () => {
+@@ -131,25 +132,25 @@ export const DangerZone = () => {
                  pk: project.id,
                },
              });
@@ -7843,28 +8886,28 @@ index 7daed28..bae3c53 100644
          } finally {
            setProcessing(null);
          }
-@@ -162,17 +155,17 @@ export const DangerZone = () => {
+@@ -162,17 +163,17 @@ export const DangerZone = () => {
        {
          type: "annotations",
          disabled: true, //&& !project.total_annotations_number,
 -        label: `Delete ${project.total_annotations_number} Annotations`,
-+        label: __uiT("Delete {{value0}} Annotations", {value0: (project.total_annotations_number)}),
++        label: __uiT("Delete {{value0}} Annotations", {value0: (counts.total_annotations_number ?? "—")}),
        },
        {
          type: "tasks",
          disabled: true, //&& !project.task_number,
 -        label: `Delete ${project.task_number} Tasks`,
-+        label: __uiT("Delete {{value0}} Tasks", {value0: (project.task_number)}),
++        label: __uiT("Delete {{value0}} Tasks", {value0: (counts.task_number ?? "—")}),
        },
        {
          type: "predictions",
          disabled: true, //&& !project.total_predictions_number,
 -        label: `Delete ${project.total_predictions_number} Predictions`,
-+        label: __uiT("Delete {{value0}} Predictions", {value0: (project.total_predictions_number)}),
++        label: __uiT("Delete {{value0}} Predictions", {value0: (counts.total_predictions_number ?? "—")}),
        },
        {
          type: "reset_cache",
-@@ -180,17 +173,17 @@ export const DangerZone = () => {
+@@ -180,31 +181,26 @@ export const DangerZone = () => {
            "Reset Cache may help in cases like if you are unable to modify the labeling configuration due " +
            "to validation errors concerning existing labels, but you are confident that the labels don't exist. You can " +
            "use this action to reset the cache and try again.",
@@ -7886,8 +8929,9 @@ index 7daed28..bae3c53 100644
 +        label: __uiT("Delete Project"),
        },
      ],
-     [project],
-@@ -198,13 +191,8 @@ export const DangerZone = () => {
+-    [project],
++    [project, counts],
+   );
  
    return (
      <div className={cn("simple-settings").toClassName()}>
@@ -7903,7 +8947,7 @@ index 7daed28..bae3c53 100644
  
        {project.id ? (
          <div style={{ marginTop: 16 }}>
-@@ -244,5 +232,5 @@ export const DangerZone = () => {
+@@ -244,5 +240,5 @@ export const DangerZone = () => {
    );
  };
  
@@ -8049,7 +9093,7 @@ index 3c423d4..2789e3f 100644
  GeneralSettings.path = "/";
  GeneralSettings.exact = true;
 diff --git a/web/apps/labelstudio/src/pages/Settings/LabelingSettings.jsx b/web/apps/labelstudio/src/pages/Settings/LabelingSettings.jsx
-index 11ac063..1e561d8 100644
+index 11ac063..6116e50 100644
 --- a/web/apps/labelstudio/src/pages/Settings/LabelingSettings.jsx
 +++ b/web/apps/labelstudio/src/pages/Settings/LabelingSettings.jsx
 @@ -1,3 +1,4 @@
@@ -8066,6 +9110,15 @@ index 11ac063..1e561d8 100644
  
    const saveConfig = useCallback(async () => {
      const res = await updateProject({
+@@ -31,7 +32,7 @@ export const LabelingSettings = () => {
+     if (project.label_config) {
+       const hasConfig = !isEmptyString(project.label_config);
+       const configIsEmpty = project.label_config.replace(/\s/g, "") === "<View></View>";
+-      const hasTasks = project.task_number > 0;
++      const hasTasks = project.has_tasks ?? project.task_number > 0;
+
+       console.log({ hasConfig, configIsEmpty, hasTasks, project });
+       return hasConfig && !configIsEmpty && hasTasks;
 @@ -65,5 +66,5 @@ export const LabelingSettings = () => {
    );
  };
@@ -10157,7 +11210,7 @@ index 39dd165..afc03aa 100644
      ) : (
        <ErrorWrapper {...formattedError} title={title} message={message} />
 diff --git a/web/apps/labelstudio/src/providers/ProjectProvider.tsx b/web/apps/labelstudio/src/providers/ProjectProvider.tsx
-index 88554df..20d5171 100644
+index 88554df..2c1b2fe 100644
 --- a/web/apps/labelstudio/src/providers/ProjectProvider.tsx
 +++ b/web/apps/labelstudio/src/providers/ProjectProvider.tsx
 @@ -1,11 +1,11 @@
@@ -10174,37 +11227,84 @@ index 88554df..20d5171 100644
  import { atom, useSetAtom } from "jotai";
  
  type Empty = Record<string, never>;
-@@ -31,7 +31,11 @@ type UpdateProjectOptions = {
+@@ -22,7 +22,8 @@ type Context = {
+ export const ProjectContext = createContext<Context>({} as Context);
+ ProjectContext.displayName = "ProjectContext";
+
+-const projectCache = new Map<number, APIProject>();
++const projectCache = new Map<string, { project: APIProject; loadedAt: number }>();
++const PROJECT_CACHE_MS = 5000;
+
+ type UpdateProjectOptions = {
+   returnErrors?: boolean;
+@@ -31,10 +32,16 @@ type UpdateProjectOptions = {
  export const ProjectProvider: React.FunctionComponent = ({ children }) => {
    const api = useAPI();
    const params = useParams();
 +  const routePath = useFixedLocation().pathname;
    const { user } = useAuth();
++  const authRef = useRef(user?.id);authRef.current = user?.id;
++  const inFlight = useRef(new Map<string, Promise<unknown>>());
 +  const routeId = Number(params.id);
 +  const routeRef = useRef(routeId);routeRef.current = routeId;
 +  const requestGeneration = useRef(0);
    const { update: updateStore } = useAppStore();
    // @todo use null for missed project data
-   const [projectData, _setProjectData] = useState<APIProject | Empty>(projectCache.get(+params.id) ?? {});
-@@ -46,7 +50,8 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
+-  const [projectData, _setProjectData] = useState<APIProject | Empty>(projectCache.get(+params.id) ?? {});
++  const [projectData, _setProjectData] = useState<APIProject | Empty>(projectCache.get(`${user?.id}:${params.id}`)?.project ?? {});
+   const setProject = useSetAtom(projectAtom);
+
+   const setProjectData = (project: APIProject | Empty) => {
+@@ -46,23 +53,39 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
      async (id, force = false) => {
        const finalProjectId = +(id ?? params.id);
  
 -      if (isNaN(finalProjectId)) return;
-+      if (!Number.isSafeInteger(finalProjectId) || finalProjectId <= 0) return;
+-
+-      if (!force && projectCache.has(finalProjectId) && projectCache.get(finalProjectId) !== undefined) {
+-        setProjectData({ ...projectCache.get(finalProjectId)! });
++      if (!user?.id || !Number.isSafeInteger(finalProjectId) || finalProjectId <= 0) return;
 +      const generation = ++requestGeneration.current;
++      const key = `${user.id}:${finalProjectId}`;
++      const cached = projectCache.get(key);
++
++      if (!force && cached) {
++        setProjectData({ ...cached.project });
++        updateStore({ project: cached.project });
++        if (Date.now() - cached.loadedAt < PROJECT_CACHE_MS) {
++          addVisitedProject(cached.project.id, user.id);
++          return cached.project;
++        }
+       }
  
-       if (!force && projectCache.has(finalProjectId) && projectCache.get(finalProjectId) !== undefined) {
-         setProjectData({ ...projectCache.get(finalProjectId)! });
-@@ -58,6 +63,7 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
-       });
+-      const result = await api.callApi<APIProject>("project", {
+-        params: { pk: finalProjectId },
+-        errorFilter: () => false,
+-      });
++      let pending = force ? undefined : inFlight.current.get(key);
++      if (!pending) {
++        pending = api.callApi<APIProject>("project", {
++          params: { pk: finalProjectId, metadata_only: true },
++          errorFilter: () => false,
++        });
++        inFlight.current.set(key, pending);
++      }
++      let result;
++      try { result = await pending; }
++      finally { if (inFlight.current.get(key) === pending) inFlight.current.delete(key); }
  
        const projectInfo = result as unknown as APIProject;
-+      if (!projectInfo?.id || generation !== requestGeneration.current || (Number.isFinite(routeRef.current) && routeRef.current !== finalProjectId)) return;
++      if (!projectInfo?.id || authRef.current !== user.id || generation !== requestGeneration.current || (Number.isFinite(routeRef.current) && routeRef.current !== finalProjectId)) return;
  
        if (shallowEqualObjects(projectData, projectInfo) === false) {
          setProjectData(projectInfo);
-@@ -71,11 +77,13 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
+         updateStore({ project: projectInfo });
+-        projectCache.set(projectInfo.id, projectInfo);
++        projectCache.set(key, { project: projectInfo, loadedAt: Date.now() });
+       }
+
+       if (projectInfo?.id) {
+@@ -71,11 +94,13 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
  
        return projectInfo;
      },
@@ -10219,7 +11319,7 @@ index 88554df..20d5171 100644
        const result = await api.callApi<APIProject>("updateProject", {
          params: {
            pk: projectData.id,
-@@ -84,7 +92,7 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
+@@ -84,10 +109,10 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
          errorFilter: options?.returnErrors ? undefined : () => true,
        });
  
@@ -10227,8 +11327,12 @@ index 88554df..20d5171 100644
 +      if (result?.$meta?.ok && (!Number.isFinite(routeRef.current) || routeRef.current === projectId)) {
          setProjectData(result as unknown as APIProject);
          updateStore({ project: result });
-         projectCache.set(result.id, result);
-@@ -96,11 +104,12 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
+-        projectCache.set(result.id, result);
++        projectCache.set(`${user?.id}:${result.id}`, { project: result as unknown as APIProject, loadedAt: Date.now() });
+       }
+
+       return result;
+@@ -96,11 +121,12 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
    );
  
    useEffect(() => {
@@ -10242,7 +11346,7 @@ index 88554df..20d5171 100644
  
    useEffect(() => {
      return () => projectCache.clear();
-@@ -115,6 +124,7 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
+@@ -115,6 +141,7 @@ export const ProjectProvider: React.FunctionComponent = ({ children }) => {
          invalidateCache() {
            projectCache.clear();
            setProjectData({});
@@ -15260,7 +16364,7 @@ index fa891b1..3994b9b 100644
              </span>
            ) : null}
 diff --git a/web/libs/datamanager/src/components/DataManager/DataManager.jsx b/web/libs/datamanager/src/components/DataManager/DataManager.jsx
-index 3da9861..2ab1fef 100644
+index 3da9861..4e4d61a 100644
 --- a/web/libs/datamanager/src/components/DataManager/DataManager.jsx
 +++ b/web/libs/datamanager/src/components/DataManager/DataManager.jsx
 @@ -1,3 +1,4 @@
@@ -15268,6 +16372,15 @@ index 3da9861..2ab1fef 100644
  import { inject, observer } from "mobx-react";
  import { useCallback } from "react";
  import { Draggable } from "react-beautiful-dnd";
+@@ -26,7 +27,7 @@ const summaryInjector = inject(({ store }) => {
+   const { project, taskStore } = store;
+
+   return {
+-    totalTasks: project?.task_count ?? project?.task_number ?? 0,
++    totalTasks: project?.task_count ?? project?.task_number ?? "—",
+     totalFoundTasks: taskStore?.total ?? 0,
+     totalAnnotations: taskStore?.totalAnnotations ?? 0,
+     totalPredictions: taskStore?.totalPredictions ?? 0,
 @@ -47,19 +48,16 @@ const ProjectSummary = summaryInjector((props) => {
    return (
      <Space size="large" style={{ paddingRight: "1em", color: "var(--color-neutral-content-subtle)" }}>
@@ -15430,7 +16543,7 @@ index 0936fb2..48457be 100644
          data-testid="dm-grid-width-button"
        />
 diff --git a/web/libs/datamanager/src/components/DataManager/Toolbar/LabelButton.jsx b/web/libs/datamanager/src/components/DataManager/Toolbar/LabelButton.jsx
-index 61e6260..de13a71 100644
+index 61e6260..1c6f603 100644
 --- a/web/libs/datamanager/src/components/DataManager/Toolbar/LabelButton.jsx
 +++ b/web/libs/datamanager/src/components/DataManager/Toolbar/LabelButton.jsx
 @@ -1,3 +1,4 @@
@@ -15438,6 +16551,15 @@ index 61e6260..de13a71 100644
  import { inject } from "mobx-react";
  import { Button, ButtonGroup } from "@humansignal/ui";
  import { Interface } from "../../Common/Interface";
+@@ -8,7 +9,7 @@ import { Menu } from "../../Common/Menu/Menu";
+
+ const injector = inject(({ store }) => {
+   const { dataStore, currentView } = store;
+-  const totalTasks = store.project?.task_count ?? store.project?.task_number ?? 0;
++  const totalTasks = store.project?.task_count ?? store.project?.task_number ?? (store.project?.has_tasks ? 1 : 0);
+   const foundTasks = dataStore?.total ?? 0;
+
+   return {
 @@ -82,6 +83,9 @@ export const LabelButton = injector(({ store, canLabel, size, target, selectedCo
  
    selectedCount;
@@ -16283,7 +17405,7 @@ index a91e3ce..9847e8a 100644
        </Space>
      </div>
 diff --git a/web/libs/datamanager/src/components/MainView/DataView/Table.jsx b/web/libs/datamanager/src/components/MainView/DataView/Table.jsx
-index cf96628..7502381 100644
+index cf96628..c9d3465 100644
 --- a/web/libs/datamanager/src/components/MainView/DataView/Table.jsx
 +++ b/web/libs/datamanager/src/components/MainView/DataView/Table.jsx
 @@ -1,3 +1,4 @@
@@ -16291,6 +17413,31 @@ index cf96628..7502381 100644
  import { QuestionIcon, SlidersHorizontalIcon } from "@humansignal/icons";
  import { Tooltip, Badge, EnterpriseBadge } from "@humansignal/ui";
  import { inject, observer } from "mobx-react";
+@@ -28,7 +29,7 @@ import { shouldShowAgreementCalculationIndicator } from "../../../utils/agreemen
+
+ const injector = inject(({ store }) => {
+   const { dataStore, currentView } = store;
+-  const totalTasks = store.project?.task_count ?? store.project?.task_number ?? 0;
++  const totalTasks = store.project?.task_count ?? store.project?.task_number ?? (store.project?.has_tasks ? 1 : 0);
+   const foundTasks = dataStore?.total ?? 0;
+
+   const props = {
+@@ -47,13 +48,13 @@ const injector = inject(({ store }) => {
+     isLoading: dataStore?.loading ?? true,
+     isSavingView: currentView?.locked ?? false,
+     isTabLocked: currentView?.isLockedByManager ?? false,
+-    hasData: (store.project?.task_count ?? store.project?.task_number ?? dataStore?.total ?? 0) > 0,
++    hasData: (dataStore?.total ?? 0) > 0 || store.project?.has_tasks === true || totalTasks > 0,
+     focusedItem: dataStore?.selected ?? dataStore?.highlighted,
+     // Role-based empty state props
+     role: store.SDK?.role ?? null,
+     project: store.project ?? {},
+     hasFilters: (currentView?.filtersApplied ?? 0) > 0,
+-    canLabel: totalTasks > 0 && foundTasks > 0,
++    canLabel: foundTasks > 0,
+     // LSE-specific callbacks and components
+     onViewAnalytics: store.SDK?.onViewAnalytics,
+     onViewReviewerAnalytics: store.SDK?.onViewReviewerAnalytics,
 @@ -226,10 +227,8 @@ function DataViewInner({
        if (store.SDK.type === "DE" && ["canceled", "failed"].includes(datasetStatusID)) {
          return (
@@ -16676,15 +17823,29 @@ index 36de0ac..db4249f 100644
          type: "error",
        });
 diff --git a/web/libs/datamanager/src/stores/AppStore.js b/web/libs/datamanager/src/stores/AppStore.js
-index af638d8..e9ef822 100644
+index af638d8..bd3f275 100644
 --- a/web/libs/datamanager/src/stores/AppStore.js
 +++ b/web/libs/datamanager/src/stores/AppStore.js
-@@ -1,3 +1,4 @@
+@@ -1,4 +1,5 @@
+-import { destroy, flow, types } from "mobx-state-tree";
 +import { uiT as __uiT } from "@humansignal/app-common/i18n/ui";
- import { destroy, flow, types } from "mobx-state-tree";
++import { destroy, flow, isAlive, types } from "mobx-state-tree";
  import { runInAction } from "mobx";
  import {
-@@ -368,12 +369,12 @@ export const AppStore = types
+   emitDatamanagerEvent,
+@@ -355,7 +356,10 @@ export const AppStore = types
+     startLabelStream(options = {}) {
+       if (!self.confirmLabelingConfigured()) return;
+
+-      const nextAction = () => {
++      const nextAction = async () => {
++        if (self.project.queue_total == null || self.project.queue_done == null) {
++          if (!(await self.fetchProject({ labeling: true }))) return;
++        }
+         self.SDK.setMode("labelstream");
+
+         if (options?.pushState !== false) {
+@@ -368,12 +372,12 @@ export const AppStore = types
  
        if (self.LSF?.lsf?.annotationStore?.selected?.commentStore?.hasUnsaved) {
          Modal.confirm({
@@ -16699,7 +17860,7 @@ index af638d8..e9ef822 100644
          });
          return;
        }
-@@ -417,12 +418,12 @@ export const AppStore = types
+@@ -417,12 +421,12 @@ export const AppStore = types
  
        if (self.LSF?.lsf?.annotationStore?.selected?.commentStore?.hasUnsaved) {
          Modal.confirm({
@@ -16714,7 +17875,7 @@ index af638d8..e9ef822 100644
          });
          return;
        }
-@@ -433,12 +434,12 @@ export const AppStore = types
+@@ -433,12 +437,12 @@ export const AppStore = types
      confirmLabelingConfigured() {
        if (!self.labelingIsConfigured) {
          Modal.confirm({
@@ -16729,7 +17890,96 @@ index af638d8..e9ef822 100644
          });
          return false;
        }
-@@ -770,7 +771,7 @@ export const AppStore = types
+@@ -556,6 +560,7 @@ export const AppStore = types
+               ...(isTimer
+                 ? {
+                     include: [
++                      "has_tasks",
+                       "task_count",
+                       "task_number",
+                       "annotation_count",
+@@ -568,19 +573,22 @@ export const AppStore = types
+           : null;
+
+       try {
+-        const newProject = yield self.apiCall("project", params);
++        const newProject = yield self.apiCall("project", {
++          ...params,
++          ...(self.mode !== "labelstream" && !options.labeling && !History.getParams().labeling ? { lightweight: true } : {}),
++          ...(options.metadataOnly ? { metadata_only: true } : {}),
++        });
++        if (!isAlive(self)) return false;
+         const hasExistingProjectData = Object.entries(self.project ?? {}).length > 0;
+         const hasNewProjectData = Object.entries(newProject ?? {}).length > 0;
+
+         self.needsDataFetch =
+           options.force !== true && hasExistingProjectData && hasNewProjectData
+-            ? self.project.task_count !== newProject.task_count ||
+-              self.project.task_number !== newProject.task_number ||
+-              self.project.annotation_count !== newProject.annotation_count ||
+-              self.project.num_tasks_with_annotations !== newProject.num_tasks_with_annotations
++            ? ["task_count","task_number","annotation_count","num_tasks_with_annotations"].some(key =>
++                self.project[key] != null && newProject[key] != null && self.project[key] !== newProject[key])
+             : false;
+
+-        if (options.interaction === "timer") {
++        if (options.interaction === "timer" || options.metadataOnly) {
+           self.project = Object.assign(self.project ?? {}, newProject ?? {});
+         } else if (JSON.stringify(newProject ?? {}) !== JSON.stringify(self.project ?? {})) {
+           self.project = newProject;
+@@ -591,6 +599,7 @@ export const AppStore = types
+           self.SDK.invoke(`${itemType}Updated`, self.project);
+         }
+       } catch {
++        if (!isAlive(self)) return false;
+         // When in timer (polling project counts) mode, we can still continue
+         // but we need to crash for non-polling interactions
+         // because we can't display the app without the project itself and will need to redirect
+@@ -600,6 +609,7 @@ export const AppStore = types
+             redirect: true,
+           });
+         }
++        self.projectFetch = false;
+         return false;
+       }
+       self.projectFetch = false;
+@@ -644,6 +654,7 @@ export const AppStore = types
+       self.setLoading(true);
+
+       const { tab, task, labeling, query } = History.getParams();
++      const metadataOnly = !isLabelStream && !labeling;
+
+       self.viewsStore.fetchColumns();
+
+@@ -653,7 +664,7 @@ export const AppStore = types
+       // the first Default / virtual tab so defaults are available. Flag-off keeps parallel fetch.
+       let projectFetched = true;
+       if (applyProjectDefaultsFirst) {
+-        projectFetched = yield self.fetchProject();
++        projectFetched = yield self.fetchProject({ metadataOnly });
+       }
+
+       const shouldLoadTabs = !isLabelStream || (self.project?.show_annotation_history && task);
+@@ -697,7 +708,7 @@ export const AppStore = types
+           yield Promise.all(tabRequests);
+         }
+       } else {
+-        const requests = [self.fetchProject(), ...tabRequests];
++        const requests = [self.fetchProject({ metadataOnly }), ...tabRequests];
+         [projectFetched] = yield Promise.all(requests);
+       }
+
+@@ -706,6 +717,9 @@ export const AppStore = types
+
+         self.setLoading(false);
+
++        // Exact global totals may scan millions of IDs. Fill them after the current page is usable.
++        if (metadataOnly) self.fetchProject({ interaction: "timer" });
++
+         self.startPolling();
+       }
+     }),
+@@ -770,7 +784,7 @@ export const AppStore = types
          }
  
          console.warn({
@@ -16738,7 +17988,7 @@ index af638d8..e9ef822 100644
            description: result?.response?.detail ?? result.error,
          });
  
-@@ -899,8 +900,8 @@ export const AppStore = types
+@@ -899,8 +913,8 @@ export const AppStore = types
  
            self.SDK.invoke("toast", {
              message: isAddOperation

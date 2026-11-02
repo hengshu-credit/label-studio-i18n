@@ -36,6 +36,12 @@ jobs:
   build-and-browser:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        database: [sqlite, mysql]
+    env:
+      COMPOSE_FILE: ${{ matrix.database == 'mysql' && 'ci/compose.yaml:ci/compose.mysql.yaml' || 'ci/compose.yaml' }}
     steps:
       - uses: actions/checkout@v4
       - run: mkdir -p artifacts
@@ -63,28 +69,41 @@ jobs:
             COMMIT_VERSION=1.24.0.dev0-hengshu-i18n
             COMMIT_SHA=${{ github.sha }}
             COMMIT_BRANCH=hengshu-credit/main
-      - run: docker compose -f ci/compose.yaml up -d --wait --wait-timeout 300
-      - run: docker compose -f ci/compose.yaml cp ci/seed.py label-studio:/tmp/seed.py
-      - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/seed.py
-      - run: docker compose -f ci/compose.yaml cp tools/optimize-sqlite-listing.py label-studio:/tmp/optimize-sqlite-listing.py
-      - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/optimize-sqlite-listing.py --database /label-studio/data/label_studio.sqlite3
-      - run: docker compose -f ci/compose.yaml cp ci/test_assistance.py label-studio:/tmp/test_assistance.py
-      - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/test_assistance.py
-      - run: docker compose -f ci/compose.yaml cp ci/test_active_learning.py label-studio:/tmp/test_active_learning.py
-      - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/test_active_learning.py
-      - run: docker compose -f ci/compose.yaml cp ci/test_workflow.py label-studio:/tmp/test_workflow.py
-      - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/test_workflow.py
-      - run: docker compose -f ci/compose.yaml cp ci/test_model_management.py label-studio:/tmp/test_model_management.py
-      - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/test_model_management.py
-      - run: docker compose -f ci/compose.yaml cp ci/test_labeling_workspace.py label-studio:/tmp/test_labeling_workspace.py
-      - run: docker compose -f ci/compose.yaml exec -T label-studio python /tmp/test_labeling_workspace.py
-      - run: docker compose -f ci/compose.yaml exec -T label-studio python /label-studio/label_studio/manage.py makemigrations projects data_manager --check --dry-run
+      - run: docker compose up -d --wait --wait-timeout 300
+      - run: >-
+          docker compose exec -T label-studio python -c
+          "import os,sys; sys.path.insert(0,'/label-studio/label_studio'); os.environ.setdefault('DJANGO_SETTINGS_MODULE','core.settings.label_studio'); import django; django.setup(); from django.db import connection; assert connection.vendor == '${{ matrix.database }}', connection.vendor; print('Verified database backend:', connection.vendor)"
+      - run: docker compose cp ci/seed.py label-studio:/tmp/seed.py
+      - run: docker compose exec -T label-studio python /tmp/seed.py
+      - if: matrix.database == 'sqlite'
+        run: docker compose cp tools/optimize-sqlite-listing.py label-studio:/tmp/optimize-sqlite-listing.py
+      - if: matrix.database == 'sqlite'
+        run: docker compose exec -T label-studio python /tmp/optimize-sqlite-listing.py --database /label-studio/data/label_studio.sqlite3
+      - run: docker compose cp ci/test_assistance.py label-studio:/tmp/test_assistance.py
+      - run: docker compose exec -T label-studio python /tmp/test_assistance.py
+      - run: docker compose cp ci/test_active_learning.py label-studio:/tmp/test_active_learning.py
+      - run: docker compose exec -T label-studio python /tmp/test_active_learning.py
+      - run: docker compose cp ci/test_workflow.py label-studio:/tmp/test_workflow.py
+      - run: docker compose exec -T label-studio python /tmp/test_workflow.py
+      - run: docker compose cp ci/test_model_management.py label-studio:/tmp/test_model_management.py
+      - run: docker compose exec -T label-studio python /tmp/test_model_management.py
+      - run: docker compose cp ci/test_labeling_workspace.py label-studio:/tmp/test_labeling_workspace.py
+      - run: docker compose exec -T label-studio python /tmp/test_labeling_workspace.py
+      - run: docker compose cp ci/test_project_performance.py label-studio:/tmp/test_project_performance.py
+      - run: docker compose exec -T label-studio python /tmp/test_project_performance.py
+      - if: matrix.database == 'mysql'
+        run: docker compose cp ci/test_mysql_compat.py label-studio:/tmp/test_mysql_compat.py
+      - if: matrix.database == 'mysql'
+        run: docker compose cp tools/migrate-sqlite-to-mysql.py label-studio:/tmp/migrate-sqlite-to-mysql.py
+      - if: matrix.database == 'mysql'
+        run: docker compose exec -T label-studio python /tmp/test_mysql_compat.py
+      - run: docker compose exec -T label-studio python /label-studio/label_studio/manage.py makemigrations projects data_manager tasks fsm labels_manager --check --dry-run
       - run: npx playwright install --with-deps chromium
       - run: npx playwright test
       - if: always()
-        run: docker compose -f ci/compose.yaml logs --no-color > artifacts/container.log
+        run: docker compose logs --no-color > artifacts/container.log
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: localization-validation
+          name: localization-validation-${{ matrix.database }}
           path: artifacts/

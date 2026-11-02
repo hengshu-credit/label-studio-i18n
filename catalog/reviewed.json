@@ -1825,5 +1825,7 @@
   "Application ID (appKey)": "应用 ID（appKey）",
   "Application secret": "应用密钥",
   "Create a Youdao application with Text Translation enabled and enter its application ID and secret. The local limit is not a free monthly allowance.": "创建已开通文本翻译服务的有道应用，填写应用 ID 和应用密钥。本地限额不代表每月免费额度。",
-  "Youdao rejected the request timestamp or nonce. Check the server clock and try again.": "有道拒绝了请求的时间戳或随机值，请检查服务器时间后重试。"
+  "Youdao rejected the request timestamp or nonce. Check the server clock and try again.": "有道拒绝了请求的时间戳或随机值，请检查服务器时间后重试。",
+  "Loading project and samples...": "正在加载项目与样本…",
+  "Could not load the project. Please retry.": "项目加载失败，请重试。"
 }
