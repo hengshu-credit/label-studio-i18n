@@ -1815,5 +1815,9 @@
   "Results are preserved. Restore tabs, preannotate this sample, or annotate manually.": "结果已保留，可恢复页签、重新预标注当前样本，或直接人工标注。",
   "Accept prediction and submit": "接受预标注并提交",
   "You already submitted a human annotation. Edit that result to avoid duplicates.": "您已提交人工标注，请编辑现有结果，避免重复提交。",
-  "Unannotated sample — choose preannotation or manual labeling": "待标注样本 · 可先预标注，也可直接人工标注"
+  "Unannotated sample — choose preannotation or manual labeling": "待标注样本 · 可先预标注，也可直接人工标注",
+  "Prediction preview is read-only. Start editing to add, change or remove labels.": "当前为预标注只读预览。点击修改后，即可新增、修改或删除标注。",
+  "Submitted result. Start editing to save a correction.": "当前为已提交结果，点击修改后可保存更正。",
+  "Edit this annotation": "修改当前标注",
+  "Editing enabled: choose labels, select text to add entities, or select an existing entity to change or delete it. Submit to save the human annotation.": "已进入编辑：选择标签后拖选原文可新增实体；点击已有实体可修改标签或删除。提交后保存为人工标注。"
 }

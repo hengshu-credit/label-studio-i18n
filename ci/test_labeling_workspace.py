@@ -35,6 +35,26 @@ class LabelingTests(unittest.TestCase):
  def sample_provider(self):
   from ml.workflow_models import AnnotationProvider
   return AnnotationProvider.objects.create(project=self.project,name='Sample model',kind='openai',model='synthetic',endpoint='https://api.openai.com/v1/chat/completions',encrypted_key='synthetic-encrypted-secret')
+ def test_sample_columns_default_order_and_visibility(self):
+  from data_manager.functions import get_all_columns
+  summary=self.project.summary;summary.all_data_columns={'content':3,'sample_id':3,'internal_metadata':3};summary.save(update_fields=['all_data_columns'])
+  columns=get_all_columns(self.project)['columns'];index={c['id']:c for c in columns};visible=[]
+  for c in columns:
+   if c.get('parent'):continue
+   for child in ([index[key] for key in c['children']] if 'children' in c else [c]):
+    if child.get('visibility_defaults',{}).get('explore'):visible.append(child['id'])
+  self.assertEqual(visible,['id','sample_id','content','predictions_model_versions','predictions_results','predictions_score','total_annotations','cancelled_annotations','total_predictions','annotators','completed_at'])
+  self.assertFalse(index['internal_metadata']['visibility_defaults']['explore'])
+  self.assertTrue(index['content']['visibility_defaults']['labeling'])
+ def test_default_column_migration_preserves_filters_and_custom_views(self):
+  from importlib import import_module
+  update=import_module('data_manager.migrations.0022_sample_column_defaults').update_default
+  original={'title':'Default','hiddenColumns':{'explore':['tasks:predictions_score'],'labeling':['tasks:id']},'columnOrder':{},'filters':{'conjunction':'and','items':[]},'ordering':['-tasks:id']}
+  updated=update(original,{'content':'Text'},{'content':3,'sample_id':3,'metadata':3})
+  self.assertEqual(updated['filters'],original['filters']);self.assertEqual(updated['ordering'],original['ordering']);self.assertEqual(updated['hiddenColumns']['labeling'],['tasks:id'])
+  self.assertNotIn('tasks:predictions_score',updated['hiddenColumns']['explore']);self.assertIn('tasks:data.metadata',updated['hiddenColumns']['explore'])
+  self.assertEqual(update(updated,{},{}),updated)
+  custom={**original,'title':'My difficult samples'};self.assertEqual(update(custom,{},{}),custom)
  def test_single_sample_prediction_is_deduplicated_and_requires_human_acceptance(self):
   from ml.workflow import process_workflow_jobs
   from ml.workflow_models import LearningRun

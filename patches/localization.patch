@@ -515,7 +515,7 @@ index 0f6b330..452dafd 100644
              )
          },
 diff --git a/label_studio/data_manager/functions.py b/label_studio/data_manager/functions.py
-index 9d30512..84e883a 100644
+index 9d30512..82984d7 100644
 --- a/label_studio/data_manager/functions.py
 +++ b/label_studio/data_manager/functions.py
 @@ -1,4 +1,5 @@
@@ -704,6 +704,26 @@ index 9d30512..84e883a 100644
              'type': 'Boolean',
              'help': 'True if at least one draft exists for the task',
              'target': 'tasks',
+@@ -297,6 +298,19 @@ def get_all_columns(project, *_):
+
+     result['columns'].append(data_root)
+
++    # Keep the task identifier and source text next to the model evidence used by annotators.
++    preferred = ['id', 'data', 'predictions_model_versions', 'predictions_results', 'predictions_score',
++                 'total_annotations', 'cancelled_annotations', 'total_predictions', 'annotators', 'completed_at']
++    visible_data = {'sample_id', 'content', *project_data_types.keys()}
++    for column in result['columns']:
++        if 'visibility_defaults' in column:
++            column['visibility_defaults']['explore'] = (
++                column['id'] in visible_data if column.get('parent') == 'data' else column['id'] in preferred
++            )
++    data_root['children'].sort(key=lambda key: ({'sample_id': 0, 'content': 1}.get(key, 2), key))
++    result['columns'].sort(key=lambda column: preferred.index(column['id'])
++                           if not column.get('parent') and column['id'] in preferred else len(preferred))
++
+     return result
+
+
 diff --git a/label_studio/data_manager/managers.py b/label_studio/data_manager/managers.py
 index 0414eb6..0f8593a 100644
 --- a/label_studio/data_manager/managers.py
@@ -919,6 +939,65 @@ index 9b1c444..4f787b8 100644
                  null=True,
                  on_delete=django.db.models.deletion.SET_NULL,
                  related_name='locked_%(app_label)s_%(class)ss',
+diff --git a/label_studio/data_manager/migrations/0022_sample_column_defaults.py b/label_studio/data_manager/migrations/0022_sample_column_defaults.py
+new file mode 100644
+index 0000000..67b19ee
+--- /dev/null
++++ b/label_studio/data_manager/migrations/0022_sample_column_defaults.py
+@@ -0,0 +1,53 @@
++"""Apply the sample review layout to existing default views, preserving filters and row ordering."""
++import copy
++from django.db import migrations
++
++VISIBLE = {'id', 'predictions_model_versions', 'predictions_results', 'predictions_score',
++           'total_annotations', 'cancelled_annotations', 'total_predictions', 'annotators', 'completed_at'}
++HIDDEN = {'inner_id', 'annotations_results', 'annotations_ids', 'file_upload', 'storage_filename',
++          'created_at', 'updated_at', 'updated_by', 'avg_lead_time', 'draft_exists'}
++BACKUP = '_before_sample_column_defaults'
++
++
++def update_default(data, data_types, data_columns):
++    if not isinstance(data, dict) or data.get('title') not in ('Default', '默认') or BACKUP in data:
++        return data
++    result = copy.deepcopy(data)
++    result[BACKUP] = {key: copy.deepcopy(data[key]) for key in ('hiddenColumns', 'columnOrder') if key in data}
++    visible = {'tasks:' + key for key in VISIBLE}
++    visible |= {'tasks:data.' + key for key in {'sample_id', 'content', *(data_types or {})}}
++    hidden = set(result.get('hiddenColumns', {}).get('explore', []))
++    hidden |= {'tasks:' + key for key in HIDDEN}
++    hidden |= {'tasks:data.' + key for key in (data_columns or {})}
++    result.setdefault('hiddenColumns', {})['explore'] = sorted(hidden - visible)
++    result['columnOrder'] = {}
++    return result
++
++
++def forwards(apps, schema_editor):
++    View = apps.get_model('data_manager', 'View')
++    Summary = apps.get_model('projects', 'ProjectSummary')
++    for view in View.objects.select_related('project').exclude(is_locked=True).iterator():
++        columns = Summary.objects.filter(project_id=view.project_id).values_list('all_data_columns', flat=True).first()
++        updated = update_default(view.data, view.project.data_types, columns)
++        if updated != view.data:
++            view.data = updated
++            view.save(update_fields=['data'])
++
++
++def backwards(apps, schema_editor):
++    for view in apps.get_model('data_manager', 'View').objects.all().iterator():
++        data = copy.deepcopy(view.data or {})
++        backup = data.pop(BACKUP, None)
++        if backup is None:
++            continue
++        for key in ('hiddenColumns', 'columnOrder'):
++            data.pop(key, None)
++        data.update(backup)
++        view.data = data
++        view.save(update_fields=['data'])
++
++
++class Migration(migrations.Migration):
++    dependencies = [('data_manager', '0021_view_locked_by_fk_validate')]
++    operations = [migrations.RunPython(forwards, backwards)]
 diff --git a/label_studio/data_manager/models.py b/label_studio/data_manager/models.py
 index 9a9ca9b..4c650ac 100644
 --- a/label_studio/data_manager/models.py
@@ -6827,10 +6906,10 @@ index 7cb984a..ed05ef5 100644
          <div className="bg-neutral-surface rounded-full overflow-hidden w-full h-2 shadow-neutral-border-subtle shadow-border-1">
 diff --git a/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.css b/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.css
 new file mode 100644
-index 0000000..9e3ce83
+index 0000000..d7962ef
 --- /dev/null
 +++ b/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.css
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,20 @@
 +.labeling-workspace{flex:1;min-width:0;padding:24px 32px;color:var(--color-neutral-content);background:var(--color-neutral-background);line-height:1.5;overflow:auto}
 +.labeling-workspace h1{font-size:25px;font-weight:650;margin:0}.labeling-workspace h2{font-size:17px;font-weight:600;margin:12px 0}.labeling-workspace p{margin:10px 0}.labeling-workspace__header,.labeling-workspace__actions,.labeling-workspace__task-heading,.labeling-workspace__stats,.labeling-workspace__footer{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.labeling-workspace__header,.labeling-workspace__task-heading{justify-content:space-between}.labeling-workspace__header p,.labeling-workspace small{color:var(--color-neutral-content-subtler)}
 +.labeling-workspace__stats{padding:14px 18px;margin:20px 0;background:#6382d810;border:1px solid var(--color-neutral-border);border-radius:8px;justify-content:space-between}.labeling-workspace__error,.labeling-workspace__notice{padding:12px 16px;margin:12px 0;border-radius:6px;overflow-wrap:anywhere}.labeling-workspace__error{background:#d62c2c14;color:#b52e2e}.labeling-workspace__notice{background:#23966512;color:var(--color-neutral-content)}
@@ -6844,12 +6923,19 @@ index 0000000..9e3ce83
 +@media(max-width:760px){.labeling-workspace{height:auto;max-height:none}.labeling-workspace__layout{display:flex;flex-direction:column;flex:none}.labeling-workspace__sources{max-height:240px;height:auto}.labeling-workspace__editor-area{height:520px}.labeling-workspace__editor{min-height:0}.labeling-workspace__footer{padding:10px;gap:6px}}
 +
 +.labeling-source-card{height:auto!important;min-height:70px;padding:12px!important;white-space:normal}.labeling-source-card.selected{border-color:var(--color-primary-border,#617ada)!important;box-shadow:inset 3px 0 var(--color-primary-border,#617ada)!important}.labeling-workspace__sources>button:not(.labeling-source-card){width:100%;margin:8px 0}.labeling-submit-menu{display:flex;flex-direction:column;padding:6px;gap:4px;min-width:190px}.labeling-submit-menu>button{text-align:left}.labeling-submit-menu>button>span{justify-content:flex-start}.labeling-workspace__notice{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
++
++.labeling-workspace__edit-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:8px 16px;border-bottom:1px solid var(--color-neutral-border);font-size:13px;flex-shrink:0}.labeling-workspace__edit-toolbar:empty{display:none}.labeling-workspace__edit-toolbar>span{flex:1;min-width:180px;color:var(--color-neutral-content-subtler)}
++
++.labeling-workspace{max-height:calc(100dvh - 48px)}
++@media(max-width:760px){.labeling-workspace{max-height:none}}
++
++.labeling-workspace__editor .lsf-sidepanels_collapsed .lsf-sidepanels__content{flex:0 0 auto;height:auto;min-height:250px}.labeling-workspace__editor .lsf-sidepanels_collapsed .lsf-main-content{height:auto;overflow:visible}
 diff --git a/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.jsx b/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.jsx
 new file mode 100644
-index 0000000..c3350e0
+index 0000000..a635997
 --- /dev/null
 +++ b/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.jsx
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,126 @@
 +import {SamplePreannotation} from "@humansignal/app-common/components/SamplePreannotation/SamplePreannotation";
 +import {WorkflowButton as Button} from "../../components/Workflow/WorkflowButton";
 +import {ButtonGroup,Dropdown,useDropdown,buttonVariant} from "@humansignal/ui";
@@ -6895,6 +6981,7 @@ index 0000000..c3350e0
 +  const mine=next.annotations.find(a=>a.mine),prediction=next.predictions.find(p=>p.model_version===next.selected_prediction_version)||next.predictions[0];
 +  if(next.draft&&!next.draft.stale&&next.reserved_until)setSelection({mode:"edit",result:next.draft.result,source:next.draft.prediction,annotation:next.draft.annotation,stamp:next.draft.annotation_updated_at});
 +  else if(mine)setSelection({mode:"human",id:mine.id,result:mine.result});
++  else if(prediction&&next.reserved_until)setSelection({mode:"edit",result:prediction.result,source:prediction.id,annotation:null,stamp:""});
 +  else if(prediction)setSelection({mode:"prediction",id:prediction.id,result:prediction.result});
 +  else if(next.reserved_until)setSelection({mode:"edit",result:[],source:null,annotation:null,stamp:""});
 +  else if(next.annotations.length)setSelection({mode:"human",id:next.annotations[0].id,result:next.annotations[0].result});
@@ -6911,8 +6998,8 @@ index 0000000..c3350e0
 + useEffect(()=>{if(!ready||!task||!view||!root.current)return;const serial=++generation.current;let instance;setEditorReady(false);editorStore.current=null;
 +  import("@humansignal/editor").then(()=>{if(generation.current!==serial||!root.current)return;instance=new window.LabelStudio(root.current,{
 +   config:project.label_config,task:{id:task.id,data:task.data,annotations:[],predictions:[]},user:{id:user?.id,firstName:user?.first_name||"",lastName:user?.last_name||"",email:user?.email||""},
-+   interfaces:["controls","side-column"],
-+   onStorageInitialized(LS){setTimeout(()=>{if(generation.current!==serial)return;try{const store=LS.annotationStore;const a=view.mode==="prediction"?store.addPrediction({pk:String(view.id),result:clone(view.result)}):store.addAnnotation({pk:view.mode==="human"&&view.id?String(view.id):undefined,result:clone(view.result),userGenerate:view.mode==="edit",createdBy:view.mode==="human"?task.annotations.find(a=>a.id===view.id)?.author:undefined,editable:view.mode==="edit"});if(view.mode==="prediction")store.selectPrediction(a.id,{exitViewAll:true});else store.selectAnnotation(a.id,{exitViewAll:true});a.deserializeResults(clone(view.result));a.setEditable(view.mode==="edit");a.setReadonly(view.mode!=="edit");editorStore.current=LS;savedResult.current=JSON.stringify(a.serializeAnnotation());setEditorReady(true);}catch(e){setError(e.message);}},0);},
++   interfaces:["controls","side-column","edit-history"],
++   onStorageInitialized(LS){setTimeout(()=>{if(generation.current!==serial)return;try{const store=LS.annotationStore;const a=view.mode==="prediction"?store.addPrediction({pk:String(view.id),result:clone(view.result)}):store.addAnnotation({pk:view.mode==="human"&&view.id?String(view.id):undefined,result:clone(view.result),userGenerate:view.mode==="edit",createdBy:view.mode==="human"?task.annotations.find(a=>a.id===view.id)?.author:undefined,editable:view.mode==="edit"});if(view.mode==="prediction")store.selectPrediction(a.id,{exitViewAll:true});else store.selectAnnotation(a.id,{exitViewAll:true});a.deserializeResults(clone(view.result));a.setEditable(view.mode==="edit");a.setReadonly(view.mode!=="edit");a.reinitHistory();editorStore.current=LS;savedResult.current=JSON.stringify(a.serializeAnnotation());setEditorReady(true);}catch(e){setError(e.message);}},0);},
 +   onPresignUrlForProject(url){try{const value=new URL(url);if(["http:","https:"].includes(value.protocol))return url;}catch{}return api.api.createUrl(API_CONFIG.endpoints.presignUrlForProject,{projectId:routeId,fileuri:btoa(url)}).url;}
 +  });editor.current=instance;}).catch(e=>setError(e.message));
 +  return()=>{generation.current++;editorStore.current=null;instance?.destroy?.();if(editor.current===instance)editor.current=null;};
@@ -6925,7 +7012,7 @@ index 0000000..c3350e0
 + useEffect(()=>{if(!task?.reserved_until)return;const timer=setInterval(()=>{if(document.hidden)return;request({action:"heartbeat",task:task.id}).then(r=>setTask(old=>old?.id===task.id?{...old,reserved_until:r.reserved_until}:old)).catch(e=>setError(e.message));},Math.min(30000,(config?.reservation_minutes||60)*20000));return()=>clearInterval(timer);},[task?.id,Boolean(task?.reserved_until),request]);
 +
 + async function next(){if(unsavedRef.current()){await saveDraft();if(unsavedRef.current())return;}if(task){const r=await action({action:"release",task:task.id});if(!r)return;}const r=await action({action:"next"});if(r){showTask(r.task);history.replace({pathname:location.pathname,search:r.task?`?task=${r.task.id}`:""});await loadSettings();}}
-+ async function edit(result=[],source=null,annotation=null){if(unsavedRef.current()&&!window.confirm(t("Replace the current unsaved draft?")))return;const r=await action({action:"reserve",task:task.id});if(!r)return;setTask(r.task);setSelection({mode:"edit",result:clone(result),source,annotation:annotation?.id||null,stamp:annotation?.updated_at||""});setNotice(t("Editing a draft. Submit it to create a human annotation."));}
++ async function edit(result=[],source=null,annotation=null){if(unsavedRef.current()&&!window.confirm(t("Replace the current unsaved draft?")))return;const r=await action({action:"reserve",task:task.id});if(!r)return;setTask(r.task);setSelection({mode:"edit",result:clone(result),source,annotation:annotation?.id||null,stamp:annotation?.updated_at||""});setNotice("");}
 + async function finishSubmission(record,after,current){
 +  savedResult.current=JSON.stringify(editorStore.current?.annotationStore.selected?.serializeAnnotation()||[]);dirtyRef.current=false;setDirty(false);setLastSubmitted({task:current.id,annotation:record.id});
 +  if(after==="exit"){history.push(`/projects/${routeId}/data`);return;}
@@ -6942,8 +7029,8 @@ index 0000000..c3350e0
 + return <main className="labeling-workspace" data-testid="labeling-workspace">
 +  <header className="labeling-workspace__header"><div><h1>{t("Labeling workspace")}</h1><p>{t("Model suggestions become human annotations only after you accept or submit them.")}</p></div><div className="labeling-workspace__actions">{config?.recent_submissions?.length>0&&<Dropdown.Trigger anchorPositioning={false} alignment="bottom-right" content={<RecentSubmissions items={config.recent_submissions} onOpen={openSubmitted}/>}><Button>{t("Annotation history")}<IconChevronDown/></Button></Dropdown.Trigger>}{config?.can_manage&&<Button onClick={()=>setShowSettings(!showSettings)}>{t("Task distribution settings")}</Button>}</div></header>
 +  {config&&<div className="labeling-workspace__stats"><span>{t("Task assignment mode")}: {config.mode==="manual"?t("Manual assignment"):t("Automatic assignment")} · {samplingName(config.mode==="manual"?"Sequential sampling":config.sampling)}</span><span>{t("Completed tasks")}: {config.completed_tasks} / {config.task_count}</span><span>{t("My submitted tasks")}: {config.my_completed}</span><span>{t("Reservation")}: {config.reservation_minutes} {t("minutes")}</span></div>}
-+  {error&&<div role="alert" className="labeling-workspace__error">{error}</div>}{notice&&<div role="status" className="labeling-workspace__notice">{notice}</div>}
-+  {lastSubmitted&&<div className="labeling-workspace__notice" role="status"><span>{t("Last submitted task")}: #{lastSubmitted.task}</span><Button look="string" onClick={()=>openSubmitted(lastSubmitted.task)}>{t("View submitted result")}</Button></div>}
++  {error&&<div role="alert" className="labeling-workspace__error">{error}</div>}{notice&&view?.mode!=="edit"&&<div role="status" className="labeling-workspace__notice">{notice}</div>}
++  {lastSubmitted&&view?.mode!=="edit"&&<div className="labeling-workspace__notice" role="status"><span>{t("Last submitted task")}: #{lastSubmitted.task}</span><Button look="string" onClick={()=>openSubmitted(lastSubmitted.task)}>{t("View submitted result")}</Button></div>}
 +  {showSettings&&config&&<section className="labeling-workspace__settings"><h2>{t("Task distribution settings")}</h2><form onSubmit={async e=>{e.preventDefault();if(await action({action:"configure",...config})){await loadSettings();await fetchProject(routeId,true);}}}><div className="labeling-workspace__fields">
 +   <label>{t("Task assignment mode")}<select aria-label={t("Task assignment mode")} value={config.mode} onChange={e=>setConfig({...config,mode:e.target.value})}><option value="automatic">{t("Automatic assignment")}</option><option value="manual">{t("Manual assignment")}</option></select></label>
 +   <label>{t("Task Sampling")}<select aria-label={t("Task Sampling")} disabled={config.mode==="manual"} value={config.sampling} onChange={e=>setConfig({...config,sampling:e.target.value})}>{["Sequential sampling","Uniform sampling","Uncertainty sampling"].map(x=><option key={x} value={x}>{samplingName(x)}</option>)}</select></label>
@@ -6960,9 +7047,12 @@ index 0000000..c3350e0
 +   <h2>{t("Submitted human annotations")}</h2>{!task.annotations.length&&<p>{t("No human annotation submitted yet")}</p>}{task.annotations.map(a=><SourceButton key={a.id} data-testid={`human-annotation-${a.id}`} className={view?.mode==="human"&&view.id===a.id?"selected":""} onClick={()=>{if(!unsavedRef.current()||window.confirm(t("Replace the current unsaved draft?")))setSelection({mode:"human",id:a.id,result:a.result});}}><strong>{a.mine?t("My annotation"):a.author}</strong><small>{a.parent_prediction?t("Human-confirmed model suggestion"):t("Human annotation")} · #{a.id}</small><span>{describe(a.result)}</span><small>{new Date(a.updated_at).toLocaleString(currentLanguage(),{hour12:false})}</small></SourceButton>)}
 +   {task.draft&&<Button disabled={busy||draftBusy||task.draft.stale} onClick={()=>edit(task.draft.result,task.draft.prediction,task.annotations.find(a=>a.id===task.draft.annotation))}>{task.draft.stale?t("Draft belongs to an older task version"):t("Resume my saved draft")}</Button>}
 +   <Button disabled={busy||draftBusy||!task.assigned_to_me} onClick={()=>edit(mine?.result||[],mine?.parent_prediction||null,mine)}>{mine?t("Edit my human annotation"):t("Annotate manually")}</Button></aside>
-+   <section className={`labeling-workspace__editor-area ${view?.mode}`}><div className="labeling-workspace__origin" data-testid="annotation-origin"><strong>{view?.mode==="prediction"?t("Model suggestion — awaiting human acceptance"):view?.mode==="edit"?t("Working draft — not submitted"):view?.mode==="empty"?t("Unannotated sample — choose preannotation or manual labeling"):t("Submitted human annotation")}</strong><span>{view?.mode==="prediction"?(selectedPrediction?.model_name||t("Imported predictions")):view?.mode==="human"?selectedHuman?.author:dirty?t("Unsaved changes"):t("Submit to confirm this annotation")}</span></div>
-+    <div className="labeling-workspace__editor" ref={root} data-testid="labeling-editor"/>{!editorReady&&<p role="status">{t("Loading labeling interface...")}</p>}
-+    <footer className="labeling-workspace__footer">{view?.mode==="prediction"&&<><SubmitActions prediction disabled={busy||draftBusy||!editorReady||Boolean(mine)||!task.assigned_to_me} onSubmit={accept}/><Button disabled={busy||draftBusy||!editorReady||!task.assigned_to_me} onClick={()=>edit(view.result,view.id,mine)}>{t("Edit prediction before submitting")}</Button>{mine&&<span>{t("You already have a human annotation. Edit it to make a correction.")}</span>}</>}{view?.mode==="edit"&&<><SubmitActions disabled={busy||draftBusy||!editorReady} onSubmit={submit}/><Button disabled={busy||draftBusy||!editorReady} onClick={saveDraft}>{t("Save draft")}</Button></>}{view?.mode==="human"&&selectedHuman?.mine&&<Button disabled={busy||draftBusy||!task.assigned_to_me} onClick={()=>edit(selectedHuman.result,selectedHuman.parent_prediction,selectedHuman)}>{t("Edit my human annotation")}</Button>}{!mine&&<Button disabled={busy||draftBusy||!task.assigned_to_me} onClick={async()=>{if(unsavedRef.current()){await saveDraft();if(unsavedRef.current())return;}const r=await action({action:"reserve",task:task.id});if(r&&await action({action:"skip",task:task.id,input_hash:task.input_hash}))next();}}>{t("Skip this task")}</Button>}</footer>
++   <section className={`labeling-workspace__editor-area ${view?.mode}`}><div className="labeling-workspace__origin" data-testid="annotation-origin"><strong>{view?.mode==="prediction"?t("Model suggestion — awaiting human acceptance"):view?.mode==="edit"?t("Working draft — not submitted"):view?.mode==="empty"?t("Unannotated sample — choose preannotation or manual labeling"):t("Submitted human annotation")}</strong><span>{view?.mode==="prediction"?(selectedPrediction?.model_name||t("Imported predictions")):view?.mode==="human"?selectedHuman?.author:dirty?t("Unsaved changes"):(notice||t("Submit to confirm this annotation"))}</span></div>
++    <div className="labeling-workspace__edit-toolbar" data-testid="labeling-edit-toolbar">
++     {view?.mode==="prediction"?<><span>{t("Prediction preview is read-only. Start editing to add, change or remove labels.")}</span><Button variant="primary" look="filled" disabled={busy||draftBusy||!editorReady||!task.assigned_to_me} onClick={()=>edit(view.result,view.id,mine)}>{t("Edit prediction before submitting")}</Button></>:view?.mode==="human"&&selectedHuman?.mine?<><span>{t("Submitted result. Start editing to save a correction.")}</span><Button disabled={busy||draftBusy||!editorReady||!task.assigned_to_me} onClick={()=>edit(selectedHuman.result,selectedHuman.parent_prediction,selectedHuman)}>{t("Edit this annotation")}</Button></>:view?.mode==="edit"?<span>{t("Editing enabled: choose labels, select text to add entities, or select an existing entity to change or delete it. Submit to save the human annotation.")}</span>:null}
++    </div>
++    <div className="labeling-workspace__editor" ref={root} data-testid="labeling-editor" aria-busy={busy||!editorReady} style={{pointerEvents:busy||!editorReady?"none":undefined}}/>{!editorReady&&<p role="status">{t("Loading labeling interface...")}</p>}
++    <footer className="labeling-workspace__footer">{view?.mode==="prediction"&&<><SubmitActions prediction disabled={busy||draftBusy||!editorReady||Boolean(mine)||!task.assigned_to_me} onSubmit={accept}/>{mine&&<span>{t("You already have a human annotation. Edit it to make a correction.")}</span>}</>}{view?.mode==="edit"&&<><SubmitActions disabled={busy||draftBusy||!editorReady} onSubmit={submit}/><Button disabled={busy||draftBusy||!editorReady} onClick={saveDraft}>{t("Save draft")}</Button></>}{view?.mode==="human"&&selectedHuman?.mine&&<Button disabled={busy||draftBusy||!task.assigned_to_me} onClick={()=>edit(selectedHuman.result,selectedHuman.parent_prediction,selectedHuman)}>{t("Edit my human annotation")}</Button>}{!mine&&<Button disabled={busy||draftBusy||!task.assigned_to_me} onClick={async()=>{if(unsavedRef.current()){await saveDraft();if(unsavedRef.current())return;}const r=await action({action:"reserve",task:task.id});if(r&&await action({action:"skip",task:task.id,input_hash:task.input_hash}))next();}}>{t("Skip this task")}</Button>}</footer>
 +   </section></div>
 +  </>}
 + </main>;

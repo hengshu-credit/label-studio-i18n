@@ -2218,5 +2218,9 @@
   "Results are preserved. Restore tabs, preannotate this sample, or annotate manually.": "Results are preserved. Restore tabs, preannotate this sample, or annotate manually.",
   "Accept prediction and submit": "Accept prediction and submit",
   "You already submitted a human annotation. Edit that result to avoid duplicates.": "You already submitted a human annotation. Edit that result to avoid duplicates.",
-  "Unannotated sample — choose preannotation or manual labeling": "Unannotated sample — choose preannotation or manual labeling"
+  "Unannotated sample — choose preannotation or manual labeling": "Unannotated sample — choose preannotation or manual labeling",
+  "Prediction preview is read-only. Start editing to add, change or remove labels.": "Prediction preview is read-only. Start editing to add, change or remove labels.",
+  "Submitted result. Start editing to save a correction.": "Submitted result. Start editing to save a correction.",
+  "Edit this annotation": "Edit this annotation",
+  "Editing enabled: choose labels, select text to add entities, or select an existing entity to change or delete it. Submit to save the human annotation.": "Editing enabled: choose labels, select text to add entities, or select an existing entity to change or delete it. Submit to save the human annotation."
 }
