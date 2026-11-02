@@ -22607,7 +22607,7 @@ index 920fe1c..95b8c93 100644
 
        return snapshot.createdBy ?? "Admin";
 diff --git a/web/libs/editor/src/stores/Annotation/store.js b/web/libs/editor/src/stores/Annotation/store.js
-index 7f32127..3f5b574 100644
+index 7f32127..d5afde8 100644
 --- a/web/libs/editor/src/stores/Annotation/store.js
 +++ b/web/libs/editor/src/stores/Annotation/store.js
 @@ -16,6 +16,7 @@ import { Annotation } from "./Annotation";
@@ -22618,7 +22618,7 @@ index 7f32127..3f5b574 100644
 
  const localStorageKeys = {
    viewingAll: "annotation-store-viewing-all",
-@@ -46,6 +47,8 @@ const AnnotationStoreModel = types
+@@ -46,12 +47,19 @@ const AnnotationStoreModel = types
    })
    .volatile(() => ({
      initialized: false,
@@ -22627,7 +22627,18 @@ index 7f32127..3f5b574 100644
    }))
    .views((self) => ({
      get store() {
-@@ -199,6 +202,7 @@ const AnnotationStoreModel = types
+       return getRoot(self);
+     },
+
++    isTabClosed(id) {
++      const entity = [...self.predictions, ...self.annotations].find((item) => item.id === id);
++      return entity ? self.closedTabIds.includes(resultTabKey(entity)) : false;
++    },
++
+     get viewingAll() {
+       // Even if we have View All flag stored as true, but we are in environment without it
+       // or if we are not ready yet — don't go into View All mode, it will be broken.
+@@ -199,6 +207,7 @@ const AnnotationStoreModel = types
 
        const { selected } = self;
        const c = selectItem(id, self.annotations, !options.retainHistory, options);
@@ -22635,7 +22646,7 @@ index 7f32127..3f5b574 100644
 
        // Set editable based on view-all mode
        // Use self.viewingAll as the primary source of truth, which checks:
-@@ -227,7 +231,9 @@ const AnnotationStoreModel = types
+@@ -227,7 +236,9 @@ const AnnotationStoreModel = types
          unselectViewingAll();
        }
 
@@ -22646,7 +22657,7 @@ index 7f32127..3f5b574 100644
      }
 
      function clearDeletedParents(annotation) {
-@@ -636,6 +642,40 @@ const AnnotationStoreModel = types
+@@ -636,6 +647,36 @@ const AnnotationStoreModel = types
        self.history = [];
      };
 
@@ -22667,10 +22678,6 @@ index 7f32127..3f5b574 100644
 +      }
 +    }
 +
-+    function isTabClosed(id) {
-+      const entity=[...self.predictions,...self.annotations].find(entity=>entity.id===id);
-+      return entity ? self.closedTabIds.includes(resultTabKey(entity)) : false;
-+    }
 +    function prepareTaskTabs(taskId) {
 +      if(self.closedTaskId!==String(taskId)){self.closedTabIds=[];self.closedTaskId=String(taskId);}
 +    }
@@ -22687,13 +22694,12 @@ index 7f32127..3f5b574 100644
      return {
        afterCreate,
        beforeDestroy,
-@@ -668,6 +708,10 @@ const AnnotationStoreModel = types
+@@ -668,6 +709,9 @@ const AnnotationStoreModel = types
        deletePrediction,
        clearDeletedParents,
        resetAnnotations,
 +      closeTab,
 +      restoreClosedTabs,
-+      isTabClosed,
 +      prepareTaskTabs,
      };
    });
