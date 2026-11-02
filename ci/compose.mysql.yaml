@@ -7,9 +7,8 @@ services:
       MYSQL_USER: labelstudio
       MYSQL_PASSWORD: ci-only-mysql-password
       MYSQL_ROOT_PASSWORD: ci-only-mysql-root
-      MYSQL_PWD: ci-only-mysql-root
     healthcheck:
-      test: ["CMD", "mysql", "-uroot", "--batch", "--skip-column-names", "-e", "SELECT 1"]
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$${MYSQL_ROOT_PASSWORD}\" mysql -uroot -h127.0.0.1 --batch --skip-column-names -e 'SELECT 1'"]
       interval: 5s
       timeout: 5s
       retries: 40
