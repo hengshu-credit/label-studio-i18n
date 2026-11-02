@@ -14,7 +14,10 @@ test('configure local Transformers model and enable uncertainty sampling',async(
   await expect(page.locator('input[name="sampling"]')).toHaveValue('Uncertainty sampling');
   const saving=page.waitForResponse(r=>/\/api\/projects\/1\/?$/.test(new URL(r.url()).pathname)&&r.request().method()==='PATCH');
   await page.getByRole('button',{name:'保存常规设置',exact:true}).click();
-  expect((await saving).ok()).toBeTruthy();
+  const saved=await saving;
+  expect(saved.ok()).toBeTruthy();
+  expect(saved.request().postDataJSON().sampling).toBe('Uncertainty sampling');
+  expect((await saved.json()).sampling).toBe('Uncertainty sampling');
   await page.reload();
   await expect(page.locator('input[type="radio"][value="Uncertainty sampling"]')).toBeChecked();
   await page.goto('/projects/1/settings/ml-advanced');
