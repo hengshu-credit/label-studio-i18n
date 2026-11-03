@@ -2240,5 +2240,8 @@
   "Saved does not mean verified. Use Test saved configuration to check the provider connection.": "保存成功不代表连接可用，请点击「测试已保存配置」验证服务连接。",
   "Saved value": "已保存",
   "API settings saved. Only masked credential summaries are displayed.": "API 设置已保存，仅显示凭据的脱敏摘要。",
-  "Credentials are encrypted on the server. Only masked summaries are shown. Leave a field blank to keep its saved value.": "凭据在服务器加密保存，仅显示脱敏摘要。留空会保留已保存的值。"
+  "Credentials are encrypted on the server. Only masked summaries are shown. Leave a field blank to keep its saved value.": "凭据在服务器加密保存，仅显示脱敏摘要。留空会保留已保存的值。",
+  "Focus next task": "聚焦下一个任务",
+  "Close labeling": "关闭标注面板",
+  "Open labeling": "打开标注面板"
 }

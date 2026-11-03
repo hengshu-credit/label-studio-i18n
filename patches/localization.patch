@@ -8028,10 +8028,10 @@ index 0000000..df82f1b
 +@media(max-width:760px){.labeling-workspace{height:auto;max-height:none}.labeling-workspace__layout{display:flex;flex-direction:column;flex:none}.labeling-workspace__sources{max-height:200px;height:auto}.labeling-workspace__editor-area{height:520px}.labeling-workspace__header>.labeling-workspace__actions{margin-left:0}.labeling-workspace__status{max-width:100%}.labeling-workspace__fields{grid-template-columns:1fr}}
 diff --git a/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.jsx b/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.jsx
 new file mode 100644
-index 0000000..9df00be
+index 0000000..aab6b14
 --- /dev/null
 +++ b/web/apps/labelstudio/src/pages/LabelingWorkspace/LabelingWorkspace.jsx
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,148 @@
 +import {SamplePreannotation} from "@humansignal/app-common/components/SamplePreannotation/SamplePreannotation";
 +import {WorkflowButton as Button} from "../../components/Workflow/WorkflowButton";
 +import {ButtonGroup,Dropdown,Tooltip,useDropdown,buttonVariant} from "@humansignal/ui";
@@ -8043,6 +8043,7 @@ index 0000000..9df00be
 +import {useProject} from "../../providers/ProjectProvider";
 +import {useAPI} from "../../providers/ApiProvider";
 +import {API_CONFIG} from "../../config/ApiConfig";
++import {loadAndApplyProjectHotkeys,clearProjectHotkeysRuntime} from "@humansignal/app-common/pages/AccountSettings/hooks/useHotkeys";
 +import "./LabelingWorkspace.css";
 +
 +const csrf=()=>decodeURIComponent(document.cookie.split("; ").find(v=>v.startsWith("csrftoken="))?.slice(10)||"");
@@ -8065,6 +8066,8 @@ index 0000000..9df00be
 + const [config,setConfig]=useState(null),[task,setTask]=useState(null),[view,setView]=useState(null);
 + const [error,setError]=useState(""),[notice,setNotice]=useState(""),[busy,setBusy]=useState(false),[editorReady,setEditorReady]=useState(false),[dirty,setDirty]=useState(false),[empty,setEmpty]=useState(false);
 + const [draftBusy,setDraftBusy]=useState(false);
++ const operation=useRef(false),hotkeyActions=useRef({});
++ useEffect(()=>()=>clearProjectHotkeysRuntime(),[routeId]);
 + const [showSettings,setShowSettings]=useState(false),[taskIds,setTaskIds]=useState(""),[members,setMembers]=useState([]);
 + const root=useRef(null),editor=useRef(null),editorStore=useRef(null),generation=useRef(0),owner=useRef(routeId),started=useRef(Date.now());owner.current=routeId;
 + const dirtyRef=useRef(false),savedResult=useRef("[]"),draftStamp=useRef(null),savingDraft=useRef(false);
@@ -8086,16 +8089,20 @@ index 0000000..9df00be
 + const hasUnsaved=()=>viewRef.current?.mode==="edit"&&Boolean(editorStore.current)&&JSON.stringify(editorStore.current.annotationStore.selected?.serializeAnnotation()||[])!==savedResult.current;
 + const unsavedRef=useRef(hasUnsaved);unsavedRef.current=hasUnsaved;
 + const loadSettings=useCallback(async()=>{const p=routeId;const r=await request();if(owner.current===p)setConfig(r);},[request,routeId]);
-+ useEffect(()=>{if(!ready)return;let active=true;loadSettings().catch(e=>active&&setError(e.message));const id=new URLSearchParams(location.search).get("task");if(id)request(null,`?task=${encodeURIComponent(id)}`).then(r=>active&&showTask(r.task)).catch(e=>active&&setError(e.message));else showTask(null);return()=>{active=false;};},[ready,routeId,location.search]);
++ useEffect(()=>{if(!ready)return;let active=true;loadSettings().catch(e=>active&&setError(e.message));const id=new URLSearchParams(location.search).get("task");if(id&&Number(id)!==taskRef.current?.id)request(null,`?task=${encodeURIComponent(id)}`).then(r=>active&&showTask(r.task)).catch(e=>active&&setError(e.message));else if(!id)showTask(null);return()=>{active=false;};},[ready,routeId,location.search]);
 + useEffect(()=>{setTask(null);setView(null);setConfig(null);setError("");setShowSettings(false);dirtyRef.current=false;},[routeId]);
 + useEffect(()=>{const before=e=>{if(unsavedRef.current()){e.preventDefault();e.returnValue="";}};window.addEventListener("beforeunload",before);const unblock=history.block(()=>!unsavedRef.current()||window.confirm(t("Unsaved changes will be lost. Leave this task?")));return()=>{window.removeEventListener("beforeunload",before);unblock();};},[history]);
 + useEffect(()=>{if(!task?.id)return;const id=task.id;return()=>{fetch(url,{method:"POST",credentials:"same-origin",keepalive:true,headers:{"Content-Type":"application/json","X-CSRFToken":csrf()},body:JSON.stringify({action:"release",task:id})}).catch(()=>{});};},[task?.id,url]);
 +
 + useEffect(()=>{if(!ready||!task||!view||!root.current)return;const serial=++generation.current;let instance;setEditorReady(false);editorStore.current=null;
-+  import("@humansignal/editor").then(()=>{if(generation.current!==serial||!root.current)return;instance=new window.LabelStudio(root.current,{
++  Promise.all([import("@humansignal/editor"),loadAndApplyProjectHotkeys(routeId)]).then(()=>{if(generation.current!==serial||!root.current)return;instance=new window.LabelStudio(root.current,{
 +   config:project.label_config,task:{id:task.id,data:task.data,annotations:[],predictions:[]},user:{id:user?.id,firstName:user?.first_name||"",lastName:user?.last_name||"",email:user?.email||""},
-+   interfaces:["controls","side-column","edit-history"],
-+   onStorageInitialized(LS){setTimeout(()=>{if(generation.current!==serial)return;try{const store=LS.annotationStore;const a=view.mode==="prediction"?store.addPrediction({pk:String(view.id),result:clone(view.result)}):store.addAnnotation({pk:view.mode==="human"&&view.id?String(view.id):undefined,result:clone(view.result),userGenerate:view.mode==="edit",createdBy:view.mode==="human"?task.annotations.find(a=>a.id===view.id)?.author:undefined,editable:view.mode==="edit"});if(view.mode==="prediction")store.selectPrediction(a.id,{exitViewAll:true});else store.selectAnnotation(a.id,{exitViewAll:true});a.deserializeResults(clone(view.result));a.setEditable(view.mode==="edit");a.setReadonly(view.mode!=="edit");a.reinitHistory();editorStore.current=LS;savedResult.current=JSON.stringify(a.serializeAnnotation());setEditorReady(true);}catch(e){setError(e.message);}},0);},
++   interfaces:["controls","side-column","edit-history"],keymap:window.APP_SETTINGS?.editor_keymap,
++   onStorageInitialized(LS){setTimeout(()=>{if(generation.current!==serial)return;try{const store=LS.annotationStore;const a=view.mode==="prediction"?store.addPrediction({pk:String(view.id),result:clone(view.result)}):store.addAnnotation({pk:view.mode==="human"&&view.id?String(view.id):undefined,result:clone(view.result),userGenerate:view.mode==="edit",createdBy:view.mode==="human"?task.annotations.find(a=>a.id===view.id)?.author:undefined,editable:view.mode==="edit"});if(view.mode==="prediction")store.selectPrediction(a.id,{exitViewAll:true});else store.selectAnnotation(a.id,{exitViewAll:true});a.deserializeResults(clone(view.result));a.setEditable(view.mode==="edit");a.setReadonly(view.mode!=="edit");a.reinitHistory();editorStore.current=LS;savedResult.current=JSON.stringify(a.serializeAnnotation());setEditorReady(true);
++    const keys=window.Htx.Hotkey("LabelingWorkspace","Labeling workspace");
++    keys.addNamed("annotation:submit",()=>hotkeyActions.current.submit?.());
++    keys.addNamed("annotation:skip",()=>hotkeyActions.current.skip?.());
++   }catch(e){setError(e.message);}},0);},
 +   onPresignUrlForProject(url){try{const value=new URL(url);if(["http:","https:"].includes(value.protocol))return url;}catch{}return api.api.createUrl(API_CONFIG.endpoints.presignUrlForProject,{projectId:routeId,fileuri:btoa(url)}).url;}
 +  });editor.current=instance;}).catch(e=>setError(e.message));
 +  return()=>{generation.current++;editorStore.current=null;instance?.destroy?.();if(editor.current===instance)editor.current=null;};
@@ -8117,8 +8124,16 @@ index 0000000..9df00be
 +  catch(e){showTask({...current,annotations:[record,...current.annotations.filter(a=>a.id!==record.id)],draft:null,reserved_until:null});setError(e.message);}
 +  finally{setBusy(false);}
 + }
-+ async function submit(after="next"){const a=editorStore.current?.annotationStore.selected;if(!a||a.validate()===false)return;if(savingDraft.current)return;const current=task;const r=await action({action:"submit",...payload()});if(r)await finishSubmission(r.annotation,after,current);}
-+ async function accept(after="next"){const a=editorStore.current?.annotationStore.selected;if(!a||a.validate()===false)return;const current=task;const reserved=await action({action:"reserve",task:task.id});if(!reserved)return;setTask(reserved.task);const r=await action({action:"accept",task:task.id,prediction:view.id,input_hash:task.input_hash,lead_time:Math.min((Date.now()-started.current)/1000,86400)});if(r)await finishSubmission(r.annotation,after,current);}
++ async function submitCurrent(after="next"){const a=editorStore.current?.annotationStore.selected;if(!a||a.validate()===false)return;if(savingDraft.current)return;const current=task;const r=await action({action:"submit",...payload()});if(r)await finishSubmission(r.annotation,after,current);}
++ async function acceptCurrent(after="next"){const a=editorStore.current?.annotationStore.selected;if(!a||a.validate()===false)return;const current=task;const reserved=await action({action:"reserve",task:task.id});if(!reserved)return;setTask(reserved.task);const r=await action({action:"accept",task:task.id,prediction:view.id,input_hash:task.input_hash,lead_time:Math.min((Date.now()-started.current)/1000,86400)});if(r)await finishSubmission(r.annotation,after,current);}
++ async function runOperation(callback){if(operation.current||busy||savingDraft.current||!editorReady)return;operation.current=true;try{await callback();}finally{operation.current=false;}}
++ const submit=after=>runOperation(()=>viewRef.current?.mode==="edit"?submitCurrent(after):undefined);
++ const accept=after=>runOperation(()=>viewRef.current?.mode==="prediction"&&!taskRef.current?.annotations.some(a=>a.mine)&&taskRef.current?.assigned_to_me?acceptCurrent(after):undefined);
++ const skip=()=>runOperation(async()=>{if(!taskRef.current?.assigned_to_me||taskRef.current.annotations.some(a=>a.mine))return;if(unsavedRef.current()){await saveDraft();if(unsavedRef.current())return;}const current=taskRef.current;const r=await action({action:"reserve",task:current.id});if(r&&await action({action:"skip",task:current.id,input_hash:current.input_hash}))await next();});
++ hotkeyActions.current={
++  submit:()=>{if(!editorStore.current?.settings.enableHotkeys)return;return viewRef.current?.mode==="prediction"?accept("next"):submit("next");},
++  skip:()=>{if(editorStore.current?.settings.enableHotkeys)return skip();},
++ };
 + function openSubmitted(id){if(!unsavedRef.current()||window.confirm(t("Unsaved changes will be lost. Leave this task?"))){dirtyRef.current=false;history.push({pathname:location.pathname,search:`?task=${id}`});}}
 + const mine=task?.annotations.find(a=>a.mine),selectedHuman=task?.annotations.find(a=>a.id===view?.id),selectedPrediction=task?.predictions.find(p=>p.id===view?.id);
 + if(!ready)return <div role="status">{t("Loading project...")}</div>;
@@ -8155,7 +8170,7 @@ index 0000000..9df00be
 +    {view?.mode==="edit"&&<Tooltip title={t("Editing enabled: choose labels, select text to add entities, or select an existing entity to change or delete it. Submit to save the human annotation.")}><Button look="string" aria-label={t("Labeling help")}>?</Button></Tooltip>}
 +   </div>
 +    <div className="labeling-workspace__editor" ref={root} data-testid="labeling-editor" aria-busy={busy||!editorReady} style={{pointerEvents:busy||!editorReady?"none":undefined}}/>{!editorReady&&<p role="status">{t("Loading labeling interface...")}</p>}
-+    {(view?.mode==="prediction"||view?.mode==="edit"||!mine)&&<footer className="labeling-workspace__footer">{view?.mode==="prediction"&&<><SubmitActions prediction disabled={busy||draftBusy||!editorReady||Boolean(mine)||!task.assigned_to_me} onSubmit={accept}/>{mine&&<span>{t("You already have a human annotation. Edit it to make a correction.")}</span>}</>}{view?.mode==="edit"&&<><SubmitActions disabled={busy||draftBusy||!editorReady} onSubmit={submit}/><Button disabled={busy||draftBusy||!editorReady} onClick={saveDraft}>{t("Save draft")}</Button></>}{!mine&&<Button disabled={busy||draftBusy||!task.assigned_to_me} onClick={async()=>{if(unsavedRef.current()){await saveDraft();if(unsavedRef.current())return;}const r=await action({action:"reserve",task:task.id});if(r&&await action({action:"skip",task:task.id,input_hash:task.input_hash}))next();}}>{t("Skip this task")}</Button>}</footer>}
++    {(view?.mode==="prediction"||view?.mode==="edit"||!mine)&&<footer className="labeling-workspace__footer">{view?.mode==="prediction"&&<><SubmitActions prediction disabled={busy||draftBusy||!editorReady||Boolean(mine)||!task.assigned_to_me} onSubmit={accept}/>{mine&&<span>{t("You already have a human annotation. Edit it to make a correction.")}</span>}</>}{view?.mode==="edit"&&<><SubmitActions disabled={busy||draftBusy||!editorReady} onSubmit={submit}/><Button disabled={busy||draftBusy||!editorReady} onClick={saveDraft}>{t("Save draft")}</Button></>}{!mine&&<Button disabled={busy||draftBusy||!task.assigned_to_me} onClick={skip}>{t("Skip this task")}</Button>}</footer>}
 +   </section></div>
 +  </>}
 + </main>;
@@ -12981,6 +12996,88 @@ index f89d112..b13fefd 100644
              type: ToastType.error,
            });
          }
+diff --git a/web/libs/app-common/src/pages/AccountSettings/hotkeys/effectiveHotkeys.test.ts b/web/libs/app-common/src/pages/AccountSettings/hotkeys/effectiveHotkeys.test.ts
+index 36d8653..b0d959b 100644
+--- a/web/libs/app-common/src/pages/AccountSettings/hotkeys/effectiveHotkeys.test.ts
++++ b/web/libs/app-common/src/pages/AccountSettings/hotkeys/effectiveHotkeys.test.ts
+@@ -28,10 +28,12 @@ describe("effectiveHotkeys", () => {
+         "annotation:annotation:submit": { key: "shift+enter", active: true },
+         "annotation:annotation:skip": { key: "ctrl+space", active: false },
+         "data_manager:focus_table": { key: "shift+1", active: true },
++        "paragraphs:phrases:next-phrase": { key: "alt+down", active: true },
+       }),
+     ).toEqual({
+       "annotation:submit": { key: "shift+enter", active: true },
+       "annotation:skip": { key: null, active: false },
++      "phrases:next-phrase": { key: "alt+down", active: true },
+     });
+   });
+
+diff --git a/web/libs/app-common/src/pages/AccountSettings/hotkeys/effectiveHotkeys.ts b/web/libs/app-common/src/pages/AccountSettings/hotkeys/effectiveHotkeys.ts
+index 3565076..df83ef4 100644
+--- a/web/libs/app-common/src/pages/AccountSettings/hotkeys/effectiveHotkeys.ts
++++ b/web/libs/app-common/src/pages/AccountSettings/hotkeys/effectiveHotkeys.ts
+@@ -11,7 +11,7 @@ export type CustomHotkey = { key: string; active: boolean; description?: string
+ export type CustomHotkeys = Record<string, CustomHotkey>;
+ export type RuntimeKeymap = Record<string, Record<string, unknown>>;
+
+-const EDITOR_PREFIX = /^(annotation|timeseries|audio|regions|video|image_gallery|tools):(.*)/;
++const EDITOR_PREFIX = /^(annotation|timeseries|audio|regions|video|image_gallery|tools|paragraphs):(.*)/;
+
+ export const mergeCustomHotkeys = (account: CustomHotkeys, project: CustomHotkeys): CustomHotkeys => ({
+   ...account,
+diff --git a/web/libs/app-common/src/pages/AccountSettings/hotkeys/recordShortcut.test.ts b/web/libs/app-common/src/pages/AccountSettings/hotkeys/recordShortcut.test.ts
+new file mode 100644
+index 0000000..36d4393
+--- /dev/null
++++ b/web/libs/app-common/src/pages/AccountSettings/hotkeys/recordShortcut.test.ts
+@@ -0,0 +1,23 @@
++import { describe, expect, it } from "bun:test";
++import { recordShortcut } from "./recordShortcut";
++
++describe("shortcut recording uses runtime key names", () => {
++  for (const [key, code, modifiers, expected] of [
++    [" ", "Space", { ctrlKey: true }, "ctrl+space"],
++    ["ArrowLeft", "ArrowLeft", { shiftKey: true }, "shift+left"],
++    ["!", "Digit1", { ctrlKey: true, shiftKey: true }, "ctrl+shift+1"],
++    [">", "Period", { shiftKey: true }, "shift+."],
++    ["+", "Equal", { ctrlKey: true, shiftKey: true }, "ctrl+shift+plus"],
++    ["Enter", "Enter", { metaKey: true }, "command+enter"],
++    [",", "Comma", { altKey: true }, "alt+,"],
++    ["1", "Numpad1", {}, "1"],
++  ] as const) {
++    it(expected, () => expect(recordShortcut(new KeyboardEvent("keydown", { key, code, ...modifiers }))).toBe(expected));
++  }
++  it("ignores IME and modifier-only events", () => {
++    for (const key of ["Control", "Shift", "Alt", "Meta", "Dead", "Process"]) {
++      expect(recordShortcut(new KeyboardEvent("keydown", { key }))).toBeNull();
++    }
++    expect(recordShortcut(new KeyboardEvent("keydown", { key: "a", isComposing: true }))).toBeNull();
++  });
++});
+diff --git a/web/libs/app-common/src/pages/AccountSettings/hotkeys/recordShortcut.ts b/web/libs/app-common/src/pages/AccountSettings/hotkeys/recordShortcut.ts
+new file mode 100644
+index 0000000..66769a8
+--- /dev/null
++++ b/web/libs/app-common/src/pages/AccountSettings/hotkeys/recordShortcut.ts
+@@ -0,0 +1,17 @@
++/** Use the names understood by both keymaster (editor) and hotkeys-js (table). */
++export function recordShortcut(event: KeyboardEvent): string | null {
++  if (event.isComposing || event.keyCode === 229 || ["Control", "Shift", "Alt", "Meta", "Dead", "Process", "Unidentified"].includes(event.key)) return null;
++  const aliases: Record<string, string> = {
++    " ": "space", ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right",
++    Escape: "esc", Delete: "delete", "+": "plus",
++  };
++  const punctuation: Record<string, string> = {
++    Equal: "plus", Minus: "minus", Comma: ",", Period: ".", Slash: "/", Backslash: "\\",
++    Semicolon: ";", Quote: "'", BracketLeft: "[", BracketRight: "]", Backquote: "`",
++  };
++  // Shift changes event.key (e.g. Digit1 -> !); the binding library uses key codes.
++  const key = /^Digit\d$/.test(event.code) ? event.code.slice(-1) :
++    punctuation[event.code] ?? aliases[event.key] ?? event.key.toLowerCase();
++  return [...(event.ctrlKey ? ["ctrl"] : []), ...(event.shiftKey ? ["shift"] : []),
++    ...(event.altKey ? ["alt"] : []), ...(event.metaKey ? ["command"] : []), key].join("+");
++}
 diff --git a/web/libs/app-common/src/pages/AccountSettings/sections/Hotkeys.tsx b/web/libs/app-common/src/pages/AccountSettings/sections/Hotkeys.tsx
 index e66089c..53d4808 100644
 --- a/web/libs/app-common/src/pages/AccountSettings/sections/Hotkeys.tsx
@@ -13240,15 +13337,58 @@ index 0e8849b..716420d 100644
        </DialogContent>
      </Dialog>
 diff --git a/web/libs/app-common/src/pages/AccountSettings/sections/Hotkeys/Item.tsx b/web/libs/app-common/src/pages/AccountSettings/sections/Hotkeys/Item.tsx
-index 241873c..3cb1ff9 100644
+index 241873c..1142288 100644
 --- a/web/libs/app-common/src/pages/AccountSettings/sections/Hotkeys/Item.tsx
 +++ b/web/libs/app-common/src/pages/AccountSettings/sections/Hotkeys/Item.tsx
 @@ -1,3 +1,4 @@
 +import { uiT as __uiT } from "@humansignal/app-common/i18n/ui";
  import { useEffect, useState, useRef } from "react";
  import clsx from "clsx";
- 
-@@ -144,22 +145,20 @@ export const HotkeyItem = ({ hotkey, onEdit, isEditing, onSave, onCancel, onTogg
+
+@@ -6,6 +7,7 @@ import { Button, Tooltip } from "@humansignal/ui";
+ import { Toggle as UiToggle } from "@humansignal/ui";
+ import { KeyboardKey } from "./Key";
+ import { IconClose } from "@humansignal/icons";
++import { recordShortcut } from "../../hotkeys/recordShortcut";
+
+ // Type definitions
+ interface Hotkey {
+@@ -68,21 +70,10 @@ export const HotkeyItem = ({ hotkey, onEdit, isEditing, onSave, onCancel, onTogg
+
+     e.preventDefault();
+
+-    const { key, ctrlKey, shiftKey, altKey, metaKey } = e.nativeEvent;
+-
+-    // Skip if only modifier keys are pressed
+-    if (["Control", "Shift", "Alt", "Meta"].includes(key)) return;
+-
+-    // Build key combination array
+-    const keyCombo: string[] = [];
+-    if (ctrlKey) keyCombo.push("ctrl");
+-    if (shiftKey) keyCombo.push("shift");
+-    if (altKey) keyCombo.push("alt");
+-    if (metaKey) keyCombo.push("meta");
+-
+-    keyCombo.push(key.toLowerCase());
+-
+-    setEditedKey(keyCombo.join("+"));
++    e.stopPropagation();
++    const shortcut = recordShortcut(e.nativeEvent);
++    if (!shortcut) return;
++    setEditedKey(shortcut);
+     setError("");
+     setKeyRecordingMode(false);
+   };
+@@ -130,7 +121,7 @@ export const HotkeyItem = ({ hotkey, onEdit, isEditing, onSave, onCancel, onTogg
+   // Render edit mode interface
+   if (isEditing) {
+     return (
+-      <div className="py-3 space-y-3 border-b border-border last:border-0">
++      <div data-testid={`hotkey-${hotkey.section}:${hotkey.element}`} className="py-3 space-y-3 border-b border-border last:border-0">
+         <div className="font-medium">{hotkey.label}</div>
+         <div className="flex gap-3">
+           {/* Key recording input area */}
+@@ -144,22 +135,20 @@ export const HotkeyItem = ({ hotkey, onEdit, isEditing, onSave, onCancel, onTogg
              )}
              onClick={startRecordingKeys}
              onKeyDown={handleKeyPress}
@@ -13265,7 +13405,7 @@ index 241873c..3cb1ff9 100644
 +              <span className="text-neutral-content-subtler">{__uiT("Click to set shortcut")}</span>
              )}
            </Button>
- 
+
            {/* Action buttons */}
            <div className="flex flex-row gap-2">
 -            <Button variant="primary" onClick={handleSave} disabled={!editedKey || !!error}>
@@ -13275,7 +13415,15 @@ index 241873c..3cb1ff9 100644
              <Button variant="neutral" icon={<IconClose />} onClick={handleCancel} />
            </div>
          </div>
-@@ -178,7 +177,7 @@ export const HotkeyItem = ({ hotkey, onEdit, isEditing, onSave, onCancel, onTogg
+@@ -171,6 +160,7 @@ export const HotkeyItem = ({ hotkey, onEdit, isEditing, onSave, onCancel, onTogg
+   // Render normal view: toggle switch, label/description, hotkey display
+   return (
+     <div
++      data-testid={`hotkey-${hotkey.section}:${hotkey.element}`}
+       className={clsx("flex items-center py-3 border-b border-border/10 last:border-0", !hotkey.active && "opacity-60")}
+     >
+       {/* Toggle switch */}
+@@ -178,7 +168,7 @@ export const HotkeyItem = ({ hotkey, onEdit, isEditing, onSave, onCancel, onTogg
          <UiToggle
            checked={hotkey.active}
            onChange={handleToggle}
@@ -13283,16 +13431,26 @@ index 241873c..3cb1ff9 100644
 +          aria-label={`${hotkey.active ? __uiT("Disable") : __uiT("Enable")} ${hotkey.label}`}
          />
        </div>
- 
-@@ -189,7 +188,7 @@ export const HotkeyItem = ({ hotkey, onEdit, isEditing, onSave, onCancel, onTogg
+
+@@ -189,13 +179,15 @@ export const HotkeyItem = ({ hotkey, onEdit, isEditing, onSave, onCancel, onTogg
        </div>
- 
+
        {/* Current hotkey display (clickable to edit) */}
 -      <Tooltip title="Click to edit hotkey">
+-        <div
 +      <Tooltip title={__uiT("Click to edit hotkey")}>
-         <div
++        <button
++          type="button"
++          aria-label={hotkey.label}
            className="flex items-center gap-2 cursor-pointer hover:opacity-80 hover:bg-primary-emphasis-subtle px-base py-base rounded-small"
            onClick={handleEdit}
+         >
+           <KeyboardKey>{hotkey.key}</KeyboardKey>
+-        </div>
++        </button>
+       </Tooltip>
+     </div>
+   );
 diff --git a/web/libs/app-common/src/pages/AccountSettings/sections/Hotkeys/Section.tsx b/web/libs/app-common/src/pages/AccountSettings/sections/Hotkeys/Section.tsx
 index c496a16..943b616 100644
 --- a/web/libs/app-common/src/pages/AccountSettings/sections/Hotkeys/Section.tsx
@@ -17563,7 +17721,7 @@ index a91e3ce..9847e8a 100644
        </Space>
      </div>
 diff --git a/web/libs/datamanager/src/components/MainView/DataView/Table.jsx b/web/libs/datamanager/src/components/MainView/DataView/Table.jsx
-index cf96628..c9d3465 100644
+index cf96628..2a582c5 100644
 --- a/web/libs/datamanager/src/components/MainView/DataView/Table.jsx
 +++ b/web/libs/datamanager/src/components/MainView/DataView/Table.jsx
 @@ -1,3 +1,4 @@
@@ -17647,6 +17805,42 @@ index cf96628..c9d3465 100644
            </div>
          );
        }
+@@ -436,29 +427,29 @@ function DataViewInner({
+     );
+
+   useShortcut("dm.focus-previous", () => {
+-    if (document.activeElement !== document.body) return;
++
+
+     const task = dataStore.focusPrev();
+
+-    getRoot(view).startLabeling(task);
++    if (task && !task.isSelected) getRoot(view).startLabeling(task);
+   });
+
+   useShortcut("dm.focus-next", () => {
+-    if (document.activeElement !== document.body) return;
++
+
+     const task = dataStore.focusNext();
+
+-    getRoot(view).startLabeling(task);
++    if (task && !task.isSelected) getRoot(view).startLabeling(task);
+   });
+
+   useShortcut("dm.close-labeling", () => {
+-    if (document.activeElement !== document.body) return;
++
+
+     if (dataStore.selected) store.closeLabeling();
+   });
+
+   useShortcut("dm.open-labeling", () => {
+-    if (document.activeElement !== document.body) return;
++
+
+     const { highlighted } = dataStore;
+     // don't close QuickView by Enter
 diff --git a/web/libs/datamanager/src/components/MainView/DataView/empty-state/EmptyState.tsx b/web/libs/datamanager/src/components/MainView/DataView/empty-state/EmptyState.tsx
 index 639f9a1..bcb35de 100644
 --- a/web/libs/datamanager/src/components/MainView/DataView/empty-state/EmptyState.tsx
@@ -17882,8 +18076,83 @@ index 1948991..20bec0d 100644
        },
      },
      type: "dm",
+diff --git a/web/libs/datamanager/src/mixins/DataStore/DataStore.js b/web/libs/datamanager/src/mixins/DataStore/DataStore.js
+index 5bdecb5..d616261 100644
+--- a/web/libs/datamanager/src/mixins/DataStore/DataStore.js
++++ b/web/libs/datamanager/src/mixins/DataStore/DataStore.js
+@@ -323,7 +323,8 @@ export const DataStore = (modelName, { listItemType, apiMethod, properties, asso
+       }),
+
+       focusPrev() {
+-        const index = Math.max(0, self.list.indexOf(self.highlighted) - 1);
++        const current = self.highlighted ?? self.selected;
++        const index = Math.max(0, self.list.findIndex((item) => item.id === current?.id) - 1);
+
+         self.highlighted = self.list[index];
+         self.updated = guidGenerator();
+@@ -332,7 +333,8 @@ export const DataStore = (modelName, { listItemType, apiMethod, properties, asso
+       },
+
+       focusNext() {
+-        const index = Math.min(self.list.length - 1, self.list.indexOf(self.highlighted) + 1);
++        const current = self.highlighted ?? self.selected;
++        const index = Math.min(self.list.length - 1, self.list.findIndex((item) => item.id === current?.id) + 1);
+
+         self.highlighted = self.list[index];
+         self.updated = guidGenerator();
+diff --git a/web/libs/datamanager/src/sdk/hotkeys.ts b/web/libs/datamanager/src/sdk/hotkeys.ts
+index 3fd7ec3..5d96356 100644
+--- a/web/libs/datamanager/src/sdk/hotkeys.ts
++++ b/web/libs/datamanager/src/sdk/hotkeys.ts
+@@ -1,6 +1,8 @@
+ import { useHotkeys } from "react-hotkeys-hook";
+ import { pascalCase } from "@humansignal/core";
+ import { keymap } from "./keymap";
++import { useSyncExternalStore } from "react";
++import { effectiveHotkeys } from "@humansignal/app-common/pages/AccountSettings/hotkeys/effectiveHotkeys";
+
+ export type Hotkey = {
+   title: string;
+@@ -26,6 +28,7 @@ export const useShortcut = (
+   options = { showShortcut: true },
+   dependencies = undefined,
+ ) => {
++  useSyncExternalStore(effectiveHotkeys.subscribe, effectiveHotkeys.getVersion);
+   const action = keymap[actionName] as Hotkey;
+   const isMacos = /mac/i.test(navigator.platform);
+
+@@ -39,18 +42,26 @@ export const useShortcut = (
+   }
+
+   useHotkeys(
+-    shortcut,
+-    () => {
++    shortcut || "",
++    (event) => {
++      if (event.isComposing || event.keyCode === 229 || event.repeat) return;
+       // Yield to editor (LSF) hotkeys when the labeling panel is active.
+       // The flag is set by Label.jsx when labeling starts and toggled via
+       // pointerdown tracking so clicks on the DM table re-enable DM shortcuts.
+-      if (document.body.dataset.lsfLabeling === "true") return;
++      if (document.body.dataset.lsfLabeling === "true") {
++        const namespaces = window.Htx?.Hotkey?.namespaces?.() ?? {};
++        // Only yield when an active editor binding actually uses this combination.
++        // Text labeling has no Shift+Arrow bindings; its table navigation stays usable.
++        if (Object.values(namespaces).some((space: any) => space.keys?.[shortcut?.toLowerCase()])) return;
++      }
+
++      event.preventDefault();
+       callback();
+     },
+     {
+       keyup: false,
+       element: document.body,
++      enabled: Boolean(shortcut),
+     } as any,
+     dependencies,
+   );
 diff --git a/web/libs/datamanager/src/sdk/keymap.ts b/web/libs/datamanager/src/sdk/keymap.ts
-index c3e3b07..06333a6 100644
+index c3e3b07..e53f582 100644
 --- a/web/libs/datamanager/src/sdk/keymap.ts
 +++ b/web/libs/datamanager/src/sdk/keymap.ts
 @@ -1,22 +1,23 @@
@@ -17896,17 +18165,17 @@ index c3e3b07..06333a6 100644
    },
    "dm.focus-next": {
 -    title: "Focus previous task",
-+    title: __uiT("Focus previous task"),
++    title: __uiT("Focus next task"),
      shortcut: "shift+down",
    },
    "dm.close-labeling": {
 -    title: "Focus previous task",
-+    title: __uiT("Focus previous task"),
++    title: __uiT("Close labeling"),
      shortcut: "shift+left",
    },
    "dm.open-labeling": {
 -    title: "Focus previous task",
-+    title: __uiT("Focus previous task"),
++    title: __uiT("Open labeling"),
      shortcut: "shift+right",
    },
    "dm.toggle-bulk-sidebar-minimization": {
@@ -18236,6 +18505,35 @@ index a67c34a..2c02f3b 100644
 -  return messages.map((message, index) => ({ label: `column-error-${index}`, messages: [message] }));
 +  return messages.map((message, index) => ({ label: __uiT("column-error-{{value0}}", {value0: (index)}), messages: [message] }));
  };
+diff --git a/web/libs/editor/src/LabelStudio.tsx b/web/libs/editor/src/LabelStudio.tsx
+index 6a9678d..4f3e585 100644
+--- a/web/libs/editor/src/LabelStudio.tsx
++++ b/web/libs/editor/src/LabelStudio.tsx
+@@ -97,7 +97,7 @@ export class LabelStudio {
+
+     // @todo whole approach to hotkeys should be rewritten,
+     // @todo but for now we need a way to export Hotkey to different app
+-    if (window.Htx) window.Htx.Hotkey = Hotkey;
++    // The store is created asynchronously; publish Hotkey after configureStore resolves.
+
+     this.supportLegacyEvents();
+
+@@ -126,6 +126,7 @@ export class LabelStudio {
+
+     this.store = store;
+     window.Htx = this.store;
++    window.Htx.Hotkey = Hotkey;
+
+     const renderApp = () => {
+       render(<App store={this.store} />, rootElement);
+@@ -158,6 +159,7 @@ export class LabelStudio {
+
+     this.store = store;
+     window.Htx = this.store;
++    window.Htx.Hotkey = Hotkey;
+
+     let isRendered = false;
+
 diff --git a/web/libs/editor/src/common/Pagination/Pagination.tsx b/web/libs/editor/src/common/Pagination/Pagination.tsx
 index ee4ed80..54099d5 100644
 --- a/web/libs/editor/src/common/Pagination/Pagination.tsx
@@ -22160,6 +22458,105 @@ index 181380c..ada789a 100644
            )}
          </div>
  
+diff --git a/web/libs/editor/src/core/Hotkey.ts b/web/libs/editor/src/core/Hotkey.ts
+index 10c95e3..618f8e4 100644
+--- a/web/libs/editor/src/core/Hotkey.ts
++++ b/web/libs/editor/src/core/Hotkey.ts
+@@ -59,21 +59,26 @@ const _scopes: HotkeyScopes = {
+   [INPUT_SCOPE]: {},
+ };
+
+-const translateNumpad = (event: any) => {
++const translateNumpad = (event: KeyboardEvent) => {
+   const numPadKeyCode = event.keyCode;
+   const translatedToDigit = numPadKeyCode - 48;
+
+-  document.dispatchEvent(new KeyboardEvent("keydown", { keyCode: translatedToDigit }));
++  (event.target ?? document).dispatchEvent(new KeyboardEvent("keydown", {
++    keyCode: translatedToDigit, bubbles: true, cancelable: true,
++    ctrlKey: event.ctrlKey, altKey: event.altKey, shiftKey: event.shiftKey, metaKey: event.metaKey,
++    repeat: event.repeat,
++  }));
+ };
+
+ keymaster.filter = (event) => {
++  if (event.isComposing || event.keyCode === 229) return false;
+   if (keymaster.getScope() === "__none__") return false;
+
+   const target = (event.target || event.srcElement) as HTMLElement | null;
+   const tag = target?.tagName;
+   const inNumberPadCodeRange = (event as any).keyCode >= 96 && (event as any).keyCode <= 105;
+
+-  if (inNumberPadCodeRange) translateNumpad(event);
++  if (inNumberPadCodeRange && !/^(INPUT|TEXTAREA|SELECT)$/i.test(tag ?? "") && !target?.isContentEditable) translateNumpad(event);
+   if (tag) {
+     const isFormField = /^(INPUT|TEXTAREA|SELECT)$/i.test(tag);
+     const isEditable = Boolean(target?.isContentEditable) || Boolean(target?.closest?.('[contenteditable="true"]'));
+@@ -84,6 +89,7 @@ keymaster.filter = (event) => {
+ };
+
+ const ALIASES: Record<string, string> = {
++  arrowup: "up", arrowdown: "down", arrowleft: "left", arrowright: "right", meta: "command",
+   plus: "=", // "ctrl plus" is actually a "ctrl =" because shift is not used
+   minus: "-",
+   // Here is a magic trick. Keymaster doesn't work with comma correctly (it breaks down everything upon unbinding), but the key code for comma it expects is 188
+@@ -94,7 +100,7 @@ const ALIASES: Record<string, string> = {
+ export const Hotkey = (namespace = "global", description = "Hotkeys") => {
+   let _hotkeys_map: HotkeyMap = {};
+
+-  _namespaces[namespace] = _namespaces[namespace] ?? {
++  _namespaces[namespace] = {
+     description,
+     get keys() {
+       return _hotkeys_map;
+@@ -190,7 +196,7 @@ export const Hotkey = (namespace = "global", description = "Hotkeys") => {
+      * Add key
+      */
+     addKey(key: string, func: keymaster.KeyHandler, desc?: string, scope: string = DEFAULT_SCOPE) {
+-      if (!isDefined(key)) return;
++      if (!key?.trim()) return;
+
+       if (_hotkeys_map[key]) {
+         console.warn(`Key already added: ${key}. It's possibly a bug.`);
+@@ -240,7 +246,7 @@ export const Hotkey = (namespace = "global", description = "Hotkeys") => {
+     removeKey(key: string, scope: string = DEFAULT_SCOPE) {
+       if (!isDefined(key)) return;
+
+-      const keyName = key.toLowerCase();
++      const keyName = this.applyAliases(key.toLowerCase());
+
+       if (this.hasKey(keyName)) {
+         scope
+@@ -248,9 +254,9 @@ export const Hotkey = (namespace = "global", description = "Hotkeys") => {
+           .map((s) => s.trim())
+           .filter(Boolean)
+           .forEach((scope) => {
+-            removeKeyHandlerRef(scope, key);
++            removeKeyHandlerRef(scope, keyName);
+             keymaster.unbind(keyName, scope);
+-            rebindKeyHandlers(scope, key);
++            rebindKeyHandlers(scope, keyName);
+           });
+
+         delete _hotkeys_map[keyName];
+@@ -328,7 +334,7 @@ export const Hotkey = (namespace = "global", description = "Hotkeys") => {
+     hasKey(key: string) {
+       if (!isDefined(key)) return;
+
+-      const keyName = key.toLowerCase();
++      const keyName = this.applyAliases(key.toLowerCase());
+
+       return isDefined(_hotkeys_map[keyName]);
+     },
+@@ -452,7 +458,7 @@ Hotkey.Tooltip = inject("store")(
+       const description = props.title ?? hotkey.description;
+       const hotkeys: JSX.Element[] = [];
+
+-      if (enabled) {
++      if (enabled && shortcut) {
+         shortcut.split(",").forEach((combination: string) => {
+           const keyParts = combination.split("+");
+           const keys: JSX.Element[] = [];
 diff --git a/web/libs/editor/src/core/settings/editorsettings.js b/web/libs/editor/src/core/settings/editorsettings.js
 index cdb10b0..18daf6b 100644
 --- a/web/libs/editor/src/core/settings/editorsettings.js
@@ -22781,10 +23178,66 @@ index 7f32127..d5afde8 100644
    });
 
 diff --git a/web/libs/editor/src/stores/AppStore.js b/web/libs/editor/src/stores/AppStore.js
-index 89c1677..ab755a3 100644
+index 89c1677..8dd78f4 100644
 --- a/web/libs/editor/src/stores/AppStore.js
 +++ b/web/libs/editor/src/stores/AppStore.js
-@@ -964,6 +964,7 @@ export default types
+@@ -506,6 +506,7 @@ export default types
+        * Hotkey for delete
+        */
+       hotkeys.addNamed("region:delete-all", () => {
++        if (!self.annotationStore.selected || self.annotationStore.selected.isReadOnly()) return;
+         const { selected } = self.annotationStore;
+
+         if (window.confirm(getEnv(self).messages.CONFIRM_TO_DELETE_ALL_REGIONS)) {
+@@ -515,6 +516,7 @@ export default types
+
+       // create relation
+       hotkeys.addNamed("region:relation", () => {
++        if (!self.annotationStore.selected || self.annotationStore.selected.isReadOnly()) return;
+         const c = self.annotationStore.selected;
+
+         if (c && c.highlightedNode && !c.isLinkingMode) {
+@@ -554,6 +556,7 @@ export default types
+       });
+
+       hotkeys.addNamed("region:lock", () => {
++        if (!self.annotationStore.selected || self.annotationStore.selected.isReadOnly()) return;
+         const c = self.annotationStore.selected;
+
+         if (c && !c.isLinkingMode) {
+@@ -567,6 +570,7 @@ export default types
+       });
+
+       hotkeys.addNamed("annotation:undo", () => {
++        if (!self.annotationStore.selected || self.annotationStore.selected.isReadOnly()) return;
+         const annotation = self.annotationStore.selected;
+
+         // Allow undo even during drawing - the undo() method handles stopping drawing
+@@ -589,6 +593,7 @@ export default types
+       });
+
+       hotkeys.addNamed("annotation:redo", () => {
++        if (!self.annotationStore.selected || self.annotationStore.selected.isReadOnly()) return;
+         const annotation = self.annotationStore.selected;
+
+         // Allow redo even during drawing - matches the behavior of the redo button
+@@ -644,6 +649,7 @@ export default types
+       });
+
+       hotkeys.addNamed("region:delete", () => {
++        if (!self.annotationStore.selected || self.annotationStore.selected.isReadOnly()) return;
+         const c = self.annotationStore.selected;
+
+         if (c) {
+@@ -665,6 +671,7 @@ export default types
+
+       // duplicate selected regions
+       hotkeys.addNamed("region:duplicate", (e) => {
++        if (!self.annotationStore.selected || self.annotationStore.selected.isReadOnly()) return;
+         const { selected } = self.annotationStore;
+         const { serializedSelection } = selected || {};
+
+@@ -964,6 +971,7 @@ export default types
       */
      function initializeStore({ annotations = [], completions = [], predictions = [], annotationHistory }) {
        const as = self.annotationStore;
@@ -22792,6 +23245,19 @@ index 89c1677..ab755a3 100644
 
        // some hacks to properly clear react and mobx structures
        as.afterReset?.();
+diff --git a/web/libs/editor/src/stores/SettingsStore.js b/web/libs/editor/src/stores/SettingsStore.js
+index bbd9613..018f885 100644
+--- a/web/libs/editor/src/stores/SettingsStore.js
++++ b/web/libs/editor/src/stores/SettingsStore.js
+@@ -126,6 +126,8 @@ const SettingsModel = types
+         });
+       }
+
++      Hotkey.setScope(self.enableHotkeys ? Hotkey.DEFAULT_SCOPE : "__none__");
++
+       // capture changes and save it
+       onSnapshot(self, (ss) => {
+         // it's necessary to wait 1 tick before check if self.isDestroying is true
 diff --git a/web/libs/editor/src/tags/Custom.jsx b/web/libs/editor/src/tags/Custom.jsx
 index 010f822..723e090 100644
 --- a/web/libs/editor/src/tags/Custom.jsx

@@ -39,7 +39,7 @@ COPY web ./
 # Target path for django-manifest-plugin → label_studio/core/static/js/manifest.json (collectstatic input).
 RUN mkdir -p /label-studio/label_studio/core/static/js
 COPY pyproject.toml ../pyproject.toml
-RUN NODE_ENV=test bun test libs/app-common/src/i18n libs/app-common/src/pages/AccountSettings/sections/Language
+RUN NODE_ENV=test bun test libs/app-common/src/i18n libs/app-common/src/pages/AccountSettings/sections/Language libs/app-common/src/pages/AccountSettings/hotkeys/recordShortcut.test.ts libs/app-common/src/pages/AccountSettings/hotkeys/effectiveHotkeys.test.ts
 RUN --mount=type=cache,target=/root/.bun/install/cache,id=bun-install-cache-lso,sharing=locked \
     bun run build
 

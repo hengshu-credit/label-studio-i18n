@@ -2240,5 +2240,8 @@
   "Saved does not mean verified. Use Test saved configuration to check the provider connection.": "Saved does not mean verified. Use Test saved configuration to check the provider connection.",
   "Saved value": "Saved value",
   "API settings saved. Only masked credential summaries are displayed.": "API settings saved. Only masked credential summaries are displayed.",
-  "Credentials are encrypted on the server. Only masked summaries are shown. Leave a field blank to keep its saved value.": "Credentials are encrypted on the server. Only masked summaries are shown. Leave a field blank to keep its saved value."
+  "Credentials are encrypted on the server. Only masked summaries are shown. Leave a field blank to keep its saved value.": "Credentials are encrypted on the server. Only masked summaries are shown. Leave a field blank to keep its saved value.",
+  "Focus next task": "Focus next task",
+  "Close labeling": "Close labeling",
+  "Open labeling": "Open labeling"
 }
